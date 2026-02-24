@@ -1,0 +1,417 @@
+#include "torch/csrc/autograd/jin_helper.h"
+
+#include <ATen/ATen.h>
+#include <c10/util/Exception.h>
+
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace {
+
+std::mutex g_mu;
+
+struct JINState {
+  bool loaded = false;
+
+  std::string role;          // "A" or "B"
+  std::string payload_path;  // /tmp/jin_payload_step0.bin
+  int64_t step = -1;
+
+  std::unordered_map<std::string, at::Tensor> kv_cpu;
+
+  int64_t conv2d_i = 0;
+  int64_t relu_i = 0;
+  int64_t addmm_i = 0;
+  int64_t maxpool2d_i = 0;
+};
+
+JINState& S() {
+  static JINState st;
+  return st;
+}
+
+static inline const char* env_cstr(const char* k) {
+  const char* v = std::getenv(k);
+  return v ? v : "";
+}
+
+static inline int64_t env_i64(const char* k, int64_t defv) {
+  const char* v = std::getenv(k);
+  if (!v || !*v) return defv;
+  char* end = nullptr;
+  long long x = std::strtoll(v, &end, 10);
+  if (!end || end == v) return defv;
+  return (int64_t)x;
+}
+
+static std::string make_key(const char* op, int64_t idx, const char* field) {
+  std::string k;
+  k.reserve(64);
+  k.append(op);
+  k.push_back(':');
+  k.append(std::to_string(idx));
+  k.push_back(':');
+  k.append(field);
+  return k;
+}
+
+static std::string sizes_str(const at::Tensor& t) {
+  std::ostringstream oss;
+  oss << "[";
+  for (int i = 0; i < t.dim(); ++i) {
+    oss << t.size(i);
+    if (i + 1 < t.dim()) oss << ",";
+  }
+  oss << "]";
+  return oss.str();
+}
+
+// ------------------------
+// JIN1 binary reader utils
+// ------------------------
+struct Reader {
+  const uint8_t* p;
+  const uint8_t* end;
+
+  explicit Reader(const std::vector<uint8_t>& buf)
+      : p(buf.data()), end(buf.data() + buf.size()) {}
+
+  void need(size_t n) {
+    TORCH_CHECK((size_t)(end - p) >= n, "[JIN] payload truncated");
+  }
+
+  uint8_t u8() {
+    need(1);
+    return *p++;
+  }
+
+  uint32_t u32() {
+    need(4);
+    uint32_t x;
+    std::memcpy(&x, p, 4);
+    p += 4;
+    return x;
+  }
+
+  uint64_t u64() {
+    need(8);
+    uint64_t x;
+    std::memcpy(&x, p, 8);
+    p += 8;
+    return x;
+  }
+
+  int64_t i64() {
+    need(8);
+    int64_t x;
+    std::memcpy(&x, p, 8);
+    p += 8;
+    return x;
+  }
+
+  std::string bytes_str(uint32_t n) {
+    need(n);
+    std::string s((const char*)p, (size_t)n);
+    p += n;
+    return s;
+  }
+
+  const uint8_t* bytes_ptr(uint64_t n) {
+    need((size_t)n);
+    const uint8_t* r = p;
+    p += (size_t)n;
+    return r;
+  }
+};
+
+static at::ScalarType dtype_from_u8(uint8_t code) {
+  switch (code) {
+    case 0: return at::kFloat;
+    case 1: return at::kDouble;
+    case 2: return at::kLong;
+    case 3: return at::kInt;
+    case 4: return at::kShort;
+    case 5: return at::kChar;
+    case 6: return at::kByte;
+    case 7: return at::kBool;
+    default:
+      TORCH_CHECK(false, "[JIN] unknown dtype code=", (int)code);
+  }
+}
+
+static void load_payload_locked(JINState& st) {
+  st.kv_cpu.clear();
+
+  std::ifstream f(st.payload_path, std::ios::binary);
+  TORCH_CHECK(f.good(), "[JIN] cannot open payload: ", st.payload_path);
+
+  f.seekg(0, std::ios::end);
+  std::streamoff sz = f.tellg();
+  TORCH_CHECK(sz > 0, "[JIN] payload empty: ", st.payload_path);
+  f.seekg(0, std::ios::beg);
+
+  std::vector<uint8_t> buf((size_t)sz);
+  f.read((char*)buf.data(), (std::streamsize)sz);
+  TORCH_CHECK(f.gcount() == sz, "[JIN] failed reading payload: ", st.payload_path);
+
+  Reader r(buf);
+
+  r.need(4);
+  TORCH_CHECK(r.u8() == 'J' && r.u8() == 'I' && r.u8() == 'N' && r.u8() == '1',
+              "[JIN] bad magic (expected JIN1): ", st.payload_path);
+
+  uint32_t n = r.u32();
+
+  for (uint32_t i = 0; i < n; ++i) {
+    uint32_t key_len = r.u32();
+    std::string key = r.bytes_str(key_len);
+
+    uint8_t dtype_code = r.u8();
+    at::ScalarType dtype = dtype_from_u8(dtype_code);
+
+    uint8_t ndim = r.u8();
+    std::vector<int64_t> sizes;
+    sizes.reserve(ndim);
+    for (uint8_t d = 0; d < ndim; ++d) {
+      sizes.push_back(r.i64());
+    }
+
+    uint64_t nbytes = r.u64();
+    const uint8_t* raw = r.bytes_ptr(nbytes);
+
+    // create CPU tensor and copy bytes
+    auto t = at::empty(sizes, at::TensorOptions().dtype(dtype).device(at::kCPU));
+    TORCH_CHECK((uint64_t)t.nbytes() == nbytes,
+                "[JIN] nbytes mismatch key=", key,
+                " expected=", (unsigned long long)t.nbytes(),
+                " got=", (unsigned long long)nbytes);
+
+    std::memcpy(t.data_ptr(), raw, (size_t)nbytes);
+
+    st.kv_cpu[key] = t;
+  }
+
+  st.loaded = true;
+
+  fprintf(stderr, "[JIN] LOADED(JIN1) payload=%s keys=%zu step=%lld\n",
+          st.payload_path.c_str(), st.kv_cpu.size(), (long long)st.step);
+  fflush(stderr);
+}
+
+static void ensure_loaded_locked(JINState& st) {
+  st.role = env_cstr("JIN_ROLE");
+  st.payload_path = env_cstr("JIN_PAYLOAD_PATH");
+  if (st.payload_path.empty()) st.payload_path = "/tmp/jin_payload.bin";
+
+  if (st.role != "B") return;
+
+  int64_t cur_step = env_i64("JIN_STEP", -1);
+  if (!st.loaded || (cur_step >= 0 && cur_step != st.step)) {
+    st.step = cur_step;
+    load_payload_locked(st);
+
+    st.conv2d_i = 0;
+    st.relu_i = 0;
+    st.addmm_i = 0;
+    st.maxpool2d_i = 0;
+  }
+}
+
+static bool overwrite_tensor_locked(JINState& st, at::Tensor& target, const std::string& key) {
+  auto it = st.kv_cpu.find(key);
+  if (it == st.kv_cpu.end()) {
+    fprintf(stderr, "[JIN] MISS key=%s\n", key.c_str());
+    fflush(stderr);
+    return false;
+  }
+
+  at::Tensor src = it->second;
+
+  TORCH_CHECK(target.defined(), "[JIN] target undefined for key=", key);
+  TORCH_CHECK(src.defined(),    "[JIN] src undefined for key=", key);
+
+  TORCH_CHECK(target.numel() == src.numel(),
+              "[JIN] numel mismatch key=", key,
+              " target_numel=", (long long)target.numel(),
+              " target_sizes=", sizes_str(target),
+              " src_numel=",    (long long)src.numel(),
+              " src_sizes=",    sizes_str(src));
+
+  TORCH_CHECK(target.scalar_type() == src.scalar_type(),
+              "[JIN] dtype mismatch key=", key,
+              " target_dtype=", c10::toString(target.scalar_type()),
+              " src_dtype=",    c10::toString(src.scalar_type()));
+
+  auto stype = target.scalar_type();
+
+  auto log_stats = [&](const char* tag, const at::Tensor& t) {
+    if (at::isFloatingType(stype) || at::isComplexType(stype)) {
+      double m = (double)t.mean().item<double>();
+      fprintf(stderr, "%s_mean=%f", tag, m);
+    } else {
+      // 보통 maxpool indices는 int64(Long)
+      // 정수/bool이면 mean 대신 max를 찍자
+      auto mx = t.to(at::kLong).abs().max().item<int64_t>();
+      fprintf(stderr, "%s_absmax=%lld", tag, (long long)mx);
+    }
+  };
+
+  fprintf(stderr, "[JIN] OK key=%s ", key.c_str());
+  log_stats("before", target);
+
+  target.copy_(src.to(target.device()));
+
+  fprintf(stderr, " ");
+  log_stats("after", target);
+  fprintf(stderr, "\n");
+  fflush(stderr);
+
+  return true;
+}
+
+} // namespace
+
+extern "C" {
+
+void jin_init_if_needed() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  ensure_loaded_locked(S());
+}
+
+void jin_reset_counters() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto& st = S();
+  st.conv2d_i = 0;
+  st.relu_i = 0;
+  st.addmm_i = 0;
+  st.maxpool2d_i = 0;
+}
+
+bool jin_has_key(const char* key) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto& st = S();
+  ensure_loaded_locked(st);
+  return st.kv_cpu.find(std::string(key)) != st.kv_cpu.end();
+}
+
+bool jin_overwrite_by_key(at::Tensor& t, const char* key) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto& st = S();
+  ensure_loaded_locked(st);
+  if (st.role != "B") return false;
+  return overwrite_tensor_locked(st, t, std::string(key));
+}
+
+void jin_overwrite_conv_input(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto& st = S();
+  ensure_loaded_locked(st);
+  if (st.role != "B") return;
+
+  const int64_t idx = st.conv2d_i;
+  const std::string key = make_key("conv2d", idx, "input");
+  TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+}
+
+void jin_overwrite_conv_weight(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto& st = S();
+  ensure_loaded_locked(st);
+  if (st.role != "B") return;
+
+  const int64_t idx = st.conv2d_i;
+  const std::string key = make_key("conv2d", idx, "weight");
+  TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+
+  st.conv2d_i += 1;
+}
+
+void jin_overwrite_relu_saved(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto& st = S();
+  ensure_loaded_locked(st);
+  if (st.role != "B") return;
+
+  const int64_t idx = st.relu_i;
+  const std::string key = make_key("relu", idx, "out");
+  TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+
+  st.relu_i += 1;
+}
+
+void jin_overwrite_relu(at::Tensor& t) { jin_overwrite_relu_saved(t); }
+
+void jin_overwrite_addmm_mat1(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto& st = S();
+  ensure_loaded_locked(st);
+  if (st.role != "B") return;
+
+  const int64_t idx = st.addmm_i;
+  const std::string key = make_key("addmm", idx, "mat1");
+  TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+}
+
+void jin_overwrite_addmm_mat2(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto& st = S();
+  ensure_loaded_locked(st);
+  if (st.role != "B") return;
+
+  const int64_t idx = st.addmm_i;
+  const std::string key = make_key("addmm", idx, "mat2");
+
+  // mat2가 undefined인 경로가 실제로 존재함 (특히 Linear backward 구현 경로에 따라)
+  if (!t.defined()) {
+    fprintf(stderr, "[JIN] SKIP key=%s (target undefined)\n", key.c_str());
+    fflush(stderr);
+    st.addmm_i += 1;  // op 단위로 idx는 진행해야 순서가 맞음
+    return;
+  }
+
+  bool ok = overwrite_tensor_locked(st, t, key);
+  TORCH_CHECK(ok, "[JIN] missing key=", key);
+
+  st.addmm_i += 1;
+}
+
+void jin_advance_addmm() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto& st = S();
+  st.addmm_i += 1;
+}
+
+void jin_overwrite_maxpool2d_input(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto& st = S();
+  ensure_loaded_locked(st);
+  if (st.role != "B") return;
+
+  const int64_t idx = st.maxpool2d_i;
+  const std::string key = make_key("maxpool2d", idx, "input");
+  TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+}
+
+void jin_overwrite_maxpool2d_indices(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto& st = S();
+  ensure_loaded_locked(st);
+  if (st.role != "B") return;
+
+  const int64_t idx = st.maxpool2d_i;
+  const std::string key = make_key("maxpool2d", idx, "indices");
+  TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+
+  st.maxpool2d_i += 1;
+}
+
+} // extern "C"

@@ -139,6 +139,8 @@ core_trainer_sources = [
     "torch/csrc/jit/ir/type_hashing.cpp",
     "torch/csrc/jit/serialization/pickler.cpp",
     "torch/csrc/jit/serialization/type_name_uniquer.cpp",
+
+    "torch/csrc/autograd/jin_helper.cpp",
 ]
 
 torch_mobile_core = [
