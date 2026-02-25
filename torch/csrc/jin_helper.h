@@ -28,4 +28,17 @@ void jin_advance_addmm();
 void jin_overwrite_maxpool2d_input(at::Tensor& t);
 void jin_overwrite_maxpool2d_indices(at::Tensor& t);
 
+void jin_set_payload_bytes(const void* data, uint64_t nbytes, int64_t step);
+
+// batchnorm
+void jin_overwrite_batchnorm_input(at::Tensor& t);
+void jin_overwrite_batchnorm_running_mean(at::Tensor& t);
+void jin_overwrite_batchnorm_running_var(at::Tensor& t);
+void jin_overwrite_batchnorm_weight(at::Tensor& t);
+void jin_overwrite_batchnorm_result1(at::Tensor& t);
+void jin_overwrite_batchnorm_result2(at::Tensor& t);
+
+C10_EXPORT void jin_set_payload_bytes(const void* data, uint64_t nbytes, int64_t step);
+
+
 } // extern "C"
