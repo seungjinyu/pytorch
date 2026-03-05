@@ -3,6 +3,8 @@
 
 extern "C" {
 
+bool jin_is_role_B();
+
 // lifecycle
 void jin_init_if_needed();
 void jin_reset_counters();
@@ -18,6 +20,12 @@ void jin_overwrite_conv_weight(at::Tensor& t);
 // relu
 void jin_overwrite_relu_saved(at::Tensor& t);
 void jin_overwrite_relu(at::Tensor& t); // alias
+
+// new (mask-based relu)
+void jin_capture_relu_mask(const at::Tensor& out);
+at::Tensor jin_relu_backward_from_mask(const at::Tensor& grad);
+// bool jin_is_role_B();
+// bool jin_has_relu_mask(int64_t i);  // optional (있으면 더 안전)
 
 // addmm
 void jin_overwrite_addmm_mat1(at::Tensor& t);

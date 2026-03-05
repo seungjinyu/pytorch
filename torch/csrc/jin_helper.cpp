@@ -1,3 +1,18 @@
+// torch/csrc/autograd/jin_helper.cpp
+// JIN helper (JIN1 binary payload) + overwrite helpers + ReLU mask (lossless) support.
+// This file is a "complete" version based on the code you pasted, with the following fixes:
+//  - No `g_state` (uses S() singleton everywhere)
+//  - Adds ReLU mask helpers + C API: jin_capture_relu_mask / jin_relu_backward_from_mask
+//  - Calls ensure_loaded_locked(st) inside the new APIs so role/step are up to date
+//  - Keeps your existing JIN1 reader + overwrite-by-key logic
+//
+// IMPORTANT: This file only *reads* JIN1 (file or mem) into st.kv_cpu.
+//            Your Node A must *write* JIN1 including keys "relu_mask:<i>" (dtype=Byte, shape=[nbytes]).
+//
+// Build note: Make sure jin_helper.h declares the two new functions:
+//   void jin_capture_relu_mask(const at::Tensor& out);
+//   at::Tensor jin_relu_backward_from_mask(const at::Tensor& grad);
+
 #include "torch/csrc/autograd/jin_helper.h"
 
 #include <ATen/ATen.h>
@@ -38,8 +53,6 @@ struct JINState {
   int64_t maxpool2d_i = 0;
   int64_t batchnorm_i = 0;
 };
-
-
 
 JINState& S() {
   static JINState st;
@@ -195,7 +208,6 @@ static void load_payload_locked(JINState& st) {
     uint64_t nbytes = r.u64();
     const uint8_t* raw = r.bytes_ptr(nbytes);
 
-    // create CPU tensor and copy bytes
     auto t = at::empty(sizes, at::TensorOptions().dtype(dtype).device(at::kCPU));
     TORCH_CHECK((uint64_t)t.nbytes() == nbytes,
                 "[JIN] nbytes mismatch key=", key,
@@ -203,7 +215,6 @@ static void load_payload_locked(JINState& st) {
                 " got=", (unsigned long long)nbytes);
 
     std::memcpy(t.data_ptr(), raw, (size_t)nbytes);
-
     st.kv_cpu[key] = t;
   }
 
@@ -273,19 +284,18 @@ static void ensure_loaded_locked(JINState& st) {
 
   st.step = cur_step;
 
-  // NEW: prefer memory payload if step matches
+  // prefer memory payload if step matches
   if (st.mem_has && (st.mem_step == cur_step)) {
     load_payload_from_mem_locked(st);
   } else {
-    load_payload_locked(st);  // file fallback
+    load_payload_locked(st);
   }
-  
+
   st.conv2d_i = 0;
   st.relu_i = 0;
   st.addmm_i = 0;
   st.maxpool2d_i = 0;
   st.batchnorm_i = 0;
-
 }
 
 static bool overwrite_tensor_locked(JINState& st, at::Tensor& target, const std::string& key) {
@@ -320,8 +330,6 @@ static bool overwrite_tensor_locked(JINState& st, at::Tensor& target, const std:
       double m = (double)t.mean().item<double>();
       fprintf(stderr, "%s_mean=%f", tag, m);
     } else {
-      // 보통 maxpool indices는 int64(Long)
-      // 정수/bool이면 mean 대신 max를 찍자
       auto mx = t.to(at::kLong).abs().max().item<int64_t>();
       fprintf(stderr, "%s_absmax=%lld", tag, (long long)mx);
     }
@@ -338,6 +346,55 @@ static bool overwrite_tensor_locked(JINState& st, at::Tensor& target, const std:
   fflush(stderr);
 
   return true;
+}
+
+// ------------------------
+// ReLU mask helpers (lossless)
+// ------------------------
+static inline std::string relu_mask_key(int64_t i) {
+  return "relu_mask:" + std::to_string(i);
+}
+
+static inline void bit_set(uint8_t* buf, int64_t idx) {
+  buf[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+}
+static inline bool bit_get(const uint8_t* buf, int64_t idx) {
+  return ((buf[idx >> 3] >> (idx & 7)) & 1u) != 0;
+}
+
+// Pack (relu_out > 0) into 1-bit-per-element bytes on CPU.
+static at::Tensor pack_relu_mask_bits_from_out(const at::Tensor& relu_out) {
+  TORCH_CHECK(relu_out.defined(), "jin_capture_relu_mask: relu_out is undefined");
+
+  at::Tensor out_cpu = relu_out.detach();
+  if (!out_cpu.is_cpu()) out_cpu = out_cpu.to(at::kCPU);
+  out_cpu = out_cpu.contiguous();
+
+  const int64_t n = out_cpu.numel();
+  const int64_t nbytes = (n + 7) / 8;
+
+  at::Tensor mask_bytes =
+      at::zeros({nbytes}, at::TensorOptions().dtype(at::kByte).device(at::kCPU));
+  uint8_t* mb = mask_bytes.data_ptr<uint8_t>();
+
+  const auto dt = out_cpu.scalar_type();
+  if (dt == at::kFloat) {
+    const float* p = out_cpu.data_ptr<float>();
+    for (int64_t i = 0; i < n; i++) if (p[i] > 0.0f) bit_set(mb, i);
+  } else if (dt == at::kDouble) {
+    const double* p = out_cpu.data_ptr<double>();
+    for (int64_t i = 0; i < n; i++) if (p[i] > 0.0) bit_set(mb, i);
+  } else if (dt == at::kHalf) {
+    const at::Half* p = out_cpu.data_ptr<at::Half>();
+    for (int64_t i = 0; i < n; i++) if ((float)p[i] > 0.0f) bit_set(mb, i);
+  } else if (dt == at::kBFloat16) {
+    const at::BFloat16* p = out_cpu.data_ptr<at::BFloat16>();
+    for (int64_t i = 0; i < n; i++) if ((float)p[i] > 0.0f) bit_set(mb, i);
+  } else {
+    TORCH_CHECK(false, "jin_capture_relu_mask: unsupported dtype: ", dt);
+  }
+
+  return mask_bytes;
 }
 
 } // namespace
@@ -398,6 +455,8 @@ void jin_overwrite_conv_weight(at::Tensor& t) {
   st.conv2d_i += 1;
 }
 
+// Old ReLU overwrite path (kept for compatibility)
+// You will stop calling this from Functions.cpp after switching to mask-based backward.
 void jin_overwrite_relu_saved(at::Tensor& t) {
   std::lock_guard<std::mutex> lk(g_mu);
   auto& st = S();
@@ -433,11 +492,10 @@ void jin_overwrite_addmm_mat2(at::Tensor& t) {
   const int64_t idx = st.addmm_i;
   const std::string key = make_key("addmm", idx, "mat2");
 
-  // mat2가 undefined인 경로가 실제로 존재함 (특히 Linear backward 구현 경로에 따라)
   if (!t.defined()) {
     fprintf(stderr, "[JIN] SKIP key=%s (target undefined)\n", key.c_str());
     fflush(stderr);
-    st.addmm_i += 1;  // op 단위로 idx는 진행해야 순서가 맞음
+    st.addmm_i += 1;
     return;
   }
 
@@ -454,11 +512,11 @@ void jin_advance_addmm() {
 }
 
 void jin_overwrite_maxpool2d_input(at::Tensor& t) {
-
   std::lock_guard<std::mutex> lk(g_mu);
   auto& st = S();
   ensure_loaded_locked(st);
   if (st.role != "B") return;
+
   const int64_t idx = st.maxpool2d_i;
   const std::string key = make_key("maxpool2d", idx, "input");
   TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
@@ -483,7 +541,7 @@ void jin_set_payload_bytes(const void* data, uint64_t nbytes, int64_t step) {
 
   TORCH_CHECK(data != nullptr, "[JIN] data is null");
   TORCH_CHECK(nbytes > 0, "[JIN] nbytes=0");
-  TORCH_CHECK(nbytes < (1ULL<<32), "[JIN] payload too large"); // optional sanity
+  TORCH_CHECK(nbytes < (1ULL << 32), "[JIN] payload too large");
 
   st.mem_buf.resize((size_t)nbytes);
   std::memcpy(st.mem_buf.data(), data, (size_t)nbytes);
@@ -493,15 +551,17 @@ void jin_set_payload_bytes(const void* data, uint64_t nbytes, int64_t step) {
   // Force reload on next ensure_loaded (or load immediately)
   st.loaded = false;
 
-  // Optionally: eagerly load now (recommended)
+  // Eagerly load now (recommended)
   st.step = step;
   load_payload_from_mem_locked(st);
+
   st.conv2d_i = 0;
   st.relu_i = 0;
   st.addmm_i = 0;
   st.maxpool2d_i = 0;
   st.batchnorm_i = 0;
 }
+
 void jin_overwrite_batchnorm_input(at::Tensor& t) {
   std::lock_guard<std::mutex> lk(g_mu);
   auto& st = S();
@@ -522,7 +582,6 @@ void jin_overwrite_batchnorm_running_mean(at::Tensor& t) {
   const int64_t idx = st.batchnorm_i;
   const std::string key = make_key("batchnorm", idx, "running_mean");
 
-  // 일부 경로에서 running_mean이 undefined일 수 있음(특히 functional / 추적 경로 차이)
   if (!t.defined()) {
     fprintf(stderr, "[JIN] SKIP key=%s (target undefined)\n", key.c_str());
     fflush(stderr);
@@ -559,7 +618,6 @@ void jin_overwrite_batchnorm_weight(at::Tensor& t) {
   const int64_t idx = st.batchnorm_i;
   const std::string key = make_key("batchnorm", idx, "weight");
 
-  // affine=False 또는 weight 경로 차이로 undefined 가능
   if (!t.defined()) {
     fprintf(stderr, "[JIN] SKIP key=%s (target undefined)\n", key.c_str());
     fflush(stderr);
@@ -590,8 +648,133 @@ void jin_overwrite_batchnorm_result2(at::Tensor& t) {
   const std::string key = make_key("batchnorm", idx, "result2");
   TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
 
-  // BN 하나의 그룹(6개)을 다 처리했으니 idx 증가를 여기서 한다
   st.batchnorm_i += 1;
+}
+
+
+// ---------------------------------------------
+// NEW: ReLU mask APIs (lossless, no activation)
+// ---------------------------------------------
+
+// Node A: compute (relu_out > 0) mask, bitpack into Byte tensor [nbytes],
+// store in st.kv_cpu["relu_mask:<i>"], advance relu_i.
+void jin_capture_relu_mask(const at::Tensor& relu_out) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto& st = S();
+
+  // Update role from env (A/B), but do not try to load payload in A.
+  ensure_loaded_locked(st);
+
+  if (st.role != "A") return;
+
+  const int64_t i = st.relu_i++;
+  const std::string key = relu_mask_key(i);
+
+  at::Tensor mask_bytes = pack_relu_mask_bits_from_out(relu_out);
+  st.kv_cpu[key] = mask_bytes;
+}
+
+// Node B: read st.kv_cpu["relu_mask:<i>"] (Byte [nbytes]),
+// apply to grad: if mask==1 copy grad bitwise, else write exact 0.
+// This avoids grad*mask multiply and is friendlier to bitwise equality.
+// Node B: read st.kv_cpu["relu_mask:<i>"] (Byte [nbytes]),
+// apply to grad: if mask==1 copy grad bitwise, else write exact 0.
+// This avoids grad*mask multiply and is friendlier to bitwise equality.
+// helper: get bit j from packed bytes
+static inline bool bit_get_u8(const uint8_t* p, int64_t j) {
+  return (p[j >> 3] >> (j & 7)) & 1;
+}
+
+at::Tensor jin_relu_backward_from_mask(const at::Tensor& grad) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto& st = S();
+  ensure_loaded_locked(st);
+
+  // A(혹은 role unset)에서는 baseline/backward가 죽으면 안됨
+  if (st.role != "B") {
+    return grad;
+  }
+
+  TORCH_CHECK(grad.defined(), "jin_relu_backward_from_mask: grad is undefined");
+
+  const int64_t i = st.relu_i++;
+  const std::string key = relu_mask_key(i);
+
+  auto it = st.kv_cpu.find(key);
+  if (it == st.kv_cpu.end()) {
+    // mask가 없으면 안전하게 통과 (순서 mismatch 디버그에 도움)
+    return grad;
+  }
+
+  at::Tensor mask_bytes = it->second;
+  TORCH_CHECK(mask_bytes.defined(), "jin_relu_backward_from_mask: mask undefined");
+  TORCH_CHECK(mask_bytes.is_cpu(), "jin_relu_backward_from_mask: mask must be CPU");
+  TORCH_CHECK(mask_bytes.scalar_type() == at::kByte, "jin_relu_backward_from_mask: mask must be uint8");
+  mask_bytes = mask_bytes.contiguous();
+  const uint8_t* mb = mask_bytes.data_ptr<uint8_t>();
+
+  at::Tensor g = grad;
+  if (!g.is_contiguous()) g = g.contiguous();
+
+  const int64_t n = g.numel();
+  TORCH_CHECK(n >= 0, "jin_relu_backward_from_mask: invalid numel");
+  TORCH_CHECK(mask_bytes.numel() * 8 >= n,
+              "jin_relu_backward_from_mask: mask too small. mask_bits=",
+              mask_bytes.numel() * 8, " n=", n);
+
+  // --------------------------
+  // Case 1) grad is CUDA: 안전한 경로 (unpack -> CUDA mask -> multiply)
+  // --------------------------
+  if (g.is_cuda()) {
+    // 1) CPU에서 uint8(0/1) mask 생성 (길이 n)
+    at::Tensor mask_u8_cpu = at::empty({n}, at::TensorOptions().dtype(at::kByte).device(at::kCPU));
+    uint8_t* mp = mask_u8_cpu.data_ptr<uint8_t>();
+    for (int64_t j = 0; j < n; j++) mp[j] = bit_get_u8(mb, j) ? 1 : 0;
+
+    // 2) CUDA로 올리고 shape 맞춘 다음 multiply
+    at::Tensor mask_u8 = mask_u8_cpu.to(g.device(), /*non_blocking=*/false);
+
+    // ✅ 핵심: mask를 grad와 같은 shape로 view
+    at::Tensor mask_f = mask_u8.to(g.scalar_type()).view_as(g);
+
+    return g * mask_f;
+  }
+
+  // --------------------------
+  // Case 2) grad is CPU: 기존 빠른 루프
+  // --------------------------
+  at::Tensor out = at::empty_like(g);
+  const auto dt = g.scalar_type();
+
+  if (dt == at::kFloat) {
+    const float* gp = g.data_ptr<float>();
+    float* op = out.data_ptr<float>();
+    for (int64_t j = 0; j < n; j++) op[j] = bit_get_u8(mb, j) ? gp[j] : 0.0f;
+  } else if (dt == at::kDouble) {
+    const double* gp = g.data_ptr<double>();
+    double* op = out.data_ptr<double>();
+    for (int64_t j = 0; j < n; j++) op[j] = bit_get_u8(mb, j) ? gp[j] : 0.0;
+  } else if (dt == at::kHalf) {
+    const at::Half* gp = g.data_ptr<at::Half>();
+    at::Half* op = out.data_ptr<at::Half>();
+    const at::Half z = (at::Half)0;
+    for (int64_t j = 0; j < n; j++) op[j] = bit_get_u8(mb, j) ? gp[j] : z;
+  } else if (dt == at::kBFloat16) {
+    const at::BFloat16* gp = g.data_ptr<at::BFloat16>();
+    at::BFloat16* op = out.data_ptr<at::BFloat16>();
+    const at::BFloat16 z = (at::BFloat16)0;
+    for (int64_t j = 0; j < n; j++) op[j] = bit_get_u8(mb, j) ? gp[j] : z;
+  } else {
+    TORCH_CHECK(false, "jin_relu_backward_from_mask: unsupported grad dtype: ", dt);
+  }
+
+  return out;
+}
+
+bool jin_is_role_B() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto& st = S();
+  return st.loaded && st.role == "B";
 }
 
 } // extern "C"

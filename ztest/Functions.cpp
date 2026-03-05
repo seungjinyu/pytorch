@@ -11650,24 +11650,38 @@ variable_list SoftMarginLossBackward0::apply_with_saved(const variable_list& gra
     saved.after(target_);
     return result;
 }
+
 variable_list ReluBackward0::apply(variable_list&& grads) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   IndexRangeGenerator gen;
   auto self_ix = gen.range(1);
   variable_list grad_inputs(gen.size());
-  const auto& grad = grads[0];
-  auto result = result_.unpack(shared_from_this());
-  // [JIN]
-  jin_overwrite_relu_saved(result);
 
+  const auto& grad = grads[0];
+  auto result = result_.unpack(shared_from_this());  // ✅ 원래 ReLU backward에 필요
   bool any_grad_defined = any_variable_defined(grads);
+
   if (task_should_compute_output({ self_ix })) {
-    auto grad_result = any_grad_defined ? (threshold_backward(grad, result, 0)) : Tensor();
-    copy_range(grad_inputs, self_ix, grad_result);
+    if (any_grad_defined) {
+      at::Tensor grad_result;
+
+      // ✅ B일 때만 mask 기반 backward
+      if (jin_is_role_B()) {
+        grad_result = jin_relu_backward_from_mask(grad);
+      } else {
+        // ✅ A(또는 role 미설정)에서는 "원래" relu backward
+        grad_result = threshold_backward(grad, result, 0);
+      }
+
+      copy_range(grad_inputs, self_ix, grad_result);
+    } else {
+      copy_range(grad_inputs, self_ix, Tensor());
+    }
   }
   return grad_inputs;
 }
+
 void ReluBackward0::compiled_args(CompiledNodeArgs& args) {
     args.collect(result_);
 }
