@@ -11659,18 +11659,16 @@ variable_list ReluBackward0::apply(variable_list&& grads) {
   variable_list grad_inputs(gen.size());
 
   const auto& grad = grads[0];
-  auto result = result_.unpack(shared_from_this());  // ✅ 원래 ReLU backward에 필요
+  auto result = result_.unpack(shared_from_this());
   bool any_grad_defined = any_variable_defined(grads);
 
   if (task_should_compute_output({ self_ix })) {
     if (any_grad_defined) {
       at::Tensor grad_result;
 
-      // ✅ B일 때만 mask 기반 backward
       if (jin_is_role_B()) {
         grad_result = jin_relu_backward_from_mask(grad);
       } else {
-        // ✅ A(또는 role 미설정)에서는 "원래" relu backward
         grad_result = threshold_backward(grad, result, 0);
       }
 
@@ -11679,6 +11677,7 @@ variable_list ReluBackward0::apply(variable_list&& grads) {
       copy_range(grad_inputs, self_ix, Tensor());
     }
   }
+
   return grad_inputs;
 }
 
@@ -13683,18 +13682,34 @@ variable_list MaxPool2DWithIndicesBackward0::apply(variable_list&& grads) {
   IndexRangeGenerator gen;
   auto self_ix = gen.range(1);
   variable_list grad_inputs(gen.size());
+
   const auto& grad = grads[0];
-  auto self = self_.unpack();
-  jin_overwrite_maxpool2d_input(self);
-
-  auto result1 = result1_.unpack(shared_from_this());
-  jin_overwrite_maxpool2d_indices(result1);
-
   bool any_grad_defined = any_variable_defined(grads);
+
+  auto self = self_.unpack();
+  auto result1 = result1_.unpack(shared_from_this());
+
+  if (jin_is_role_B()) {
+    jin_overwrite_maxpool2d_input(self);
+    jin_overwrite_maxpool2d_indices(result1);
+  }
+
   if (task_should_compute_output({ self_ix })) {
-    auto grad_result = any_grad_defined ? (max_pool2d_with_indices_backward(grad, self, kernel_size, stride, padding, dilation, ceil_mode, result1)) : Tensor();
+    auto grad_result = any_grad_defined
+        ? max_pool2d_with_indices_backward(
+              grad,
+              self,
+              kernel_size,
+              stride,
+              padding,
+              dilation,
+              ceil_mode,
+              result1)
+        : Tensor();
+
     copy_range(grad_inputs, self_ix, grad_result);
   }
+
   return grad_inputs;
 }
 void MaxPool2DWithIndicesBackward0::compiled_args(CompiledNodeArgs& args) {
