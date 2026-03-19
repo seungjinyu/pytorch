@@ -1,5 +1,7 @@
 #pragma once
 #include <ATen/ATen.h>
+#include <vector>
+
 
 extern "C" {
 
@@ -50,3 +52,24 @@ C10_EXPORT void jin_set_payload_bytes(const void* data, uint64_t nbytes, int64_t
 
 
 } // extern "C"
+
+std::vector<uint8_t> jin_pack_maxpool2x2_flat_indices_to_2bit(
+    const at::Tensor& flat_indices,
+    int64_t input_h,
+    int64_t input_w
+);
+
+at::Tensor jin_unpack_maxpool2x2_2bit_to_flat_indices(
+    const std::vector<uint8_t>& packed,
+    int64_t N,
+    int64_t C,
+    int64_t Hout,
+    int64_t Wout,
+    int64_t input_h,
+    int64_t input_w,
+    c10::Device device
+);
+
+at::Tensor jin_make_maxpool2d_indices_2bit_tensor(
+    const at::Tensor& flat_indices
+);
