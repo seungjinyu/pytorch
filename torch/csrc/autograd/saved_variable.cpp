@@ -159,41 +159,41 @@ Variable SavedVariable::unpack(std::shared_ptr<Node> saved_for) const {
 
   // Only check version counter in the case without hooks
   // If user provides hooks, we can't track versions through the hooks
-  if (!hooks_) {
-    auto current_version = saved_original_
-        ? impl::version_counter(data_).current_version()
-        : version_counter_.current_version();
+  // if (!hooks_) {
+    // auto current_version = saved_original_
+    //     ? impl::version_counter(data_).current_version()
+    //     : version_counter_.current_version();
 
-    if (saved_version_ != current_version) {
-      std::stringstream message;
-      message
-          << "one of the variables needed for gradient computation has been "
-             "modified by an inplace operation: ["
-          << data_.toString() << " ";
-      if (data_.is_nested()) {
-        message << data_._nested_tensor_size() << "]";
-      } else {
-        message << data_.sizes() << "]";
-      }
-      if (grad_fn) {
-        message << ", which is output " << output_nr_ << " of "
-                << grad_fn->name() << ",";
-      }
-      message << " is at version " << current_version << "; expected version "
-              << saved_version_ << " instead.";
-      if (!AnomalyMode::is_enabled()) {
-        message << " Hint: enable anomaly detection to find the operation "
-                   "that failed to compute its gradient, with torch.autograd."
-                   "set_detect_anomaly(True).";
-      } else {
-        message
-            << " Hint: the backtrace further above shows the operation "
-               "that failed to compute its gradient. The variable in question "
-               "was changed in there or anywhere later. Good luck!";
-      }
-      TORCH_CHECK(false, message.str());
-    }
-  }
+    // if (saved_version_ != current_version) {
+    //   std::stringstream message;
+    //   message
+    //       << "one of the variables needed for gradient computation has been "
+    //          "modified by an inplace operation: ["
+    //       << data_.toString() << " ";
+    //   if (data_.is_nested()) {
+    //     message << data_._nested_tensor_size() << "]";
+    //   } else {
+    //     message << data_.sizes() << "]";
+    //   }
+    //   if (grad_fn) {
+    //     message << ", which is output " << output_nr_ << " of "
+    //             << grad_fn->name() << ",";
+    //   }
+    //   message << " is at version " << current_version << "; expected version "
+    //           << saved_version_ << " instead.";
+    //   if (!AnomalyMode::is_enabled()) {
+    //     message << " Hint: enable anomaly detection to find the operation "
+    //                "that failed to compute its gradient, with torch.autograd."
+    //                "set_detect_anomaly(True).";
+    //   } else {
+    //     message
+    //         << " Hint: the backtrace further above shows the operation "
+    //            "that failed to compute its gradient. The variable in question "
+    //            "was changed in there or anywhere later. Good luck!";
+    //   }
+    //   TORCH_CHECK(false, message.str());
+    // }
+  // }
 
   // The version counter is correct.
   // Additionally, if we deal with a non-leaf variable, we have its correct

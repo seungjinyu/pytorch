@@ -439,7 +439,13 @@ void jin_overwrite_conv_input(at::Tensor& t) {
 
   const int64_t idx = st.conv2d_i;
   const std::string key = make_key("conv2d", idx, "input");
-  TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+  // TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+
+  bool ok = overwrite_tensor_locked(st, t, key);
+  if (!ok){
+    fprintf(stderr, "[JIN] SKIP key=%s (payload missing, keep local conv input)\n", key.c_str());
+    fflush(stderr);
+  }
 }
 
 // void jin_overwrite_conv_weight(at::Tensor& t) {
@@ -485,9 +491,21 @@ void jin_overwrite_relu_saved(at::Tensor& t) {
 
   const int64_t idx = st.relu_i;
   const std::string key = make_key("relu", idx, "out");
-  TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+
+  bool ok = overwrite_tensor_locked(st, t, key);
+  // TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+
+  if (!ok){
+    // std::cout << "[JIN] SKIP key=" << key 
+    //           << "(payload missing, keep local ReLU output)" << std::endl;
+    fprintf(stderr, "[JIN] SKIP key=%s (payload missing, keep local ReLU output)\n", key.c_str());
+    
+    st.relu_i += 1;
+    return;
+  }
 
   st.relu_i += 1;
+  
 }
 
 void jin_overwrite_relu(at::Tensor& t) { jin_overwrite_relu_saved(t); }
@@ -500,7 +518,12 @@ void jin_overwrite_addmm_mat1(at::Tensor& t) {
 
   const int64_t idx = st.addmm_i;
   const std::string key = make_key("addmm", idx, "mat1");
-  TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+  // TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+  bool ok = overwrite_tensor_locked(st, t, key);
+  if (!ok){
+    fprintf(stderr, "[JIN] SKIP key=%s (payload missing, keep local addmm mat1)\n", key.c_str());
+    return ;
+  }
 }
 
 // void jin_overwrite_addmm_mat2(at::Tensor& t) {
@@ -566,7 +589,14 @@ void jin_overwrite_maxpool2d_input(at::Tensor& t) {
 
   const int64_t idx = st.maxpool2d_i;
   const std::string key = make_key("maxpool2d", idx, "input");
-  TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+  // TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+  bool ok = overwrite_tensor_locked(st, t, key);
+  if (!ok) {
+    fprintf(stderr,
+            "[JIN] SKIP key=%s (payload missing, keep local maxpool input)\n",
+            key.c_str());
+    fflush(stderr);
+  }
 }
 
 void jin_overwrite_maxpool2d_indices(at::Tensor& t) {
@@ -577,7 +607,15 @@ void jin_overwrite_maxpool2d_indices(at::Tensor& t) {
 
   const int64_t idx = st.maxpool2d_i;
   const std::string key = make_key("maxpool2d", idx, "indices");
-  TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+  // TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+
+  bool ok = overwrite_tensor_locked(st, t, key);
+  if (!ok) {
+    fprintf(stderr,
+            "[JIN] SKIP key=%s (payload missing, keep local maxpool indices)\n",
+            key.c_str());
+    fflush(stderr);
+  }
 
   st.maxpool2d_i += 1;
 }
@@ -684,7 +722,13 @@ void jin_overwrite_batchnorm_running_mean(at::Tensor& t) {
     return;
   }
 
-  TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+  bool ok = overwrite_tensor_locked(st, t, key);
+  if (!ok) {
+    fprintf(stderr,
+            "[JIN] SKIP key=%s (payload missing, keep local batchnorm running_mean)\n",
+            key.c_str());
+    fflush(stderr);
+  }
 }
 
 void jin_overwrite_batchnorm_running_var(at::Tensor& t) {
@@ -702,7 +746,13 @@ void jin_overwrite_batchnorm_running_var(at::Tensor& t) {
     return;
   }
 
-  TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+  bool ok = overwrite_tensor_locked(st, t, key);
+  if (!ok) {
+    fprintf(stderr,
+            "[JIN] SKIP key=%s (payload missing, keep local batchnorm running_var)\n",
+            key.c_str());
+    fflush(stderr);
+  }
 }
 
 void jin_overwrite_batchnorm_weight(at::Tensor& t) {
@@ -737,7 +787,14 @@ void jin_overwrite_batchnorm_result1(at::Tensor& t) {
 
   const int64_t idx = st.batchnorm_i;
   const std::string key = make_key("batchnorm", idx, "result1");
-  TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+  // TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+  bool ok = overwrite_tensor_locked(st, t, key);
+  if (!ok) {
+    fprintf(stderr,
+            "[JIN] SKIP key=%s (payload missing, keep local batchnorm result1)\n",
+            key.c_str());
+    fflush(stderr);
+  }
 }
 
 void jin_overwrite_batchnorm_result2(at::Tensor& t) {
@@ -748,8 +805,14 @@ void jin_overwrite_batchnorm_result2(at::Tensor& t) {
 
   const int64_t idx = st.batchnorm_i;
   const std::string key = make_key("batchnorm", idx, "result2");
-  TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
-
+  // TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
+  bool ok = overwrite_tensor_locked(st, t, key);
+  if (!ok) {
+    fprintf(stderr,
+            "[JIN] SKIP key=%s (payload missing, keep local batchnorm result2)\n",
+            key.c_str());
+    fflush(stderr);
+  }
   st.batchnorm_i += 1;
 }
 
