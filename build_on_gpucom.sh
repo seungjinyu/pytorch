@@ -21,4 +21,4 @@ export BUILD_TEST=0
 # rm -rf third_party/nccl/nccl/build
 
 # 7️⃣ 🔥 최종 빌드
-python3 setup.py develop
+"${CONDA_PREFIX}/bin/python3" setup.py develop

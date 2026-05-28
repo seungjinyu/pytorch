@@ -46,6 +46,7 @@ def run_node_a(
     max_steps=60000,
     policy="full",
     optional_keys=None,
+    grad_save_path=None,
 ):
 
     runtime_a = SplitRuntime(model, role="A")
@@ -85,14 +86,16 @@ def run_node_a(
                 optional_keys=optional_keys,  
             )
 
+            policy_meta = payload.meta.get("tensor_policy", {})
+
             t_capture1 = time.perf_counter()
 
-            extra = None
+            extra = {
+                "tensor_policy": policy_meta,
+            }
 
             if global_step == 0:
-                extra = {
-                    "state_dict": clone_state_dict(model),
-                }
+                extra["state_dict"]= clone_state_dict(model)
 
             t_send0 = time.perf_counter()
 
@@ -103,13 +106,22 @@ def run_node_a(
                 extra=extra,
             )
 
+
             t_send1 = time.perf_counter()
 
             if reply["status"] != "ok":
                 print("[Node A] bad reply:", reply)
                 break
 
+            if grad_save_path is not None and "grads" in reply:
+                torch.save(reply["grads"], grad_save_path)
+                print(f"[Node A] saved grads to {grad_save_path}")
+                return
+            
             t_load0 = time.perf_counter()
+
+            if "grads" in reply:
+                print("[Node A][GRADS] received:", sorted(reply["grads"].keys()))
 
             model.load_state_dict(reply["updated_state_dict"])
 

@@ -310,13 +310,18 @@ static bool overwrite_tensor_locked(JINState& st, at::Tensor& target, const std:
 
   TORCH_CHECK(target.defined(), "[JIN] target undefined for key=", key);
   TORCH_CHECK(src.defined(),    "[JIN] src undefined for key=", key);
+  if (target.numel() != src.numel()) {
 
-  TORCH_CHECK(target.numel() == src.numel(),
-              "[JIN] numel mismatch key=", key,
-              " target_numel=", (long long)target.numel(),
-              " target_sizes=", sizes_str(target),
-              " src_numel=",    (long long)src.numel(),
-              " src_sizes=",    sizes_str(src));
+    TORCH_WARN(
+        "[JIN] SKIP numel mismatch key=", key,
+        " target_numel=", (long long)target.numel(),
+        " target_sizes=", sizes_str(target),
+        " src_numel=",    (long long)src.numel(),
+        " src_sizes=",    sizes_str(src)
+    );
+
+    return false;
+  }
 
   TORCH_CHECK(target.scalar_type() == src.scalar_type(),
               "[JIN] dtype mismatch key=", key,

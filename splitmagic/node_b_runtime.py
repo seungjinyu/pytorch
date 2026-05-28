@@ -5,6 +5,14 @@ import torch.nn.functional as F
 
 from splitmagic import SplitRuntime, ZMQServer
 from splitmagic.utils.timing import CSVLogger
+# from splitmagic.resolver import read_jin1_tensor
+
+def clone_grads(model):
+    return {
+        name: p.grad.detach().cpu().clone()
+        for name, p in model.named_parameters()
+        if p.grad is not None
+    }
 
 def run_node_b(
     model,
@@ -13,8 +21,8 @@ def run_node_b(
     lr=0.1,
 ):
   
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cpu"
     model = model.to(device)
 
     optimizer = torch.optim.SGD(model.parameters(), lr=lr)
@@ -62,12 +70,22 @@ def run_node_b(
 
         optimizer.zero_grad(set_to_none=True)
 
+        print("[Node B][PAYLOAD_KEYS]", sorted(req["payload"].tensors.keys()))
+
+        # t = read_jin1_tensor(req["payload_path"], "relu:1:out")
+        # print("[TEST][JIN1_READ] relu:1:out", t.shape, t.dtype, t.mean().item())
+
         loss = runtime_b.backward_jin(
             x_dummy=x_dummy,
             y=y,
             payload=req["payload"],
             loss_fn=F.cross_entropy,
+            payload_path=req["payload_path"],
+            tensor_policy=req.get("tensor_policy",None),
         )
+
+        # 비교를 위한 grad 
+        grads = clone_grads(model)
 
         optimizer.step()
 
@@ -84,6 +102,8 @@ def run_node_b(
             "loss": float(loss.detach().cpu()),
             "bytes": req["num_bytes"],
             "updated_state_dict": updated_state,
+            # 비교를 위한 추가 이후 제거 예정
+            "grads": grads,
         })
 
         print(
