@@ -10,7 +10,7 @@ from .graph import collect_saved_attrs
 from .payload import payload_from_saved_attrs
 from .replay import ReplayEngine
 
-from .keymap import assign_jin_keys
+from .keymap import assign_jin_keys, assign_jin_keys_by_autograd_order
 from .payload import payload_from_jin_items 
 from .resolver import SavedTensorResolver
 from .fx_trace import (
@@ -613,13 +613,28 @@ class SplitRuntime:
 
         self.model.train()
         self.model.zero_grad(set_to_none=True)
-
+        # self.model.eval()
         out = self.model(x)
+        print("[DEBUG] logits_sum", out.detach().sum().item())
+        print("[DEBUG] logits_mean", out.detach().mean().item())
+        print("[DEBUG] label_sum", y.sum().item())
         loss = loss_fn(out, y)
 
         items = collect_saved_attrs(loss)
-        jin_items = assign_jin_keys(items)
 
+        # JIN key 할당 by order
+        # jin_items = assign_jin_keys(items)
+        # 260602 - JIN key 할당 by autograd order (실험적)
+
+        key_mode = "autograd_order"
+        
+        if key_mode == "autograd_order":
+            jin_items = assign_jin_keys_by_autograd_order(items)
+        else :
+            jin_items = assign_jin_keys(items)
+
+        
+       
         all_keys = [
             get_jin_key(item)
             for item in jin_items
@@ -714,45 +729,45 @@ class SplitRuntime:
                     )
             bn_records = capture_batchnorm_inputs(self.model, x)
 
-            downsample_bn_override = {
-                "layer2.0.downsample.1": "batchnorm:32x128x16x16:4",
-                "layer3.0.downsample.1": "batchnorm:32x256x8x8:4",
-                "layer4.0.downsample.1": "batchnorm:32x512x4x4:4",
-            }
+            # downsample_bn_override = {
+            #     "layer2.0.downsample.1": "batchnorm:32x128x16x16:4",
+            #     "layer3.0.downsample.1": "batchnorm:32x256x8x8:4",
+            #     "layer4.0.downsample.1": "batchnorm:32x512x4x4:4",
+            # }
 
-            for r in bn_records:
-                name = r["name"]
+            # for r in bn_records:
+            #     name = r["name"]
 
-                if name not in downsample_bn_override:
-                    continue
+            #     if name not in downsample_bn_override:
+            #         continue
 
-                prefix = downsample_bn_override[name]
+            #     prefix = downsample_bn_override[name]
 
-                tensors = {
-                    "input": r["input"],
-                    "running_mean": r["running_mean"],
-                    "running_var": r["running_var"],
-                }
+            #     tensors = {
+            #         "input": r["input"],
+            #         "running_mean": r["running_mean"],
+            #         "running_var": r["running_var"],
+            #     }
 
-                if r["weight"] is not None:
-                    tensors["weight"] = r["weight"]
+            #     if r["weight"] is not None:
+            #         tensors["weight"] = r["weight"]
 
-                for suffix, tensor in tensors.items():
-                    key = f"{prefix}:{suffix}"
+            #     for suffix, tensor in tensors.items():
+            #         key = f"{prefix}:{suffix}"
 
-                    payload.tensors[key] = tensor
+            #         payload.tensors[key] = tensor
 
-                    if key not in all_keys:
-                        all_keys.append(key)
+            #         if key not in all_keys:
+            #             all_keys.append(key)
 
-                    if key not in included_keys:
-                        included_keys.append(key)
+            #         if key not in included_keys:
+            #             included_keys.append(key)
 
-                    print(
-                        f"[SUPPLEMENT][BN_DOWNSAMPLE] {key} "
-                        f"module={name} "
-                        f"shape={tuple(tensor.shape)}"
-                    )
+            #         print(
+            #             f"[SUPPLEMENT][BN_DOWNSAMPLE] {key} "
+            #             f"module={name} "
+            #             f"shape={tuple(tensor.shape)}"
+            #         )
         # print("[DEBUG] payload tensor keys:", payload.tensors.keys())
         # payload.add_tensor("model.input", x.detach())
         payload.add_tensor("model.output", out)
@@ -788,6 +803,7 @@ class SplitRuntime:
             raise RuntimeError("backward_jin() is only available for Node B")
 
         self.model.train()
+        # self.model.eval()
         self.model.zero_grad(set_to_none=True)
 
         out_dummy = self.model(x_dummy)

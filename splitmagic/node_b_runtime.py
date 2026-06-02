@@ -53,6 +53,7 @@ def run_node_b(
 
         if "state_dict" in req:
             model.load_state_dict(req["state_dict"])
+            # model.eval()
 
         os.environ["JIN_ROLE"] = "B"
         os.environ["JIN_PAYLOAD_PATH"] = req["payload_path"]
@@ -76,7 +77,7 @@ def run_node_b(
         # print("[TEST][JIN1_READ] relu:1:out", t.shape, t.dtype, t.mean().item())
 
         loss = runtime_b.backward_jin(
-            x_dummy=x_dummy,
+            x_dummy,
             y=y,
             payload=req["payload"],
             loss_fn=F.cross_entropy,

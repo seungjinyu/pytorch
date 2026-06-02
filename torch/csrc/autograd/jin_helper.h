@@ -16,7 +16,7 @@ bool jin_has_key(const char* key);
 bool jin_overwrite_by_key(at::Tensor& t, const char* key);
 
 // conv2d
-void jin_overwrite_conv_input(at::Tensor& t);
+void jin_overwrite_conv_input(at::Tensor& t, const at::Tensor& w);
 void jin_overwrite_conv_weight(at::Tensor& t);
 
 // relu

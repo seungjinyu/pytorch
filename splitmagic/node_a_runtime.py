@@ -101,6 +101,7 @@ def run_node_a(
 
             reply = client.send_payload(
                 payload=payload,
+                
                 y=y,
                 batch_size=x.size(0),
                 extra=extra,
