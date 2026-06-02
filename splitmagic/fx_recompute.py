@@ -6,6 +6,17 @@ class FXRecomputeEngine:
         self.model = model
         self.modules = dict(model.named_modules())
 
+        # FX node name: features_9
+        # PyTorch module name: features.9
+        aliases = {}
+
+        for name, module in self.modules.items():
+            if "." in name:
+                aliases[name.replace(".", "_")] = module
+
+        self.modules.update(aliases)
+
+        print("[RECOMPUTE][MODULE_KEYS]", sorted(self.modules.keys()))
     def run_path(self, start_node, start_tensor, path):
         """
         path example:

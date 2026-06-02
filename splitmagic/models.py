@@ -1,3 +1,4 @@
+from torchvision.models import vgg11_bn
 from torchvision.models import resnet18
 import torch.nn as nn
 
@@ -119,9 +120,6 @@ class TinyResNetNoBN(nn.Module):
 
         return x
     
-    
-import torch.nn as nn
-
 
 def make_resnet18_cifar10():
     model = resnet18(weights=None)
@@ -138,6 +136,90 @@ def make_resnet18_cifar10():
     model.fc = nn.Linear(model.fc.in_features, 10)
 
     # inplace ReLU 끄기
+    for m in model.modules():
+        if isinstance(m, nn.ReLU):
+            m.inplace = False
+
+    return model
+
+class VGGLikeCIFAR(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+
+        self.features = nn.Sequential(
+            # block 1: 32x32
+            nn.Conv2d(3, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),  # 16x16
+
+            # block 2
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),  # 8x8
+
+            # block 3
+            nn.Conv2d(128, 256, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(256, 256, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),  # 4x4
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(256 * 4 * 4, 512),
+            nn.ReLU(),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_classes),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.flatten(1)
+        x = self.classifier(x)
+        return x
+    
+
+class TinyBNNet(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(3, 16, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.relu1 = nn.ReLU()
+
+        self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(32)
+        self.relu2 = nn.ReLU()
+
+        self.pool = nn.MaxPool2d(2, 2)
+        self.fc = nn.Linear(32 * 16 * 16, num_classes)
+
+    def forward(self, x):
+        x = self.relu1(self.bn1(self.conv1(x)))
+        x = self.relu2(self.bn2(self.conv2(x)))
+        x = self.pool(x)
+        x = x.flatten(1)
+        x = self.fc(x)
+        return x
+    
+
+
+def make_vgg11_bn_cifar10():
+    model = vgg11_bn(weights=None)
+
+    model.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+
+    model.classifier = nn.Sequential(
+        nn.Linear(512, 256),
+        nn.ReLU(inplace=False),
+        nn.Linear(256, 10),
+    )
+
     for m in model.modules():
         if isinstance(m, nn.ReLU):
             m.inplace = False

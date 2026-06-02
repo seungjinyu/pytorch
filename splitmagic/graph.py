@@ -73,7 +73,7 @@ def format_saved_attr(name, value):
         return f"{name}: {type(value).__name__}({', '.join(parts)})"
     return f"{name}: {repr(value)}"
 
-def collect_saved_attrs(loss, tensor_only=True, max_depth=50):
+def collect_saved_attrs(loss, tensor_only=True, max_depth=1000000):
     items = []
     seen = set()
 
@@ -87,6 +87,7 @@ def collect_saved_attrs(loss, tensor_only=True, max_depth=50):
         node_name = fn.__class__.__name__
 
         attrs = [a for a in dir(fn) if a.startswith("_saved_")]
+
 
         priority = {
             "_saved_input": 0,
@@ -103,13 +104,35 @@ def collect_saved_attrs(loss, tensor_only=True, max_depth=50):
         for attr in attrs:
             try:
                 value = getattr(fn, attr)
+                if "AddBackward" in node_name:
+                    print("[ADD ATTR]", node_name, attr, type(value))
+
             except Exception:
                 continue
 
             if tensor_only and not torch.is_tensor(value):
                 continue
 
+
+
             if torch.is_tensor(value):
+
+                if "Conv" in node_name or "Convolution" in node_name:
+                    print(
+                        "[AUTOGRAD NODE]",
+                        node_name,
+                        attr,
+                        tuple(value.shape)
+                    )
+                if "AddBackward" in node_name:
+                    print(
+                        "[ADD NODE]",
+                        node_name,
+                        attr,
+                        tuple(value.shape)
+                    )
+
+
                 items.append({
                     "node": node_name,
                     "attr": attr,

@@ -1,3 +1,9 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import os
+
 # 사용자가 import 하는 입구
 # Node A / Node B 역할 선택 
 from .graph import collect_saved_attrs
@@ -81,6 +87,306 @@ LENET_OPTIONAL_OR_REPLACEABLE_KEYS = {
     # "relu:2:out",
     # "relu:3:out",
 }
+def build_module_alias_map(jin_items, module_records):
+    """
+    기존 shape/counter key -> module-name key 매핑 생성.
+
+    주의:
+    - shape만으로 매칭하면 BN의 result1/result2/running_mean/weight가 섞임.
+    - 그래서 op 종류 + attr 종류별로 분리해서 매칭한다.
+    - BN result1/result2는 module hook에서 직접 얻기 어렵기 때문에 여기서는 alias하지 않는다.
+    """
+
+    alias = {}
+
+    module_by_kind = {
+        "conv2d_input": [],
+        "batchnorm_input": [],
+        "batchnorm_running_mean": [],
+        "batchnorm_running_var": [],
+        "batchnorm_weight": [],
+        "relu_out": [],
+        "maxpool2d_input": [],
+        "maxpool2d_indices": [],
+        "addmm_mat1": [],
+    }
+
+    # 1. module-name records를 종류별로 분리
+    for r in module_records:
+        key = r["key"]
+
+        if key.startswith("module:conv2d:") and key.endswith(":input"):
+            module_by_kind["conv2d_input"].append(r)
+
+        elif key.startswith("module:batchnorm:") and key.endswith(":input"):
+            module_by_kind["batchnorm_input"].append(r)
+
+        elif key.startswith("module:batchnorm:") and key.endswith(":running_mean"):
+            module_by_kind["batchnorm_running_mean"].append(r)
+
+        elif key.startswith("module:batchnorm:") and key.endswith(":running_var"):
+            module_by_kind["batchnorm_running_var"].append(r)
+
+        elif key.startswith("module:batchnorm:") and key.endswith(":weight"):
+            module_by_kind["batchnorm_weight"].append(r)
+
+        elif key.startswith("module:relu:") and key.endswith(":out"):
+            module_by_kind["relu_out"].append(r)
+
+        elif key.startswith("module:maxpool2d:") and key.endswith(":input"):
+            module_by_kind["maxpool2d_input"].append(r)
+
+        elif key.startswith("module:maxpool2d:") and key.endswith(":indices"):
+            module_by_kind["maxpool2d_indices"].append(r)
+
+        elif key.startswith("module:addmm:") and key.endswith(":mat1"):
+            module_by_kind["addmm_mat1"].append(r)
+
+    for kind in module_by_kind:
+        module_by_kind[kind] = list(reversed(module_by_kind[kind]))
+
+    used = set()
+
+    def get_kind(old_key):
+        if old_key.startswith("conv2d:") and old_key.endswith(":input"):
+            return "conv2d_input"
+
+        if old_key.startswith("batchnorm:"):
+            # if old_key.endswith(":input"):
+            #     return "batchnorm_input"
+            # if old_key.endswith(":running_mean"):
+            #     return "batchnorm_running_mean"
+            # if old_key.endswith(":running_var"):
+            #     return "batchnorm_running_var"
+            # if old_key.endswith(":weight"):
+            #     return "batchnorm_weight"
+            return None
+
+        if old_key.startswith("relu:") and old_key.endswith(":out"):
+            return "relu_out"
+
+        if old_key.startswith("maxpool2d:") and old_key.endswith(":input"):
+            return "maxpool2d_input"
+
+        if old_key.startswith("maxpool2d:") and old_key.endswith(":indices"):
+            return "maxpool2d_indices"
+
+        if old_key.startswith("addmm:") and old_key.endswith(":mat1"):
+            return "addmm_mat1"
+
+        return None
+
+    # 2. old JIN key를 module-name key에 매칭
+    for item in jin_items:
+        old_key = item.get("jin_key")
+        if old_key is None:
+            continue
+
+        kind = get_kind(old_key)
+        if kind is None:
+            continue
+
+        shape = tuple(item["shape"])
+        candidates = module_by_kind[kind]
+
+        for r in candidates:
+            rid = id(r)
+
+            if rid in used:
+                continue
+
+            if tuple(r["shape"]) == shape:
+                alias[old_key] = r["key"]
+                used.add(rid)
+                break
+
+    return alias
+
+def capture_module_named_payload( model , x ):
+    import torch.nn as nn
+
+    records = []
+    handles = []
+
+    def add_record(key, tensor):
+        records.append({
+            "key": key,
+            "tensor": tensor.detach().cpu().clone(),
+            "shape": tuple(tensor.shape),
+        })
+    
+    def make_hook(name, module):
+
+        def hook(mod, inputs, output):
+            if len(inputs) == 0:
+                return
+            
+            inp = inputs[0]
+
+            if isinstance(mod, nn.Conv2d):
+                add_record(f"module:conv2d:{name}:input", inp)
+
+            elif isinstance(mod , nn.BatchNorm2d):
+                add_record(f"module:batchnorm:{name}:input", inp)
+                add_record(f"module:batchnorm:{name}:running_mean", mod.running_mean)
+                add_record(f"module:batchnorm:{name}:running_var", mod.running_var)
+
+                if mod.weight is not None:
+                    add_record(f"module:batchnorm:{name}:weight", mod.weight)
+
+            elif isinstance(mod, nn.ReLU):
+                add_record(f"module:relu:{name}:out", output)
+            
+            elif isinstance(mod, nn.Linear):
+                add_record(f"module:addmm:{name}:mat1", inp)
+
+            elif isinstance(mod, nn.MaxPool2d):
+
+                add_record(f"module:maxpool2d:{name}:input", inp)
+
+                _, indices = F.max_pool2d(
+                    inp,
+                    kernel_size=mod.kernel_size,
+                    stride=mod.stride,
+                    padding=mod.padding,
+                    dilation=mod.dilation,
+                    ceil_mode=mod.ceil_mode,
+                    return_indices=True,
+                )
+
+                add_record(f"module:maxpool2d:{name}:indices", indices)
+        return hook
+    
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Conv2d, nn.BatchNorm2d, nn.ReLU, nn.Linear, nn.MaxPool2d)):
+            handles.append(module.register_forward_hook(make_hook(name, module)))
+
+    with torch.no_grad():
+
+        model(x)
+
+    for h in handles:
+        h.remove()
+
+    return records
+                
+
+
+def capture_batchnorm_inputs(model, x):
+    import torch.nn as nn
+
+    records = []
+    handles = []
+
+    def make_hook(name):
+        def hook(mod, inputs, output):
+            if len(inputs) == 0:
+                return
+
+            inp = inputs[0]
+
+            records.append({
+                "name": name,
+                "input": inp.detach().cpu().clone(),
+                "input_shape": tuple(inp.shape),
+                "running_mean": mod.running_mean.detach().cpu().clone(),
+                "running_var": mod.running_var.detach().cpu().clone(),
+                "weight": mod.weight.detach().cpu().clone()
+                if mod.weight is not None else None,
+            })
+
+        return hook
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.BatchNorm2d):
+            handles.append(module.register_forward_hook(make_hook(name)))
+
+    with torch.no_grad():
+        model(x)
+
+    for h in handles:
+        h.remove()
+
+    return records
+
+def capture_conv1x1_inputs(model, x):
+    records = []
+    handles = []
+
+    def make_hook(name, module):
+        def hook(mod, inputs, output):
+            if len(inputs) == 0:
+                return
+
+            inp = inputs[0]
+
+            if not hasattr(inp, "shape"):
+                return
+
+            if not isinstance(mod, nn.Conv2d):
+                return
+
+            if mod.kernel_size != (1, 1):
+                return
+
+            records.append({
+                "name": name,
+                "input": inp.detach().cpu().clone(),
+                "input_shape": tuple(inp.shape),
+                "weight_shape": tuple(mod.weight.shape),
+            })
+
+        return hook
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv2d):
+            handles.append(module.register_forward_hook(make_hook(name, module)))
+
+    with torch.no_grad():
+        model(x)
+
+    for h in handles:
+        h.remove()
+
+    return records
+
+def capture_batchnorm_saved_by_module(model, x):
+    records = []
+    handles = []
+
+    def make_hook(name, module):
+        def hook(mod, inputs, output):
+            if len(inputs) == 0:
+                return
+
+            inp = inputs[0]
+
+            records.append({
+                "name": name,
+                "input": inp.detach().cpu().clone(),
+                "input_shape": tuple(inp.shape),
+                "running_mean": mod.running_mean.detach().cpu().clone(),
+                "running_var": mod.running_var.detach().cpu().clone(),
+                "weight": mod.weight.detach().cpu().clone() if mod.weight is not None else None,
+            })
+
+        return hook
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.BatchNorm2d):
+            handles.append(module.register_forward_hook(make_hook(name, module)))
+
+    with torch.no_grad():
+        model(x)
+
+    for h in handles:
+        h.remove()
+
+    return records
+
+
+def shape_sig(shape):
+    return "x".join(str(int(s)) for s in shape)
 
 def classify_jin_key_for_policy(key):
     """
@@ -97,6 +403,15 @@ def classify_jin_key_for_policy(key):
         return "send"
     if key.startswith("maxpool2d:") and key.endswith(":input"):
         return "send"
+    # if key.startswith("batchnorm:") and (
+    #     key.endswith(":running_mean")
+    #     or key.endswith(":running_var")
+    #     or key.endswith(":weight")
+    # ):
+    #     return "local"
+    
+    if key.startswith("batchnorm:"):
+        return "send"
 
     # model input 쪽 conv input은 우선 send 유지
     # 일반적으로 가장 마지막 conv index가 실제 model input일 가능성이 높음.
@@ -106,10 +421,10 @@ def classify_jin_key_for_policy(key):
 
     # Recomputable candidates
     if key.startswith("relu:") and key.endswith(":out"):
-        return "recompute"
+        return "send"
 
     if key.startswith("addmm:") and key.endswith(":mat1"):
-        return "recompute"
+        return "send"
 
     # default: send
     return "send"
@@ -290,6 +605,7 @@ class SplitRuntime:
         loss_fn,
         policy="full",
         optional_keys=None,
+        key_mode="module",
     ):
 
         if self.role != "A":
@@ -328,6 +644,115 @@ class SplitRuntime:
 
         payload = payload_from_jin_items(jin_items)
 
+        if key_mode == "module_debug":
+            module_records = capture_module_named_payload(
+                self.model,
+                x,
+            )
+
+            for r in module_records:
+                key = r["key"]
+                tensor = r["tensor"]
+
+                if key not in payload.tensors:
+                    payload.add_tensor(key, tensor)
+
+                    all_keys.append(key)
+                    included_keys.append(key)
+
+                print(
+                    f"[MODULE_PAYLOAD] {key} "
+                    f"shape={r['shape']}"
+                )
+
+            alias_map = build_module_alias_map(
+                jin_items,
+                module_records,
+            )
+
+            payload.meta = getattr(payload, "meta", {})
+            payload.meta["alias_map"] = alias_map
+            alias_path = "/tmp/jin_payload_recv.bin" + ".alias"
+
+            with open(alias_path, "w") as f:
+                for old_key, new_key in alias_map.items():
+                    f.write(f"{old_key}\t{new_key}\n")
+
+            print(f"[MODULE_ALIAS_FILE] saved: {alias_path}")
+
+            print("[MODULE_ALIAS_MAP]")
+            for old_key, new_key in alias_map.items():
+                print(f"  {old_key} -> {new_key}")
+
+        if policy in ("full", "auto_recompute"):
+            conv1x1_records = capture_conv1x1_inputs(self.model, x)
+
+            # backward order에 맞추기 위해 reverse
+            conv1x1_records = list(reversed(conv1x1_records))
+
+            sig_counts = {}
+
+            for r in conv1x1_records:
+                in_sig = shape_sig(r["input_shape"])
+                w_sig = shape_sig(r["weight_shape"])
+
+                sig = f"{in_sig}:{w_sig}"
+                idx = sig_counts.get(sig, 0)
+                sig_counts[sig] = idx + 1
+
+                key = f"conv2d:{in_sig}:{w_sig}:{idx}:input"
+
+                if key not in payload.tensors:
+                    payload.add_tensor(key, r["input"])
+                    all_keys.append(key)
+                    included_keys.append(key)
+
+                    print(
+                        f"[SUPPLEMENT][CONV1x1] {key} "
+                        f"module={r['name']} "
+                        f"shape={r['input_shape']}"
+                    )
+            bn_records = capture_batchnorm_inputs(self.model, x)
+
+            downsample_bn_override = {
+                "layer2.0.downsample.1": "batchnorm:32x128x16x16:4",
+                "layer3.0.downsample.1": "batchnorm:32x256x8x8:4",
+                "layer4.0.downsample.1": "batchnorm:32x512x4x4:4",
+            }
+
+            for r in bn_records:
+                name = r["name"]
+
+                if name not in downsample_bn_override:
+                    continue
+
+                prefix = downsample_bn_override[name]
+
+                tensors = {
+                    "input": r["input"],
+                    "running_mean": r["running_mean"],
+                    "running_var": r["running_var"],
+                }
+
+                if r["weight"] is not None:
+                    tensors["weight"] = r["weight"]
+
+                for suffix, tensor in tensors.items():
+                    key = f"{prefix}:{suffix}"
+
+                    payload.tensors[key] = tensor
+
+                    if key not in all_keys:
+                        all_keys.append(key)
+
+                    if key not in included_keys:
+                        included_keys.append(key)
+
+                    print(
+                        f"[SUPPLEMENT][BN_DOWNSAMPLE] {key} "
+                        f"module={name} "
+                        f"shape={tuple(tensor.shape)}"
+                    )
         # print("[DEBUG] payload tensor keys:", payload.tensors.keys())
         # payload.add_tensor("model.input", x.detach())
         payload.add_tensor("model.output", out)
@@ -344,7 +769,7 @@ class SplitRuntime:
             "optional_keys": sorted(list(optional_keys or [])),
         }
 
-        print("[A][POLICY]", policy_meta)
+        # print("[A][POLICY]", policy_meta)
 
         payload.add_meta("tensor_policy", policy_meta)
 

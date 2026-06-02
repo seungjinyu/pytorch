@@ -5,27 +5,25 @@ import torch.nn.functional as F
 from splitmagic import SplitRuntime, ZMQClient
 from splitmagic.utils.timing import CSVLogger
 
-
-def evaluate(model, loader):
-
+@torch.no_grad()
+def evaluate(model, test_loader, device="cpu"):
     model.eval()
 
-    correct = 0
     total = 0
+    correct = 0
     total_loss = 0.0
 
-    with torch.no_grad():
-        for x, y in loader:
-            out = model(x)
-            loss = F.cross_entropy(out, y)
+    for x, y in test_loader:
+        x = x.to(device)
+        y = y.to(device)
 
-            total_loss += loss.item() * x.size(0)
+        out = model(x)
+        loss = F.cross_entropy(out, y)
 
-            pred = out.argmax(dim=1)
-            correct += (pred == y).sum().item()
-            total += y.size(0)
-
-    model.train()
+        pred = out.argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.size(0)
+        total_loss += loss.item() * y.size(0)
 
     return total_loss / total, correct / total
 
@@ -47,6 +45,7 @@ def run_node_a(
     policy="full",
     optional_keys=None,
     grad_save_path=None,
+    key_mode="shape",
 ):
 
     runtime_a = SplitRuntime(model, role="A")
@@ -83,7 +82,8 @@ def run_node_a(
                 y=y,
                 loss_fn=F.cross_entropy,
                 policy=policy, 
-                optional_keys=optional_keys,  
+                optional_keys=optional_keys, 
+                key_mode=key_mode, 
             )
 
             policy_meta = payload.meta.get("tensor_policy", {})
@@ -106,17 +106,17 @@ def run_node_a(
                 extra=extra,
             )
 
+            if grad_save_path is not None and "grads" in reply:
+                torch.save(reply["grads"], grad_save_path)
+                print(f"[Node A] saved grads to {grad_save_path}")
+                return
+
 
             t_send1 = time.perf_counter()
 
             if reply["status"] != "ok":
                 print("[Node A] bad reply:", reply)
                 break
-
-            if grad_save_path is not None and "grads" in reply:
-                torch.save(reply["grads"], grad_save_path)
-                print(f"[Node A] saved grads to {grad_save_path}")
-                return
             
             t_load0 = time.perf_counter()
 
@@ -159,6 +159,8 @@ def run_node_a(
             global_step += 1
 
     test_loss, test_acc = evaluate(model, test_loader)
+    
+    torch.save(model.state_dict(), "vgg11_bn_split_final.pt")
 
     print(
         f"[Eval] "
@@ -167,3 +169,29 @@ def run_node_a(
     )
 
     print("[Node A] done")
+
+@torch.no_grad()
+def evaluate_accuracy(model, test_loader, device="cpu"):
+    model.eval()
+
+    total = 0
+    correct = 0
+    total_loss = 0.0
+
+    for x, y in test_loader:
+        x = x.to(device)
+        y = y.to(device)
+
+        out = model(x)
+        loss = F.cross_entropy(out, y)
+
+        pred = out.argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.size(0)
+        total_loss += loss.item() * y.size(0)
+
+    acc = 100.0 * correct / total
+    avg_loss = total_loss / total
+
+    model.train()
+    return avg_loss, acc
