@@ -45,7 +45,7 @@ def run_node_a(
     policy="full",
     optional_keys=None,
     grad_save_path=None,
-    key_mode="shape",
+    key_mode="module_debug",
 ):
 
     runtime_a = SplitRuntime(model, role="A")

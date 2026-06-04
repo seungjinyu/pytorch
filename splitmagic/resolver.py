@@ -33,27 +33,36 @@ class SavedTensorResolver:
         self.local_keys = local_keys
         self.sources = {}
 
+        self.alias_map = getattr(self.payload, "meta", {}).get("alias_map", {})
+
         self.jin1_keys = set()
         if payload_path is not None:
             self.jin1_keys = read_jin1_keys(payload_path)
 
     def has_payload(self, key):
+        lookup_key = self.alias(key)
         return (
-            key in self.payload.tensors or key in self.jin1_keys
+            lookup_key in self.payload.tensors or lookup_key in self.jin1_keys
         )
-    
     def is_local(self, key):
         return key in self.local_keys
     
     def can_recompute(self, key):
         # not implemented yet
         return False
+    def alias(self, key):
+        return self.alias_map.get(key, key)
     def resolve(self, key):
-        if key in self.payload.tensors:
-            self.sources[key] = "payload_python"
-            return self.payload.tensors[key], "payload_python"
+        lookup_key = self.alias(key)
 
-        if key in self.jin1_keys:
+        if lookup_key != key:
+            print(f"[ALIAS_RESOLVE] {key} -> {lookup_key}")
+
+        if lookup_key in self.payload.tensors:
+            self.sources[key] = "payload_python"
+            return self.payload.tensors[lookup_key], "payload_python"
+
+        if lookup_key in self.jin1_keys:
             self.sources[key] = "payload_jin1"
             return None, "payload_jin1"
 

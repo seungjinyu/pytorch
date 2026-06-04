@@ -53,7 +53,6 @@ def run_node_b(
 
         if "state_dict" in req:
             model.load_state_dict(req["state_dict"])
-            # model.eval()
 
         os.environ["JIN_ROLE"] = "B"
         os.environ["JIN_PAYLOAD_PATH"] = req["payload_path"]

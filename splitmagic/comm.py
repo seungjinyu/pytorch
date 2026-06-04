@@ -60,11 +60,16 @@ class ZMQServer:
 
         payload_bytes = msg["payload"]
 
+        # network로 받은 bytes를 C++ JIN이 읽을 파일로 저장
         with open(payload_path, "wb") as f:
             f.write(payload_bytes)
 
+        # Python 쪽 payload는 model.output만 있으면 됨
         payload = Payload()
         payload.add_tensor("model.output", msg["model_output"])
+
+        print("[RECV_PAYLOAD_BYTES]", len(payload_bytes))
+        print("[RECV_KEYS]", list(payload.tensors.keys()))
 
         req = {
             "payload": payload,
@@ -74,7 +79,6 @@ class ZMQServer:
             "num_bytes": len(payload_bytes),
         }
 
-        # extra fields 보존
         for k, v in msg.items():
             if k not in {
                 "type",
@@ -86,6 +90,5 @@ class ZMQServer:
                 req[k] = v
 
         return req
-
     def send_reply(self, reply):
         self.sock.send_pyobj(reply)

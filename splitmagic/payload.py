@@ -38,6 +38,12 @@ class Payload:
 
         with open(path, "wb") as f:
             f.write(b"JIN1")
+            print("=== SAVE_JIN1_KEYS ===")
+
+            for k in sorted(self.tensors.keys()):
+                if k.startswith("graph:bn:"):
+                    print(k)
+
             f.write(struct.pack("<I", len(self.tensors)))
 
             for key, tensor in self.tensors.items():
@@ -99,17 +105,35 @@ def payload_from_jin_items(items):
     payload = Payload()
 
     for item in items:
-        key = item["jin_key"]
+        # key = item["jin_key"]
+        tensor = item["tensor"]
+        graph_key = item.get("graph_key")
 
-        payload.add_tensor(key, item["tensor"])
-        payload.add_meta(key, {
+        if graph_key is None:
+            continue
+
+        payload.add_tensor(graph_key, tensor)
+
+        payload.add_meta(graph_key, {
             "node": item["node"],
             "attr": item["attr"],
             "shape": item["shape"],
             "dtype": str(item["dtype"]),
             "requires_grad": item["requires_grad"],
-            "jin_key": key,
+            "graph_key": graph_key,
+            "legacy_jin_key": item.get("jin_key"),
         })
+        # NEW: graph_key 추가 저장
+        print(
+            f"[GRAPH_KEY_ADD] "
+            f"{graph_key} "
+            f"shape={tuple(tensor.shape)}"
+        )
+    print("=== PAYLOAD_FROM_JIN_ITEMS ===")
+
+    for k in sorted(payload.tensors.keys()):
+        if k.startswith("graph:bn:"):
+            print(k)
 
     return payload
 

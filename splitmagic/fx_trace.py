@@ -452,9 +452,9 @@ def analyze_recompute_for_missing_keys(model, missing_keys, available_nodes=None
         }
 
         status = "YES" if ok else "NO"
-        print(f"  {key}: can_recompute={status}")
-        print(f"    nearest_start={nearest_start}")
-        print(f"    path={' -> '.join(path) if path else '<none>'}")
+        # print(f"  {key}: can_recompute={status}")
+        # print(f"    nearest_start={nearest_start}")
+        # print(f"    path={' -> '.join(path) if path else '<none>'}")
 
         for r in reasons:
             print(f"    - {r}")

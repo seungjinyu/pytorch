@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import os
+from collections import defaultdict
 
 # 사용자가 import 하는 입구
 # Node A / Node B 역할 선택 
@@ -25,6 +25,8 @@ from .fx_trace import (
 )
 from .recompute import FXRecomputeEngine
 from .resolver import read_jin1_payload
+from .debug_backward_graph import dump_backward_graph
+
 
 ALWAYS_LOCAL_KEYS = {
     "conv2d:0:weight",
@@ -87,162 +89,77 @@ LENET_OPTIONAL_OR_REPLACEABLE_KEYS = {
     # "relu:2:out",
     # "relu:3:out",
 }
-def build_module_alias_map(jin_items, module_records):
-    """
-    기존 shape/counter key -> module-name key 매핑 생성.
+def capture_module_named_payload(model):
 
-    주의:
-    - shape만으로 매칭하면 BN의 result1/result2/running_mean/weight가 섞임.
-    - 그래서 op 종류 + attr 종류별로 분리해서 매칭한다.
-    - BN result1/result2는 module hook에서 직접 얻기 어렵기 때문에 여기서는 alias하지 않는다.
-    """
-
-    alias = {}
-
-    module_by_kind = {
-        "conv2d_input": [],
-        "batchnorm_input": [],
-        "batchnorm_running_mean": [],
-        "batchnorm_running_var": [],
-        "batchnorm_weight": [],
-        "relu_out": [],
-        "maxpool2d_input": [],
-        "maxpool2d_indices": [],
-        "addmm_mat1": [],
-    }
-
-    # 1. module-name records를 종류별로 분리
-    for r in module_records:
-        key = r["key"]
-
-        if key.startswith("module:conv2d:") and key.endswith(":input"):
-            module_by_kind["conv2d_input"].append(r)
-
-        elif key.startswith("module:batchnorm:") and key.endswith(":input"):
-            module_by_kind["batchnorm_input"].append(r)
-
-        elif key.startswith("module:batchnorm:") and key.endswith(":running_mean"):
-            module_by_kind["batchnorm_running_mean"].append(r)
-
-        elif key.startswith("module:batchnorm:") and key.endswith(":running_var"):
-            module_by_kind["batchnorm_running_var"].append(r)
-
-        elif key.startswith("module:batchnorm:") and key.endswith(":weight"):
-            module_by_kind["batchnorm_weight"].append(r)
-
-        elif key.startswith("module:relu:") and key.endswith(":out"):
-            module_by_kind["relu_out"].append(r)
-
-        elif key.startswith("module:maxpool2d:") and key.endswith(":input"):
-            module_by_kind["maxpool2d_input"].append(r)
-
-        elif key.startswith("module:maxpool2d:") and key.endswith(":indices"):
-            module_by_kind["maxpool2d_indices"].append(r)
-
-        elif key.startswith("module:addmm:") and key.endswith(":mat1"):
-            module_by_kind["addmm_mat1"].append(r)
-
-    for kind in module_by_kind:
-        module_by_kind[kind] = list(reversed(module_by_kind[kind]))
-
-    used = set()
-
-    def get_kind(old_key):
-        if old_key.startswith("conv2d:") and old_key.endswith(":input"):
-            return "conv2d_input"
-
-        if old_key.startswith("batchnorm:"):
-            # if old_key.endswith(":input"):
-            #     return "batchnorm_input"
-            # if old_key.endswith(":running_mean"):
-            #     return "batchnorm_running_mean"
-            # if old_key.endswith(":running_var"):
-            #     return "batchnorm_running_var"
-            # if old_key.endswith(":weight"):
-            #     return "batchnorm_weight"
-            return None
-
-        if old_key.startswith("relu:") and old_key.endswith(":out"):
-            return "relu_out"
-
-        if old_key.startswith("maxpool2d:") and old_key.endswith(":input"):
-            return "maxpool2d_input"
-
-        if old_key.startswith("maxpool2d:") and old_key.endswith(":indices"):
-            return "maxpool2d_indices"
-
-        if old_key.startswith("addmm:") and old_key.endswith(":mat1"):
-            return "addmm_mat1"
-
-        return None
-
-    # 2. old JIN key를 module-name key에 매칭
-    for item in jin_items:
-        old_key = item.get("jin_key")
-        if old_key is None:
-            continue
-
-        kind = get_kind(old_key)
-        if kind is None:
-            continue
-
-        shape = tuple(item["shape"])
-        candidates = module_by_kind[kind]
-
-        for r in candidates:
-            rid = id(r)
-
-            if rid in used:
-                continue
-
-            if tuple(r["shape"]) == shape:
-                alias[old_key] = r["key"]
-                used.add(rid)
-                break
-
-    return alias
-
-def capture_module_named_payload( model , x ):
     import torch.nn as nn
+    import torch.nn.functional as F
 
     records = []
     handles = []
+    call_counts = {}
+    bn_records_by_name = defaultdict(list)
 
     def add_record(key, tensor):
+        t = tensor.detach().cpu().clone()
+
+        print(f"[ADD_RECORD] {key}")
         records.append({
             "key": key,
-            "tensor": tensor.detach().cpu().clone(),
-            "shape": tuple(tensor.shape),
+            "graph_key": key,
+            "tensor": t,
+            "node": "module",
+            "attr": key,
+            "shape": tuple(t.shape),
+            "dtype": t.dtype,
+            "requires_grad": bool(getattr(tensor, "requires_grad", False)),
         })
-    
-    def make_hook(name, module):
 
+    def make_call_key(base_key):
+        i = call_counts.get(base_key, 0)
+        call_counts[base_key] = i + 1
+        return f"{base_key}#{i}"
+
+    def make_hook(name, module):
         def hook(mod, inputs, output):
             if len(inputs) == 0:
                 return
-            
+
             inp = inputs[0]
+            if isinstance(mod, nn.BatchNorm2d):
+                print(f"[BN_HOOK] {name} shape={tuple(inp.shape)}")
+                bn_records_by_name[name].append({
+                    "input": inp.detach().cpu().clone(),
+                    "running_mean": mod.running_mean.detach().cpu(),
+                    "running_var": mod.running_var.detach().cpu(),
+                    "weight": (
+                        mod.weight.detach().cpu()
+                        if mod.weight is not None
+                        else None
+                    ),
+                })
 
-            if isinstance(mod, nn.Conv2d):
-                add_record(f"module:conv2d:{name}:input", inp)
-
-            elif isinstance(mod , nn.BatchNorm2d):
-                add_record(f"module:batchnorm:{name}:input", inp)
-                add_record(f"module:batchnorm:{name}:running_mean", mod.running_mean)
-                add_record(f"module:batchnorm:{name}:running_var", mod.running_var)
-
-                if mod.weight is not None:
-                    add_record(f"module:batchnorm:{name}:weight", mod.weight)
-
+            elif isinstance(mod, nn.Conv2d):
+                add_record(
+                    f"graph:conv:{name}:input",
+                    inp,
+                )
             elif isinstance(mod, nn.ReLU):
-                add_record(f"module:relu:{name}:out", output)
-            
+                idx = call_counts.get("relu_mask", 0)
+                call_counts["relu_mask"] = idx + 1
+
+                mask = (output > 0).to(torch.uint8)
+
+                add_record(
+                    f"relu_mask:{idx}",
+                    mask,
+                )
+
             elif isinstance(mod, nn.Linear):
-                add_record(f"module:addmm:{name}:mat1", inp)
+                add_record(f"graph:addmm:{name}:mat1", inp)
+                add_record(f"graph:addmm:{name}:mat2", mod.weight.t())
 
             elif isinstance(mod, nn.MaxPool2d):
-
-                add_record(f"module:maxpool2d:{name}:input", inp)
+                add_record(f"graph:maxpool2d:{name}:input", inp)
 
                 _, indices = F.max_pool2d(
                     inp,
@@ -253,23 +170,189 @@ def capture_module_named_payload( model , x ):
                     ceil_mode=mod.ceil_mode,
                     return_indices=True,
                 )
+                add_record(f"graph:maxpool2d:{name}:indices", indices)
 
-                add_record(f"module:maxpool2d:{name}:indices", indices)
         return hook
-    
     for name, module in model.named_modules():
-        if isinstance(module, (nn.Conv2d, nn.BatchNorm2d, nn.ReLU, nn.Linear, nn.MaxPool2d)):
+        if isinstance(module, (nn.BatchNorm2d, nn.Conv2d, nn.ReLU, nn.Linear, nn.MaxPool2d)):
             handles.append(module.register_forward_hook(make_hook(name, module)))
+    def finalize_bn_records(jin_items):
+        import torch
 
-    with torch.no_grad():
+        print("[BN_HOOK_KEYS]", sorted(bn_records_by_name.keys()))
 
-        model(x)
+        used_names = set()
 
-    for h in handles:
-        h.remove()
+        for item in jin_items:
+            gk = item.get("graph_key", "")
 
-    return records
-                
+            if not (gk.startswith("graph:bn:") and gk.endswith(":input")):
+                continue
+
+            parts = gk.split(":")
+            idx = int(parts[2])
+
+            target = item["tensor"].detach().cpu()
+
+            matched_name = None
+            matched_record = None
+
+            for bn_name, records in bn_records_by_name.items():
+                if bn_name in used_names:
+                    continue
+
+                for r in records:
+                    cand = r["input"]
+
+                    if tuple(cand.shape) != tuple(target.shape):
+                        continue
+
+                    if torch.equal(cand, target):
+                        matched_name = bn_name
+                        matched_record = r
+                        break
+
+                if matched_record is not None:
+                    break
+
+            if matched_record is None:
+                print(
+                    f"[BN_AUTO_MATCH_FAIL] idx={idx} "
+                    f"graph_key={gk} shape={tuple(target.shape)}"
+                )
+                continue
+
+            used_names.add(matched_name)
+
+            r = matched_record
+
+            print(
+                f"[BN_AUTO_MATCH] idx={idx} "
+                f"name={matched_name} "
+                f"shape={tuple(r['input'].shape)}"
+            )
+
+            add_record(f"graph:bn:{bn_name}:input", r["input"])
+            add_record(f"graph:bn:{bn_name}:running_mean", r["running_mean"])
+            add_record(f"graph:bn:{bn_name}:running_var", r["running_var"])
+
+            if r["weight"] is not None:
+                add_record(f"graph:bn:{bn_name}:weight", r["weight"])
+
+            print(f"[BN_FINALIZE_OK] idx={idx} name={matched_name}")
+
+    return records, handles, finalize_bn_records
+def build_module_alias_map(jin_items, module_records):
+    import torch
+
+    cxx_order = [
+        "layer4.1.bn2",
+        "layer4.1.bn1",
+
+        "layer4.0.bn2",
+        "layer4.0.downsample.1",
+        "layer4.0.bn1",
+
+        "layer3.1.bn2",
+        "layer3.1.bn1",
+
+        "layer3.0.bn2",
+        "layer3.0.downsample.1",
+        "layer3.0.bn1",
+
+        "layer2.1.bn2",
+        "layer2.1.bn1",
+
+        "layer2.0.bn2",
+        "layer2.0.downsample.1",
+        "layer2.0.bn1",
+
+        "layer1.1.bn2",
+        "layer1.1.bn1",
+
+        "layer1.0.bn2",
+        "layer1.0.bn1",
+
+        "bn1",
+    ]
+
+    bn_modules = [
+        r for r in module_records
+        if r["key"].startswith("module:batchnorm:")
+        and r["key"].endswith(":input")
+    ]
+
+    saved_alias_map = {}
+
+    bn_saved = {}
+
+    for item in jin_items:
+        old_key = get_jin_key(item)
+
+        if not old_key.startswith("batchnorm:"):
+            continue
+
+        parts = old_key.split(":")
+
+        if len(parts) < 3:
+            continue
+
+        idx = int(parts[1])
+        suffix = parts[2]
+
+        if suffix not in ("result1", "result2"):
+            continue
+
+        if idx not in bn_saved:
+            bn_saved[idx] = f"batchnorm:{idx}"
+
+    print("=== BN SAVED IDX ===")
+    for k in sorted(bn_saved.keys()):
+        print(k, bn_saved[k])
+
+    print("=== BN SAVED ORDER ===")
+    for i, x in enumerate(bn_saved):
+        print(i, x)
+
+    print("=== BN MODULE ORDER ===")
+    for i, x in enumerate(cxx_order):
+        print(i, x)
+
+    for idx, bn_name in enumerate(cxx_order):
+
+        if idx >= len(bn_saved):
+            break
+
+        old_prefix = bn_saved[idx]
+        new_prefix = f"graph:bn:{bn_name}"
+
+        # saved_alias_map[f"{old_prefix}:result1"] = f"{new_prefix}:result1"
+        # saved_alias_map[f"{old_prefix}:result2"] = f"{new_prefix}:result2"
+
+        print(
+            f"[BN_ALIAS] "
+            f"{old_prefix}:result1 -> {new_prefix}:result1"
+        )
+
+    print("=== FINAL CXX ORDER ===")
+    for i, n in enumerate(cxx_order):
+        print(i, n)
+
+    alias_map = {}
+
+    for idx, name in enumerate(cxx_order):
+        old_prefix = f"batchnorm:{idx}"
+        new_prefix = f"module:batchnorm:{name}"
+
+        for suffix in [
+            "input",
+            "running_mean",
+            "running_var",
+            "weight",
+        ]:
+            alias_map[f"{old_prefix}:{suffix}"] = f"{new_prefix}:{suffix}"
+
+    return alias_map, saved_alias_map
 
 
 def capture_batchnorm_inputs(model, x):
@@ -443,6 +526,12 @@ def is_always_local_key(key):
         return True
     if key.startswith("addmm:") and key.endswith(":mat2"):
         return True
+
+    if key.startswith("graph:conv:") and key.endswith(":weight"):
+        return True
+    if key.startswith("graph:addmm:") and key.endswith(":mat2"):
+        return True
+
     return False
 
 def parse_jin_index(key):
@@ -605,38 +694,40 @@ class SplitRuntime:
         loss_fn,
         policy="full",
         optional_keys=None,
-        key_mode="module",
+        key_mode="module_debug",
     ):
 
         if self.role != "A":
-            raise RuntimeError("Only role 'A' can capture tensors")
 
+            raise RuntimeError("Only role 'A' can capture tensors")
+        print(f"[CAPTURE_JIN] key_mode={key_mode} policy={policy}")
         self.model.train()
         self.model.zero_grad(set_to_none=True)
-        # self.model.eval()
-        out = self.model(x)
-        print("[DEBUG] logits_sum", out.detach().sum().item())
-        print("[DEBUG] logits_mean", out.detach().mean().item())
-        print("[DEBUG] label_sum", y.sum().item())
+        
+        module_records = []
+        module_handles = []
+
+        if key_mode in ("module_debug","graph"):
+            module_records, module_handles,finalize_bn_records = capture_module_named_payload(self.model)
+
+        try:
+            out = self.model(x)
+        finally:
+            for h in module_handles:
+                h.remove()
+
         loss = loss_fn(out, y)
+        dump_backward_graph(loss)
 
         items = collect_saved_attrs(loss)
+        jin_items = assign_jin_keys_by_autograd_order(items)
 
-        # JIN key 할당 by order
-        # jin_items = assign_jin_keys(items)
-        # 260602 - JIN key 할당 by autograd order (실험적)
+        if key_mode in ("module_debug", "graph"):
+            print("[CALL] finalize_bn_records")
+            finalize_bn_records(jin_items)
 
-        key_mode = "autograd_order"
-        
-        if key_mode == "autograd_order":
-            jin_items = assign_jin_keys_by_autograd_order(items)
-        else :
-            jin_items = assign_jin_keys(items)
-
-        
-       
         all_keys = [
-            get_jin_key(item)
+            item.get("graph_key", get_jin_key(item))
             for item in jin_items
         ]
 
@@ -653,34 +744,79 @@ class SplitRuntime:
         ]
 
         included_keys = [
-            get_jin_key(item)
+            item.get("graph_key", get_jin_key(item))
             for item in jin_items
         ]
 
-        payload = payload_from_jin_items(jin_items)
+        all_items = jin_items + module_records
+        payload = payload_from_jin_items(all_items)
+        # BN result1/result2: idx key -> module-name key 복사
+        cxx_order = [
+            "layer4.1.bn2",
+            "layer4.1.bn1",
+            "layer4.0.bn2",
+            "layer4.0.downsample.1",
+            "layer4.0.bn1",
 
-        if key_mode == "module_debug":
-            module_records = capture_module_named_payload(
-                self.model,
-                x,
-            )
+            "layer3.1.bn2",
+            "layer3.1.bn1",
+            "layer3.0.bn2",
+            "layer3.0.downsample.1",
+            "layer3.0.bn1",
 
-            for r in module_records:
-                key = r["key"]
-                tensor = r["tensor"]
+            "layer2.1.bn2",
+            "layer2.1.bn1",
+            "layer2.0.bn2",
+            "layer2.0.downsample.1",
+            "layer2.0.bn1",
 
-                if key not in payload.tensors:
-                    payload.add_tensor(key, tensor)
+            "layer1.1.bn2",
+            "layer1.1.bn1",
+            "layer1.0.bn2",
+            "layer1.0.bn1",
 
-                    all_keys.append(key)
-                    included_keys.append(key)
+            "bn1",
+        ]
+        for idx, bn_name in enumerate(cxx_order):
 
-                print(
-                    f"[MODULE_PAYLOAD] {key} "
-                    f"shape={r['shape']}"
+            for suffix in ["result1", "result2"]:
+
+                old_key = f"graph:bn:{idx}:{suffix}"
+                new_key = f"graph:bn:{bn_name}:{suffix}"
+
+                if old_key not in payload.tensors:
+                    continue
+
+                if new_key in payload.tensors:
+                    continue
+
+                payload.add_tensor(
+                    new_key,
+                    payload.tensors[old_key].clone()
                 )
 
-            alias_map = build_module_alias_map(
+                print(
+                    f"[BN_RESULT_ALIAS] "
+                    f"{old_key} -> {new_key}"
+                )
+        print("[DEBUG_GRAPH_ITEMS]", len(jin_items))
+
+        for x in jin_items[:10]:
+            print(x.get("graph_key"), x.get("jin_key"))
+
+        if key_mode in ("module_debug","graph"):
+
+            for r in module_records:
+                key = r["graph_key"]
+
+                if key not in all_keys:
+                    all_keys.append(key)
+                if key not in included_keys:
+                    included_keys.append(key)
+
+                print(f"[MODULE_PAYLOAD] {key} shape={r['shape']}")
+
+            alias_map, saved_alias_map = build_module_alias_map(
                 jin_items,
                 module_records,
             )
@@ -692,6 +828,36 @@ class SplitRuntime:
             with open(alias_path, "w") as f:
                 for old_key, new_key in alias_map.items():
                     f.write(f"{old_key}\t{new_key}\n")
+            ####################################
+
+            # for old_key, new_key in saved_alias_map.items():
+            #     if not (
+            #         old_key.startswith("batchnorm:")
+            #         and (old_key.endswith(":result1") or old_key.endswith(":result2"))
+            #     ):
+            #         continue
+
+            #     # if old_key in payload.tensors and new_key not in payload.tensors:
+            #     if old_key in payload.tensors:
+            #         print(f"[MODULE_BN_RESULT_FOUND] {old_key} -> {new_key}")
+            #         if new_key in payload.tensors:
+            #             print(f"[OVERWRITE_WARN] {new_key}")
+
+            #         payload.add_tensor(
+            #             new_key,
+            #             payload.tensors[old_key].clone()
+            #         )
+
+            #         if new_key not in all_keys:
+            #             all_keys.append(new_key)
+            #         if new_key not in included_keys:
+            #             included_keys.append(new_key)
+
+            #         print(f"[MODULE_BN_RESULT_COPY] {old_key} -> {new_key}")
+
+
+            ####################################
+            
 
             print(f"[MODULE_ALIAS_FILE] saved: {alias_path}")
 
@@ -699,77 +865,6 @@ class SplitRuntime:
             for old_key, new_key in alias_map.items():
                 print(f"  {old_key} -> {new_key}")
 
-        if policy in ("full", "auto_recompute"):
-            conv1x1_records = capture_conv1x1_inputs(self.model, x)
-
-            # backward order에 맞추기 위해 reverse
-            conv1x1_records = list(reversed(conv1x1_records))
-
-            sig_counts = {}
-
-            for r in conv1x1_records:
-                in_sig = shape_sig(r["input_shape"])
-                w_sig = shape_sig(r["weight_shape"])
-
-                sig = f"{in_sig}:{w_sig}"
-                idx = sig_counts.get(sig, 0)
-                sig_counts[sig] = idx + 1
-
-                key = f"conv2d:{in_sig}:{w_sig}:{idx}:input"
-
-                if key not in payload.tensors:
-                    payload.add_tensor(key, r["input"])
-                    all_keys.append(key)
-                    included_keys.append(key)
-
-                    print(
-                        f"[SUPPLEMENT][CONV1x1] {key} "
-                        f"module={r['name']} "
-                        f"shape={r['input_shape']}"
-                    )
-            bn_records = capture_batchnorm_inputs(self.model, x)
-
-            # downsample_bn_override = {
-            #     "layer2.0.downsample.1": "batchnorm:32x128x16x16:4",
-            #     "layer3.0.downsample.1": "batchnorm:32x256x8x8:4",
-            #     "layer4.0.downsample.1": "batchnorm:32x512x4x4:4",
-            # }
-
-            # for r in bn_records:
-            #     name = r["name"]
-
-            #     if name not in downsample_bn_override:
-            #         continue
-
-            #     prefix = downsample_bn_override[name]
-
-            #     tensors = {
-            #         "input": r["input"],
-            #         "running_mean": r["running_mean"],
-            #         "running_var": r["running_var"],
-            #     }
-
-            #     if r["weight"] is not None:
-            #         tensors["weight"] = r["weight"]
-
-            #     for suffix, tensor in tensors.items():
-            #         key = f"{prefix}:{suffix}"
-
-            #         payload.tensors[key] = tensor
-
-            #         if key not in all_keys:
-            #             all_keys.append(key)
-
-            #         if key not in included_keys:
-            #             included_keys.append(key)
-
-            #         print(
-            #             f"[SUPPLEMENT][BN_DOWNSAMPLE] {key} "
-            #             f"module={name} "
-            #             f"shape={tuple(tensor.shape)}"
-            #         )
-        # print("[DEBUG] payload tensor keys:", payload.tensors.keys())
-        # payload.add_tensor("model.input", x.detach())
         payload.add_tensor("model.output", out)
         payload.add_meta("loss", {
             "value": float(loss.detach().cpu())
@@ -785,7 +880,6 @@ class SplitRuntime:
         }
 
         # print("[A][POLICY]", policy_meta)
-
         payload.add_meta("tensor_policy", policy_meta)
 
         return payload
@@ -803,7 +897,6 @@ class SplitRuntime:
             raise RuntimeError("backward_jin() is only available for Node B")
 
         self.model.train()
-        # self.model.eval()
         self.model.zero_grad(set_to_none=True)
 
         out_dummy = self.model(x_dummy)
@@ -834,13 +927,15 @@ class SplitRuntime:
 
         try:
             resolver.check_required(required_keys)
-        except RuntimeError:
+        except RuntimeError as e:
+            print("[FX-ANALYSIS] missing required keys for backward execution")
+            print(e)
             missing = [
                 k for k in LENET_REQUIRED_KEYS
                 if k not in resolver.sources or resolver.sources[k] == "missing"
             ]
 
-            explain_missing_keys(self.model, missing)
+            # explain_missing_keys(self.model, missing)
 
             payload_keys = set(resolver.jin1_keys | set(payload.tensors.keys()))
 
@@ -946,14 +1041,27 @@ class SplitRuntime:
             }
 
             resolver.check_required(required_keys)
-
-            
-
         loss.backward()
+
+        grad_dump = {}
+
+        for name, p in self.model.named_parameters():
+            if p.grad is None:
+                continue
+
+            grad_dump[name] = p.grad.detach().cpu().clone()
+
+            print(
+                f"[B][GRAD] {name} "
+                f"mean={p.grad.mean().item():.8f} "
+                f"absmax={p.grad.abs().max().item():.8f}"
+            )
+
+        torch.save(grad_dump, "/tmp/node_b_grads.pt")
+
         print("[B][BACKWARD] done")
 
         return loss
-
 
     def get_jin_key(item):
         if isinstance(item, dict):
