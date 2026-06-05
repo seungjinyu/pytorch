@@ -50,7 +50,7 @@ def run_node_a(
 
     runtime_a = SplitRuntime(model, role="A")
     client = ZMQClient(endpoint)
-
+    
     logger = CSVLogger(
         csv_path,
         [
@@ -107,10 +107,10 @@ def run_node_a(
                 extra=extra,
             )
 
-            if grad_save_path is not None and "grads" in reply:
-                torch.save(reply["grads"], grad_save_path)
-                print(f"[Node A] saved grads to {grad_save_path}")
-                return
+            # if grad_save_path is not None and "grads" in reply:
+            #     torch.save(reply["grads"], grad_save_path)
+            #     print(f"[Node A] saved grads to {grad_save_path}")
+            #     return
 
 
             t_send1 = time.perf_counter()

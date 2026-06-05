@@ -544,22 +544,12 @@ static bool overwrite_tensor_locked(JINState& st, at::Tensor& target, const std:
 static int64_t jin_begin_batchnorm_locked(JINState& st) {
   const int64_t idx = st.bn_global_i++;
   st.current_bn_idx = idx;
-  if (idx >= 0 && idx < (int64_t)kBnBackwardNames.size()) {
-    st.current_bn_stack.push_back(kBnBackwardNames[idx]);
-  } else {
-    st.current_bn_stack.push_back(std::to_string(idx));
-  }
-
-  const char* name = "unknown";
-  if (idx >= 0 && idx < (int64_t)kBnBackwardNames.size()) {
-    name = kBnBackwardNames[idx].c_str();
-  }
+  st.current_bn_stack.push_back(std::to_string(idx));
 
   fprintf(
       stderr,
-      "[JIN][BN_BEGIN] idx=%lld name=%s\n",
-      (long long)idx,
-      name
+      "[JIN][BN_BEGIN] idx=%lld\n",
+      (long long)idx
   );
   fflush(stderr);
 
@@ -673,12 +663,7 @@ void jin_overwrite_conv_input(at::Tensor& input, const at::Tensor& weight) {
 
   const int64_t idx = st.conv2d_i;
   
-  std::string key;
-  if (idx >= 0 && idx < (int64_t)kConvBackwardNames.size()) {
-    key = std::string("graph:conv:") + kConvBackwardNames[idx] + ":input";
-  } else {
-    key = make_key("graph:conv", idx, "input");
-  }
+  std::string key = make_key("graph:conv", idx, "input");
 
   bool ok = overwrite_tensor_locked(st, input, key);
 
@@ -707,12 +692,7 @@ void jin_overwrite_conv_weight(at::Tensor& t) {
   if (st.role != "B") return;
 
   const int64_t idx = st.conv2d_i;
-  std::string key;
-  if (idx >= 0 && idx < (int64_t)kConvBackwardNames.size()) {
-    key = std::string("graph:conv:") + kConvBackwardNames[idx] + ":weight";
-  } else {
-    key = make_key("graph:conv", idx, "weight");
-  }
+  std::string key = make_key("graph:conv", idx, "weight");
 
   bool ok = overwrite_tensor_locked(st, t, key);
   if (!ok) {
@@ -761,12 +741,7 @@ void jin_overwrite_addmm_mat1(at::Tensor& t) {
   if (st.role != "B") return;
 
   const int64_t idx = st.addmm_i;
-  std::string key;
-  if (idx >= 0 && idx < (int64_t)kAddmmBackwardNames.size()) {
-    key = std::string("graph:addmm:") + kAddmmBackwardNames[idx] + ":mat1";
-  } else {
-    key = make_key("graph:addmm", idx, "mat1");
-  }
+  std::string key = make_key("graph:addmm", idx, "mat1");
   // TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
   bool ok = overwrite_tensor_locked(st, t, key);
   if (!ok){
@@ -782,13 +757,7 @@ void jin_overwrite_addmm_mat2(at::Tensor& t) {
   if (st.role != "B") return;
 
   const int64_t idx = st.addmm_i;
-  std::string key;
-  if (idx >= 0 && idx < (int64_t)kAddmmBackwardNames.size()) {
-    key = std::string("graph:addmm:") + kAddmmBackwardNames[idx] + ":mat2";
-  } else {
-    key = make_key("graph:addmm", idx, "mat2");
-  }
-
+  std::string key = make_key("graph:addmm", idx, "mat2");
   if (!t.defined()) {
     fprintf(stderr, "[JIN] SKIP key=%s (target undefined)\n", key.c_str());
     fflush(stderr);
@@ -820,12 +789,7 @@ void jin_overwrite_maxpool2d_input(at::Tensor& t) {
   if (st.role != "B") return;
 
   const int64_t idx = st.maxpool2d_i;
-  std::string key;
-  if (idx >= 0 && idx < (int64_t)kMaxPoolBackwardNames.size()) {
-    key = std::string("graph:maxpool2d:") + kMaxPoolBackwardNames[idx] + ":input";
-  } else {
-    key = make_key("graph:maxpool2d", idx, "input");
-  }
+  std::string key = make_key("graph:maxpool2d", idx, "input");
   // TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
   bool ok = overwrite_tensor_locked(st, t, key);
   if (!ok) {
@@ -843,12 +807,7 @@ void jin_overwrite_maxpool2d_indices(at::Tensor& t) {
   if (st.role != "B") return;
 
   const int64_t idx = st.maxpool2d_i;
-  std::string key;
-  if (idx >= 0 && idx < (int64_t)kMaxPoolBackwardNames.size()) {
-    key = std::string("graph:maxpool2d:") + kMaxPoolBackwardNames[idx] + ":indices";
-  } else {
-    key = make_key("graph:maxpool2d", idx, "indices");
-  }
+  std::string key = make_key("graph:maxpool2d", idx, "indices");
   // TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
 
   bool ok = overwrite_tensor_locked(st, t, key);
@@ -903,10 +862,7 @@ void jin_overwrite_batchnorm_input(at::Tensor& t) {
   if (st.role != "B") return;
 
   const int64_t idx = jin_begin_batchnorm_locked(st);
-  const std::string bn_name = current_bn_name_locked(st);
-
-  const std::string key =
-      "graph:bn:" + bn_name + ":input";
+  const std::string key = make_key("graph:bn", idx, "input");
   bool ok = overwrite_tensor_locked(st, t, key);
   if (!ok) {
     fprintf(stderr,
@@ -922,7 +878,7 @@ void jin_overwrite_batchnorm_running_mean(at::Tensor& t) {
   ensure_loaded_locked(st);
   if (st.role != "B") return;
 
-  const std::string key = "graph:bn:" + current_bn_name_locked(st) + ":running_mean";
+  const std::string key = make_key("graph:bn", st.current_bn_idx, "running_mean");
 
   if (!t.defined()) {
     fprintf(stderr, "[JIN] SKIP key=%s (target undefined)\n", key.c_str());
@@ -946,7 +902,7 @@ void jin_overwrite_batchnorm_running_var(at::Tensor& t) {
   if (st.role != "B") return;
 
 
-  const std::string key = "graph:bn:" + current_bn_name_locked(st) + ":running_var";
+  const std::string key = make_key("graph:bn", st.current_bn_idx, "running_var");
 
   if (!t.defined()) {
     fprintf(stderr, "[JIN] SKIP key=%s (target undefined)\n", key.c_str());
@@ -969,7 +925,7 @@ void jin_overwrite_batchnorm_weight(at::Tensor& t) {
   ensure_loaded_locked(st);
   if (st.role != "B") return;
 
-  const std::string key = "graph:bn:" + current_bn_name_locked(st) + ":weight";
+  const std::string key = make_key("graph:bn", st.current_bn_idx, "weight");
 
   if (!t.defined()) {
     fprintf(stderr, "[JIN] SKIP key=%s (target undefined)\n", key.c_str());
@@ -1011,46 +967,37 @@ void jin_overwrite_batchnorm_result1(at::Tensor& t) {
     fflush(stderr);
   }
 }
-
 void jin_overwrite_batchnorm_result2(at::Tensor& t) {
-// fprintf(stderr, "[JIN][BN_RESULT2_ENTER]\n");
-// fflush(stderr);
   std::lock_guard<std::mutex> lk(g_mu);
   auto& st = S();
   ensure_loaded_locked(st);
   if (st.role != "B") return;
 
-  const std::string key = "graph:bn:" + current_bn_name_locked(st) + ":result2";
+  const int64_t idx = st.current_bn_idx;
+  const std::string key = make_key("graph:bn", idx, "result2");
 
   fprintf(
-    stderr,
-    "[JIN][BN] key=%s shape=%s\n",
-    key.c_str(),
-    sizes_str(t).c_str()
+      stderr,
+      "[JIN][BN] key=%s shape=%s\n",
+      key.c_str(),
+      sizes_str(t).c_str()
   );
-  // TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
-  bool ok = overwrite_tensor_locked(st, t, key);
-  if (!ok) {
-    fprintf(stderr,
-            "[JIN] SKIP key=%s (payload missing, keep local batchnorm result2)\n",
-            key.c_str());
-    fflush(stderr);
-  }
+  fflush(stderr);
+
+  overwrite_tensor_locked(st, t, key);
+
   fprintf(
       stderr,
-      "[JIN][BN_END] idx=%lld name=%s\n",
-      (long long)st.current_bn_idx,
-      current_bn_name_locked(st).c_str()
+      "[JIN][BN_END] idx=%lld\n",
+      (long long)idx
   );
 
   if (!st.current_bn_stack.empty()) {
-      st.current_bn_stack.pop_back();
+    st.current_bn_stack.pop_back();
   }
+
   fflush(stderr);
-
 }
-
-
 // ---------------------------------------------
 // NEW: ReLU mask APIs (lossless, no activation)
 // ---------------------------------------------
@@ -1098,7 +1045,15 @@ at::Tensor jin_relu_backward_from_mask(const at::Tensor& grad) {
 
   const int64_t i = st.relu_i++;
   const std::string key = relu_mask_key(i);
-
+  fprintf(
+      stderr,
+      "[JIN][RELU_BWD] idx=%lld grad_shape=%s grad_numel=%lld key=%s\n",
+      (long long)i,
+      sizes_str(grad).c_str(),
+      (long long)grad.numel(),
+      key.c_str()
+  );
+  fflush(stderr);
   auto it = st.kv_cpu.find(key);
   if (it == st.kv_cpu.end()) {
     // mask가 없으면 안전하게 통과 (순서 mismatch 디버그에 도움)
@@ -1106,6 +1061,15 @@ at::Tensor jin_relu_backward_from_mask(const at::Tensor& grad) {
   }
 
   at::Tensor mask_bytes = it->second;
+  fprintf(
+    stderr,
+    "[JIN][RELU_MASK] idx=%lld mask_bytes=%lld mask_bits=%lld grad_numel=%lld\n",
+    (long long)i,
+    (long long)mask_bytes.numel(),
+    (long long)(mask_bytes.numel() * 8),
+    (long long)grad.numel()
+  );
+  fflush(stderr);
   TORCH_CHECK(mask_bytes.defined(), "jin_relu_backward_from_mask: mask undefined");
   TORCH_CHECK(mask_bytes.is_cpu(), "jin_relu_backward_from_mask: mask must be CPU");
   TORCH_CHECK(mask_bytes.scalar_type() == at::kByte, "jin_relu_backward_from_mask: mask must be uint8");

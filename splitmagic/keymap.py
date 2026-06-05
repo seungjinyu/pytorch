@@ -10,7 +10,7 @@ def assign_jin_keys(items):
         "batchnorm": 0,
     }
 
-    shape_counters = {}
+    # shape_counters = {}
     pending_conv_inputs = []
     conv_sig_counters = {}
 
@@ -18,10 +18,10 @@ def assign_jin_keys(items):
     global_idx = 0
 
     bn_global_idx = 0
-    current_bn_sig = None
+    # current_bn_sig = None
     current_bn_idx = None
 
-    pending_bn = {}
+    # pending_bn = {}
 
 
     for item in items:

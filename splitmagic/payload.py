@@ -124,16 +124,16 @@ def payload_from_jin_items(items):
             "legacy_jin_key": item.get("jin_key"),
         })
         # NEW: graph_key 추가 저장
-        print(
-            f"[GRAPH_KEY_ADD] "
-            f"{graph_key} "
-            f"shape={tuple(tensor.shape)}"
-        )
-    print("=== PAYLOAD_FROM_JIN_ITEMS ===")
+        # print(
+        #     f"[GRAPH_KEY_ADD] "
+        #     f"{graph_key} "
+        #     f"shape={tuple(tensor.shape)}"
+        # )
+    # print("=== PAYLOAD_FROM_JIN_ITEMS ===")
 
-    for k in sorted(payload.tensors.keys()):
-        if k.startswith("graph:bn:"):
-            print(k)
+    # for k in sorted(payload.tensors.keys()):
+    #     if k.startswith("graph:bn:"):
+    #         print(k)
 
     return payload
 

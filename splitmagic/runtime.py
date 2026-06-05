@@ -99,6 +99,8 @@ def capture_module_named_payload(model):
     call_counts = {}
     bn_records_by_name = defaultdict(list)
 
+    relu_mask_records = []
+
     def add_record(key, tensor):
         t = tensor.detach().cpu().clone()
 
@@ -144,15 +146,23 @@ def capture_module_named_payload(model):
                     inp,
                 )
             elif isinstance(mod, nn.ReLU):
-                idx = call_counts.get("relu_mask", 0)
-                call_counts["relu_mask"] = idx + 1
+                fwd_idx = call_counts.get("relu_mask", 0)
+                call_counts["relu_mask"] = fwd_idx + 1
 
-                mask = (output > 0).to(torch.uint8)
+                mask = (output > 0).to(torch.uint8).detach().cpu().clone()
 
-                add_record(
-                    f"relu_mask:{idx}",
-                    mask,
+                print(
+                    f"[PY][RELU_MASK_FWD] fwd_idx={fwd_idx} "
+                    f"shape={tuple(output.shape)} "
+                    f"numel={output.numel()}"
                 )
+
+                relu_mask_records.append({
+                    "fwd_idx": fwd_idx,
+                    "tensor": mask,
+                    "shape": tuple(output.shape),
+                    "numel": output.numel(),
+                })
 
             elif isinstance(mod, nn.Linear):
                 add_record(f"graph:addmm:{name}:mat1", inp)
@@ -232,128 +242,155 @@ def capture_module_named_payload(model):
                 f"shape={tuple(r['input'].shape)}"
             )
 
-            add_record(f"graph:bn:{bn_name}:input", r["input"])
-            add_record(f"graph:bn:{bn_name}:running_mean", r["running_mean"])
-            add_record(f"graph:bn:{bn_name}:running_var", r["running_var"])
+            add_record(f"graph:bn:{matched_name}:input", r["input"])
+            add_record(f"graph:bn:{matched_name}:running_mean", r["running_mean"])
+            add_record(f"graph:bn:{matched_name}:running_var", r["running_var"])
 
             if r["weight"] is not None:
-                add_record(f"graph:bn:{bn_name}:weight", r["weight"])
+                add_record(f"graph:bn:{matched_name}:weight", r["weight"])
 
             print(f"[BN_FINALIZE_OK] idx={idx} name={matched_name}")
 
-    return records, handles, finalize_bn_records
+    def finalize_relu_masks():
+        # forward 순서로 모은 ReLU mask를 backward 순서로 뒤집어서 저장
+        for bwd_idx, rec in enumerate(reversed(relu_mask_records)):
+            key = f"relu_mask:{bwd_idx}"
+            t = rec["tensor"]
+
+            print(
+                f"[PY][RELU_MASK_FINAL] "
+                f"fwd_idx={rec['fwd_idx']} -> bwd_idx={bwd_idx} "
+                f"key={key} "
+                f"shape={rec['shape']} "
+                f"numel={rec['numel']}"
+            )
+
+            add_record(key, t)
+
+    return records, handles, finalize_bn_records, finalize_relu_masks
+
 def build_module_alias_map(jin_items, module_records):
     import torch
 
-    cxx_order = [
-        "layer4.1.bn2",
-        "layer4.1.bn1",
-
-        "layer4.0.bn2",
-        "layer4.0.downsample.1",
-        "layer4.0.bn1",
-
-        "layer3.1.bn2",
-        "layer3.1.bn1",
-
-        "layer3.0.bn2",
-        "layer3.0.downsample.1",
-        "layer3.0.bn1",
-
-        "layer2.1.bn2",
-        "layer2.1.bn1",
-
-        "layer2.0.bn2",
-        "layer2.0.downsample.1",
-        "layer2.0.bn1",
-
-        "layer1.1.bn2",
-        "layer1.1.bn1",
-
-        "layer1.0.bn2",
-        "layer1.0.bn1",
-
-        "bn1",
-    ]
-
-    bn_modules = [
-        r for r in module_records
-        if r["key"].startswith("module:batchnorm:")
-        and r["key"].endswith(":input")
-    ]
-
+    alias_map = {}
     saved_alias_map = {}
 
-    bn_saved = {}
+    # module_records를 key별로 정리
+    module_by_key = {
+        r["graph_key"]: r
+        for r in module_records
+        if "graph_key" in r
+    }
+
+    # -------------------------
+    # BN: graph:bn:0:* -> graph:bn:<module_name>:*
+    # -------------------------
+    bn_module_inputs = [
+        r for r in module_records
+        if r.get("graph_key", "").startswith("graph:bn:")
+        and r.get("graph_key", "").endswith(":input")
+        and not r.get("graph_key", "").split(":")[2].isdigit()
+    ]
+
+    used_bn = set()
 
     for item in jin_items:
-        old_key = get_jin_key(item)
+        gk = item.get("graph_key", "")
 
-        if not old_key.startswith("batchnorm:"):
+        if not (
+            gk.startswith("graph:bn:")
+            and gk.endswith(":input")
+            and gk.split(":")[2].isdigit()
+        ):
             continue
 
-        parts = old_key.split(":")
+        target = item["tensor"].detach().cpu()
 
-        if len(parts) < 3:
+        matched = None
+
+        for r in bn_module_inputs:
+            rk = r["graph_key"]
+
+            if rk in used_bn:
+                continue
+
+            cand = r["tensor"]
+
+            if tuple(cand.shape) != tuple(target.shape):
+                continue
+
+            if torch.equal(cand, target):
+                matched = r
+                break
+
+        if matched is None:
+            print(f"[ALIAS_BN_FAIL] {gk}")
             continue
 
-        idx = int(parts[1])
-        suffix = parts[2]
+        used_bn.add(matched["graph_key"])
 
-        if suffix not in ("result1", "result2"):
+        old_prefix = gk.rsplit(":", 1)[0]
+        new_prefix = matched["graph_key"].rsplit(":", 1)[0]
+
+        for suffix in ["input", "running_mean", "running_var", "weight","result1", "result2"]:
+            old_key = f"{old_prefix}:{suffix}"
+            new_key = f"{new_prefix}:{suffix}"
+
+            if new_key in module_by_key:
+                alias_map[old_key] = new_key
+                # print(f"[ALIAS_BN] {old_key} -> {new_key}")
+
+    # -------------------------
+    # Conv: graph:conv:0:input -> graph:conv:<module_name>:input
+    # -------------------------
+    conv_module_inputs = [
+        r for r in module_records
+        if r.get("graph_key", "").startswith("graph:conv:")
+        and r.get("graph_key", "").endswith(":input")
+        and not r.get("graph_key", "").split(":")[2].isdigit()
+    ]
+
+    used_conv = set()
+
+    for item in jin_items:
+        gk = item.get("graph_key", "")
+
+        if not (
+            gk.startswith("graph:conv:")
+            and gk.endswith(":input")
+            and gk.split(":")[2].isdigit()
+        ):
             continue
 
-        if idx not in bn_saved:
-            bn_saved[idx] = f"batchnorm:{idx}"
+        target = item["tensor"].detach().cpu()
 
-    print("=== BN SAVED IDX ===")
-    for k in sorted(bn_saved.keys()):
-        print(k, bn_saved[k])
+        matched = None
 
-    print("=== BN SAVED ORDER ===")
-    for i, x in enumerate(bn_saved):
-        print(i, x)
+        for r in conv_module_inputs:
+            rk = r["graph_key"]
 
-    print("=== BN MODULE ORDER ===")
-    for i, x in enumerate(cxx_order):
-        print(i, x)
+            if rk in used_conv:
+                continue
 
-    for idx, bn_name in enumerate(cxx_order):
+            cand = r["tensor"]
 
-        if idx >= len(bn_saved):
-            break
+            if tuple(cand.shape) != tuple(target.shape):
+                continue
 
-        old_prefix = bn_saved[idx]
-        new_prefix = f"graph:bn:{bn_name}"
+            if torch.equal(cand, target):
+                matched = r
+                break
 
-        # saved_alias_map[f"{old_prefix}:result1"] = f"{new_prefix}:result1"
-        # saved_alias_map[f"{old_prefix}:result2"] = f"{new_prefix}:result2"
+        if matched is None:
+            print(f"[ALIAS_CONV_FAIL] {gk}")
+            continue
 
-        print(
-            f"[BN_ALIAS] "
-            f"{old_prefix}:result1 -> {new_prefix}:result1"
-        )
+        used_conv.add(matched["graph_key"])
 
-    print("=== FINAL CXX ORDER ===")
-    for i, n in enumerate(cxx_order):
-        print(i, n)
-
-    alias_map = {}
-
-    for idx, name in enumerate(cxx_order):
-        old_prefix = f"batchnorm:{idx}"
-        new_prefix = f"module:batchnorm:{name}"
-
-        for suffix in [
-            "input",
-            "running_mean",
-            "running_var",
-            "weight",
-        ]:
-            alias_map[f"{old_prefix}:{suffix}"] = f"{new_prefix}:{suffix}"
+        alias_map[gk] = matched["graph_key"]
+        # print(f"[ALIAS_CONV] {gk} -> {matched['graph_key']}")
 
     return alias_map, saved_alias_map
-
 
 def capture_batchnorm_inputs(model, x):
     import torch.nn as nn
@@ -687,6 +724,39 @@ class SplitRuntime:
         )
 
         return loss 
+    ################################ PLAN ###################################
+    def build_backward_plan(jin_items):
+        plan = []
+
+        for item in jin_items:
+            gk = item.get("graph_key")
+            if gk is None:
+                continue
+
+            parts = gk.split(":")
+            if len(parts) < 4:
+                continue
+
+            op = parts[1]
+            idx = parts[2]
+            suffix = ":".join(parts[3:])
+
+            if op not in ("conv", "addmm", "maxpool2d", "bn", "relu"):
+                continue
+
+            t = item["tensor"]
+
+            plan.append({
+                "op": op,
+                "idx": idx,
+                "suffix": suffix,
+                "key": gk,
+                "shape": tuple(t.shape),
+                "dtype": str(t.dtype),
+            })
+
+        return plan
+    ################################ PLAN ###################################
     def capture_jin(
         self,
         x,
@@ -708,7 +778,7 @@ class SplitRuntime:
         module_handles = []
 
         if key_mode in ("module_debug","graph"):
-            module_records, module_handles,finalize_bn_records = capture_module_named_payload(self.model)
+            module_records, module_handles,finalize_bn_records, finalize_relu_masks = capture_module_named_payload(self.model)
 
         try:
             out = self.model(x)
@@ -725,11 +795,13 @@ class SplitRuntime:
         if key_mode in ("module_debug", "graph"):
             print("[CALL] finalize_bn_records")
             finalize_bn_records(jin_items)
+            print("[CALL] finalize_relu_masks")
+            finalize_relu_masks()
 
-        all_keys = [
-            item.get("graph_key", get_jin_key(item))
-            for item in jin_items
-        ]
+        # all_keys = [
+        #     item.get("graph_key", get_jin_key(item))
+        #     for item in jin_items
+        # ]
 
         before_count = len(jin_items)
 
@@ -742,6 +814,22 @@ class SplitRuntime:
 
             )
         ]
+        # jin_items = [
+        #     item for item in jin_items
+        #     if not (
+        #         item.get("graph_key", "").startswith("graph:bn:")
+        #         and (
+        #             item.get("graph_key", "").endswith(":result1")
+        #             or item.get("graph_key", "").endswith(":result2")
+        #         )
+        #     )
+        # ]
+        # 중요: 제거 후 다시 계산
+        all_keys = [
+            item.get("graph_key", get_jin_key(item))
+            for item in jin_items
+        ]
+
 
         included_keys = [
             item.get("graph_key", get_jin_key(item))
@@ -777,28 +865,28 @@ class SplitRuntime:
 
             "bn1",
         ]
-        for idx, bn_name in enumerate(cxx_order):
+        # for idx, bn_name in enumerate(cxx_order):
 
-            for suffix in ["result1", "result2"]:
+        #     for suffix in ["result1", "result2"]:
 
-                old_key = f"graph:bn:{idx}:{suffix}"
-                new_key = f"graph:bn:{bn_name}:{suffix}"
+        #         old_key = f"graph:bn:{idx}:{suffix}"
+        #         new_key = f"graph:bn:{bn_name}:{suffix}"
 
-                if old_key not in payload.tensors:
-                    continue
+        #         if old_key not in payload.tensors:
+        #             continue
 
-                if new_key in payload.tensors:
-                    continue
+        #         if new_key in payload.tensors:
+        #             continue
 
-                payload.add_tensor(
-                    new_key,
-                    payload.tensors[old_key].clone()
-                )
+        #         payload.add_tensor(
+        #             new_key,
+        #             payload.tensors[old_key].clone()
+        #         )
 
-                print(
-                    f"[BN_RESULT_ALIAS] "
-                    f"{old_key} -> {new_key}"
-                )
+        #         print(
+        #             f"[BN_RESULT_ALIAS] "
+        #             f"{old_key} -> {new_key}"
+                # )
         print("[DEBUG_GRAPH_ITEMS]", len(jin_items))
 
         for x in jin_items[:10]:
@@ -814,7 +902,7 @@ class SplitRuntime:
                 if key not in included_keys:
                     included_keys.append(key)
 
-                print(f"[MODULE_PAYLOAD] {key} shape={r['shape']}")
+                # print(f"[MODULE_PAYLOAD] {key} shape={r['shape']}")
 
             alias_map, saved_alias_map = build_module_alias_map(
                 jin_items,
@@ -828,6 +916,8 @@ class SplitRuntime:
             with open(alias_path, "w") as f:
                 for old_key, new_key in alias_map.items():
                     f.write(f"{old_key}\t{new_key}\n")
+            print(f"[ALIAS_WRITE] path={alias_path} n={len(alias_map)}")
+            
             ####################################
 
             # for old_key, new_key in saved_alias_map.items():

@@ -1,45 +1,48 @@
 import torch
 
 
-BASE = "/tmp/baseline_grads.pt"
-SPLIT = "/tmp/split_grads.pt"
+BASE = "./vgg_baseline_grads.pt"
+SPLIT = "./vgg_split_grads.pt"
 
 ATOL = 1e-6
+RTOL = 1e-5
 
 
 def main():
-    a = torch.load(BASE, map_location="cpu")
-    b = torch.load(SPLIT, map_location="cpu")
+    base = torch.load(BASE, map_location="cpu")
+    split = torch.load(SPLIT, map_location="cpu")
 
-    all_keys = sorted(set(a.keys()) | set(b.keys()))
+    all_keys = sorted(set(base.keys()) | set(split.keys()))
 
     same = True
 
     for k in all_keys:
-        if k not in a:
+        if k not in base:
             print(f"[ONLY_SPLIT] {k}")
             same = False
             continue
 
-        if k not in b:
-            print(f"[ONLY_BASELINE] {k}")
+        if k not in split:
+            print(f"[ONLY_BASE] {k}")
             same = False
             continue
 
-        if a[k].shape != b[k].shape:
-            print(f"[SHAPE_DIFF] {k} base={a[k].shape} split={b[k].shape}")
+        a = base[k]
+        b = split[k]
+
+        if a.shape != b.shape:
+            print(f"[SHAPE_DIFF] {k} base={tuple(a.shape)} split={tuple(b.shape)}")
             same = False
             continue
 
-        diff = (a[k] - b[k]).abs()
-
+        diff = (a - b).abs()
         max_diff = diff.max().item()
         mean_diff = diff.mean().item()
 
-        ok = max_diff <= ATOL
+        ok = torch.allclose(a, b, atol=ATOL, rtol=RTOL)
 
         print(
-            f"{k:45s} "
+            f"{k:35s} "
             f"max={max_diff:.10e} "
             f"mean={mean_diff:.10e} "
             f"{'OK' if ok else 'DIFF'}"
