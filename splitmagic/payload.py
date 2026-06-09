@@ -38,11 +38,13 @@ class Payload:
 
         with open(path, "wb") as f:
             f.write(b"JIN1")
-            print("=== SAVE_JIN1_KEYS ===")
 
-            for k in sorted(self.tensors.keys()):
-                if k.startswith("graph:bn:"):
-                    print(k)
+            # print the elements in payload 
+            # print("=== SAVE_JIN1_KEYS ===")
+
+            # for k in sorted(self.tensors.keys()):
+            #     if k.startswith("graph:bn:"):
+            #         print(k)
 
             f.write(struct.pack("<I", len(self.tensors)))
 

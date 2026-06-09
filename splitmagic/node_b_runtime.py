@@ -2,10 +2,10 @@ import os
 import time
 import torch
 import torch.nn.functional as F
+import json
 
 from splitmagic import SplitRuntime, ZMQServer
 from splitmagic.utils.timing import CSVLogger
-# from splitmagic.resolver import read_jin1_tensor
 
 def clone_grads(model):
     return {
@@ -21,8 +21,8 @@ def run_node_b(
     lr=0.1,
 ):
   
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = "cpu"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = "cpu"
     model = model.to(device)
 
     optimizer = torch.optim.SGD(model.parameters(), lr=lr)
@@ -47,6 +47,29 @@ def run_node_b(
     while True:
 
         req = server.recv_payload()
+
+        dryrun_backward_plan = req.get("dryrun_backward_plan", [])
+        
+        if dryrun_backward_plan:
+
+            plan_path = "/tmp/jin_execution_plan.tsv"
+
+            with open(plan_path,"w" ) as f :
+                for e in dryrun_backward_plan:
+                    f.write(f"{e['row_id']}\t{e['op']}\t{e['idx']}\t{e['suffix']}\t{e['shape']}\n")
+
+            os.environ["JIN_EXECUTION_PLAN_PATH"] = plan_path
+
+            print(
+                f"[Node B][EXEC_PLAN_SAVE]"
+                f"path={plan_path}"
+                f"len={len(dryrun_backward_plan)}",
+                flush=True
+            )
+
+        else :
+            os.environ.pop("JIN_EXECUTION_PLAN_PATH",None)
+            print("[Node B][EXEC_PLAN_EMPTY]")
 
         if req is None:
             break
@@ -84,6 +107,7 @@ def run_node_b(
             tensor_policy=req.get("tensor_policy",None),
         )
 
+        # torch._C._jin_dump_used_keys("/tmp/jin_used_keys.txt")
         # 비교를 위한 grad 
         grads = clone_grads(model)
 

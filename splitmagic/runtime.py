@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os 
 
 from collections import defaultdict
 
@@ -89,6 +90,40 @@ LENET_OPTIONAL_OR_REPLACEABLE_KEYS = {
     # "relu:2:out",
     # "relu:3:out",
 }
+
+################################ PLAN ###################################
+def build_backward_plan(jin_items):
+    plan = []
+
+    for item in jin_items:
+        gk = item.get("graph_key")
+        if gk is None:
+            continue
+
+        parts = gk.split(":")
+        if len(parts) < 4:
+            continue
+
+        op = parts[1]
+        idx = parts[2]
+        suffix = ":".join(parts[3:])
+
+        if op not in ("conv", "addmm", "maxpool2d", "bn", "relu"):
+            continue
+
+        t = item["tensor"]
+
+        plan.append({
+            "op": op,
+            "idx": idx,
+            "suffix": suffix,
+            "key": gk,
+            "shape": tuple(t.shape),
+            "dtype": str(t.dtype),
+        })
+
+    return plan
+################################ PLAN ###################################
 def capture_module_named_payload(model):
 
     import torch.nn as nn
@@ -673,6 +708,148 @@ def should_include_jin_item(
         optional_keys=optional_keys,
     )
 
+# read the dryrun plan and be ready to send it in the payload 
+def read_dryrun_plan(path="/tmp/jin_dryrun_plan.tsv"):
+    plan = []
+    
+    if not os.path.exists(path):
+        return plan 
+
+    with open(path,"r") as f :
+        for line in f :
+            line = line.rstrip("\n")
+
+            if not line:
+                continue 
+            
+            parts = line.split("\t")
+            if len(parts) == 5 :
+                row_id, op, idx, suffix, shape = parts 
+            elif len(parts) == 4 :
+                op, idx, suffix, shape = parts 
+                row_id = len(plan)
+            else:
+                raise ValueError(f"bad dryrun plan line: {line}")
+            # row,op,idx,suffix,shape = line.split("\t")
+
+            plan.append({
+                "row_id":int(row_id),
+                "op":op,
+                "idx":int(idx),
+                "suffix":suffix,
+                "shape": shape,
+            })
+    return plan
+
+def keys_from_dryrun_plan(plan):
+    keys = set()
+
+    for e in plan:
+        op = e["op"]
+        idx = e["idx"]
+        suffix = e["suffix"]
+
+        # local parameter라 안 보내도 되는 것
+        if op == "conv" and suffix == "weight":
+            continue
+        if op == "addmm" and suffix == "mat2":
+            continue
+
+        keys.add(f"graph:{op}:{idx}:{suffix}")
+
+    return keys
+
+def read_used_keys(path="/tmp/jin_used_keys.txt"):
+    with open(path, "r") as f:
+        return set(line.strip() for line in f if line.strip())
+    
+def build_plan_key_map(plan):
+    """
+    forward capture key를 dryrun backward key로 바꾸기 위한 map 생성.
+    우선 shape 기준으로 매칭한다.
+    """
+    by_op_suffix = {}
+
+    for e in plan:
+        op = e["op"]
+        suffix = e["suffix"]
+        
+        if op not in ("conv", "bn", "relu", "maxpool2d", "addmm"):
+            continue
+
+        by_op_suffix.setdefault((op, suffix), []).append(e)
+
+    return by_op_suffix
+
+def parse_shape_str(s):
+    # "[32,512,4,4]" -> (32,512,4,4)
+    s = s.strip()
+    s = s.strip("[]")
+    if not s:
+        return tuple()
+    return tuple(int(x) for x in s.split(","))
+
+
+def remap_payload_to_dryrun_idx(payload, plan):
+    old_tensors = payload.tensors
+    new_tensors = {}
+
+    if "model.output" in old_tensors:
+        new_tensors["model.output"] = old_tensors["model.output"]
+
+    used_old_keys = set()
+
+    for e in plan:
+        op = e["op"]
+        idx = e["idx"]
+        suffix = e["suffix"]
+        shape = parse_shape_str(e["shape"])
+
+        # weight/addmm mat2는 local fallback 가능하면 안 보내도 됨
+        if op == "conv" and suffix == "weight":
+            continue
+        if op == "addmm" and suffix == "mat2":
+            continue
+
+        new_key = f"graph:{op}:{idx}:{suffix}"
+
+        # 이미 정확한 key + shape가 있으면 사용
+        if new_key in old_tensors and tuple(old_tensors[new_key].shape) == shape:
+            new_tensors[new_key] = old_tensors[new_key]
+            used_old_keys.add(new_key)
+            continue
+
+        # module 기반 key 중 op/suffix/shape가 맞는 첫 tensor를 사용
+        found = False
+        for old_key, tensor in old_tensors.items():
+            if old_key in used_old_keys:
+                continue
+
+            parts = old_key.split(":")
+            if len(parts) != 4:
+                continue
+
+            if parts[0] != "graph":
+                continue
+            if parts[1] != op:
+                continue
+            if parts[3] != suffix:
+                continue
+            if tuple(tensor.shape) != shape:
+                continue
+
+            new_tensors[new_key] = tensor
+            used_old_keys.add(old_key)
+            print(f"[REMAP] {old_key} -> {new_key}")
+            found = True
+            break
+
+        if not found:
+            print(f"[REMAP_MISS] {new_key} shape={shape}")
+
+    payload.tensors = new_tensors
+    return payload
+
 class SplitRuntime:
     def __init__(self, model, role: str):
         self.model = model 
@@ -724,39 +901,6 @@ class SplitRuntime:
         )
 
         return loss 
-    ################################ PLAN ###################################
-    def build_backward_plan(jin_items):
-        plan = []
-
-        for item in jin_items:
-            gk = item.get("graph_key")
-            if gk is None:
-                continue
-
-            parts = gk.split(":")
-            if len(parts) < 4:
-                continue
-
-            op = parts[1]
-            idx = parts[2]
-            suffix = ":".join(parts[3:])
-
-            if op not in ("conv", "addmm", "maxpool2d", "bn", "relu"):
-                continue
-
-            t = item["tensor"]
-
-            plan.append({
-                "op": op,
-                "idx": idx,
-                "suffix": suffix,
-                "key": gk,
-                "shape": tuple(t.shape),
-                "dtype": str(t.dtype),
-            })
-
-        return plan
-    ################################ PLAN ###################################
     def capture_jin(
         self,
         x,
@@ -791,6 +935,19 @@ class SplitRuntime:
 
         items = collect_saved_attrs(loss)
         jin_items = assign_jin_keys_by_autograd_order(items)
+        backward_plan = build_backward_plan(jin_items)
+
+        print("========== BACKWARD PLAN ==========")
+        for i, e in enumerate(backward_plan):
+            print(
+                f"[PLAN] {i:03d} "
+                f"op={e['op']} "
+                f"idx={e['idx']} "
+                f"suffix={e['suffix']} "
+                f"key={e['key']} "
+                f"shape={e['shape']}"
+            )
+        print("========== END BACKWARD PLAN ==========")
 
         if key_mode in ("module_debug", "graph"):
             print("[CALL] finalize_bn_records")
@@ -814,17 +971,7 @@ class SplitRuntime:
 
             )
         ]
-        # jin_items = [
-        #     item for item in jin_items
-        #     if not (
-        #         item.get("graph_key", "").startswith("graph:bn:")
-        #         and (
-        #             item.get("graph_key", "").endswith(":result1")
-        #             or item.get("graph_key", "").endswith(":result2")
-        #         )
-        #     )
-        # ]
-        # 중요: 제거 후 다시 계산
+
         all_keys = [
             item.get("graph_key", get_jin_key(item))
             for item in jin_items
@@ -838,56 +985,8 @@ class SplitRuntime:
 
         all_items = jin_items + module_records
         payload = payload_from_jin_items(all_items)
-        # BN result1/result2: idx key -> module-name key 복사
-        cxx_order = [
-            "layer4.1.bn2",
-            "layer4.1.bn1",
-            "layer4.0.bn2",
-            "layer4.0.downsample.1",
-            "layer4.0.bn1",
 
-            "layer3.1.bn2",
-            "layer3.1.bn1",
-            "layer3.0.bn2",
-            "layer3.0.downsample.1",
-            "layer3.0.bn1",
-
-            "layer2.1.bn2",
-            "layer2.1.bn1",
-            "layer2.0.bn2",
-            "layer2.0.downsample.1",
-            "layer2.0.bn1",
-
-            "layer1.1.bn2",
-            "layer1.1.bn1",
-            "layer1.0.bn2",
-            "layer1.0.bn1",
-
-            "bn1",
-        ]
-        # for idx, bn_name in enumerate(cxx_order):
-
-        #     for suffix in ["result1", "result2"]:
-
-        #         old_key = f"graph:bn:{idx}:{suffix}"
-        #         new_key = f"graph:bn:{bn_name}:{suffix}"
-
-        #         if old_key not in payload.tensors:
-        #             continue
-
-        #         if new_key in payload.tensors:
-        #             continue
-
-        #         payload.add_tensor(
-        #             new_key,
-        #             payload.tensors[old_key].clone()
-        #         )
-
-        #         print(
-        #             f"[BN_RESULT_ALIAS] "
-        #             f"{old_key} -> {new_key}"
-                # )
-        print("[DEBUG_GRAPH_ITEMS]", len(jin_items))
+        payload.meta["backward_plan"] = backward_plan
 
         for x in jin_items[:10]:
             print(x.get("graph_key"), x.get("jin_key"))
@@ -902,7 +1001,6 @@ class SplitRuntime:
                 if key not in included_keys:
                     included_keys.append(key)
 
-                # print(f"[MODULE_PAYLOAD] {key} shape={r['shape']}")
 
             alias_map, saved_alias_map = build_module_alias_map(
                 jin_items,
@@ -918,37 +1016,6 @@ class SplitRuntime:
                     f.write(f"{old_key}\t{new_key}\n")
             print(f"[ALIAS_WRITE] path={alias_path} n={len(alias_map)}")
             
-            ####################################
-
-            # for old_key, new_key in saved_alias_map.items():
-            #     if not (
-            #         old_key.startswith("batchnorm:")
-            #         and (old_key.endswith(":result1") or old_key.endswith(":result2"))
-            #     ):
-            #         continue
-
-            #     # if old_key in payload.tensors and new_key not in payload.tensors:
-            #     if old_key in payload.tensors:
-            #         print(f"[MODULE_BN_RESULT_FOUND] {old_key} -> {new_key}")
-            #         if new_key in payload.tensors:
-            #             print(f"[OVERWRITE_WARN] {new_key}")
-
-            #         payload.add_tensor(
-            #             new_key,
-            #             payload.tensors[old_key].clone()
-            #         )
-
-            #         if new_key not in all_keys:
-            #             all_keys.append(new_key)
-            #         if new_key not in included_keys:
-            #             included_keys.append(new_key)
-
-            #         print(f"[MODULE_BN_RESULT_COPY] {old_key} -> {new_key}")
-
-
-            ####################################
-            
-
             print(f"[MODULE_ALIAS_FILE] saved: {alias_path}")
 
             print("[MODULE_ALIAS_MAP]")
