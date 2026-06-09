@@ -51,6 +51,16 @@ void jin_trace_add_backward(
     const at::Tensor& grad,
     int64_t idx
 );
+
+bool jin_is_role_dryrun();
+
+void jin_record_exec(
+    const char* op,
+    int64_t idx, 
+    const char* suffix, 
+    const at::Tensor& t
+);
+
 C10_EXPORT void jin_set_payload_bytes(const void* data, uint64_t nbytes, int64_t step);
 
 
@@ -76,3 +86,5 @@ at::Tensor jin_unpack_maxpool2x2_2bit_to_flat_indices(
 at::Tensor jin_make_maxpool2d_indices_2bit_tensor(
     const at::Tensor& flat_indices
 );
+
+bool jin_is_dryrun();

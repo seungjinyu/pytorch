@@ -92,8 +92,6 @@ def run_node_a(
 
             if dryrun_plan and not dryrun_done:
 
-                # state_before_dryrun = clone_state_dict(model)
-
                 dryrun_path = "/tmp/jin_dryrun_plan.tsv"
 
                 if os.path.exists(dryrun_path):
@@ -109,19 +107,6 @@ def run_node_a(
 
                 model.zero_grad(set_to_none=True)
 
-                # x_dry = torch.randn_like(x)
-
-                # y_dry = torch.randint(
-                #     0,
-                #     10,
-                #     (x.size(0),),
-                #     device=x.device,
-                # )
-
-                # out = model(x_dry)
-                # loss = F.cross_entropy(out, y_dry)
-                # loss.backward()
-
                 out = model(x)
                 loss = F.cross_entropy(out,y)
                 loss.backward()
@@ -130,7 +115,6 @@ def run_node_a(
                 os.environ.pop("JIN_DRYRUN_PATH",None)
                 os.environ.pop("JIN_DRYRUN_TENSOR_DIR", None)
 
-                # model.load_state_dict(state_before_dryrun)
                 model.zero_grad(set_to_none=True)
 
                 dryrun_done = True

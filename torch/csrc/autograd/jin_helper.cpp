@@ -14,6 +14,7 @@
 //   at::Tensor jin_relu_backward_from_mask(const at::Tensor& grad);
 
 #include "torch/csrc/autograd/jin_helper.h"
+#include <torch/serialize.h>
 
 #include <ATen/ATen.h>
 #include <c10/util/Exception.h>
@@ -93,6 +94,14 @@ static const std::vector<std::string> kBnBackwardNames = {
   "bn1",
 };
 
+struct JINExecItem{
+  std::string op;
+  int64_t idx;
+  std::string suffix;
+  std::string shape;
+  int64_t row_id = -1;
+};
+
 struct JINState {
   bool loaded = false;
 
@@ -122,8 +131,17 @@ struct JINState {
   std::vector<std::string> current_bn_stack;
 
   std::unordered_map<std::string, std::string> alias_map;
+
+  // Dry run var 
+  std::vector<JINExecItem> exec_plan;
+  std::string exec_plan_path;
+  bool exec_plan_loaded = false;
+  size_t exec_cursor = 0;
+
+  int64_t dryrun_row_id = 0;
   
 };
+
 
 JINState& S() {
   static JINState st;
@@ -396,6 +414,79 @@ static void load_payload_from_mem_locked(JINState& st) {
   fflush(stderr);
 }
 
+static void load_execution_plan_locked(JINState& st){
+
+  const char *path_c = std::getenv("JIN_EXECUTION_PLAN_PATH");
+
+  if (path_c == nullptr){
+    return ;
+  }
+
+  std::string path(path_c);
+
+  if(st.exec_plan_loaded && st.exec_plan_path == path){
+    return ;
+  }
+
+  st.exec_plan.clear();
+  st.exec_cursor = 0 ;
+  st.exec_plan_path = path;
+  st.exec_plan_loaded = true;
+
+  FILE* fp = fopen(path.c_str(),"r");
+
+  if (fp == nullptr){
+    fprintf(stderr, "[JIN][EXEC_PLAN_LOAD_FAIL] path=%s\n",path.c_str());
+    fflush(stderr);
+    return;
+  }
+
+  char line[4096];
+  while (fgets(line, sizeof(line), fp) != nullptr) {
+    std::string s(line);
+
+    if (!s.empty() && s.back() == '\n') {
+      s.pop_back();
+    }
+
+    std::vector<std::string> parts;
+    size_t start = 0;
+
+    while (true) {
+      size_t pos = s.find('\t', start);
+      if (pos == std::string::npos) {
+        parts.push_back(s.substr(start));
+        break;
+      }
+      parts.push_back(s.substr(start, pos - start));
+      start = pos + 1;
+    }
+
+    if (parts.size() < 5) {
+      continue;
+    }
+
+    JINExecItem item;
+
+    item.row_id = std::stoll(parts[0]);
+    item.op = parts[1];
+    item.idx = std::stoll(parts[2]);
+    item.suffix = parts[3];
+    item.shape = parts[4];
+    
+    st.exec_plan.push_back(item);
+  }
+  fclose(fp);
+
+  fprintf(
+    stderr,
+    "[JIN][EXEC_PLAN_LOADED] path=%s len=%lld\n",
+    path.c_str(),
+    (long long)st.exec_plan.size()
+  );
+  fflush(stderr);
+}
+
 static void ensure_loaded_locked(JINState& st) {
   st.role = env_cstr("JIN_ROLE");
   st.payload_path = env_cstr("JIN_PAYLOAD_PATH");
@@ -429,24 +520,27 @@ static void ensure_loaded_locked(JINState& st) {
   st.current_bn_sig.clear();
   st.current_bn_idx = 0;
   st.current_bn_stack.clear();
+
+  load_execution_plan_locked(st);
 }
 
 static std::string resolve_alias_locked(JINState& st, const std::string& key) {
-  auto it = st.alias_map.find(key);
+  // auto it = st.alias_map.find(key);
 
-  if (it == st.alias_map.end()) {
-    return key;
-  }
+  // if (it == st.alias_map.end()) {
+  //   return key;
+  // }
 
-  fprintf(
-      stderr,
-      "[JIN][ALIAS] %s -> %s\n",
-      key.c_str(),
-      it->second.c_str()
-  );
-  fflush(stderr);
+  // fprintf(
+  //     stderr,
+  //     "[JIN][ALIAS] %s -> %s\n",
+  //     key.c_str(),
+  //     it->second.c_str()
+  // );
+  // fflush(stderr);
 
-  return it->second;
+  // return it->second;
+  return key;
 }
 
 // static std::string resolve_alias_locked(JINState& st, const std::string& key) {
@@ -533,6 +627,15 @@ static bool overwrite_tensor_locked(JINState& st, at::Tensor& target, const std:
 
   target.copy_(src.to(target.device()));
 
+
+  fprintf(
+    stderr,
+    "[JIN][USED] key=%s\n",
+    actual_key.c_str()
+  );
+  fflush(stderr);
+  
+
   fprintf(stderr, " ");
   log_stats("after", target);
   fprintf(stderr, "\n");
@@ -616,6 +719,65 @@ static at::Tensor pack_relu_mask_bits_from_out(const at::Tensor& relu_out) {
 
 } // namespace
 
+static bool jin_next_exec_item_locked(
+    JINState& st,
+    const char* expected_op,
+    const char* expected_suffix,
+    JINExecItem* out
+) {
+  load_execution_plan_locked(st);
+
+  if (st.exec_cursor >= st.exec_plan.size()) {
+    fprintf(
+        stderr,
+        "[JIN][EXEC_PLAN_END] expected=%s:%s cursor=%lld len=%lld\n",
+        expected_op,
+        expected_suffix,
+        (long long)st.exec_cursor,
+        (long long)st.exec_plan.size()
+    );
+    fflush(stderr);
+    return false;
+  }
+
+  const JINExecItem& item = st.exec_plan[st.exec_cursor];
+
+  fprintf(
+      stderr,
+      "[JIN][PLAN_NEXT] cursor=%lld got=%s:%lld:%s expected=%s:%s shape=%s\n",
+      (long long)st.exec_cursor,
+      item.op.c_str(),
+      (long long)item.idx,
+      item.suffix.c_str(),
+      expected_op,
+      expected_suffix,
+      item.shape.c_str()
+  );
+  fflush(stderr);
+
+  if (item.op != expected_op || item.suffix != expected_suffix) {
+    fprintf(
+        stderr,
+        "[JIN][PLAN_MISMATCH] cursor=%lld got=%s:%lld:%s expected=%s:%s\n",
+        (long long)st.exec_cursor,
+        item.op.c_str(),
+        (long long)item.idx,
+        item.suffix.c_str(),
+        expected_op,
+        expected_suffix
+    );
+    fflush(stderr);
+    return false;
+  }
+
+  if (out != nullptr) {
+    *out = item;
+  }
+
+  st.exec_cursor += 1;
+  return true;
+}
+
 extern "C" {
 
 void jin_init_if_needed() {
@@ -661,10 +823,12 @@ void jin_overwrite_conv_input(at::Tensor& input, const at::Tensor& weight) {
   ensure_loaded_locked(st);
   if (st.role != "B") return;
 
-  const int64_t idx = st.conv2d_i;
+  JINExecItem item;
+  jin_next_exec_item_locked(st, "conv","input",&item);
+
+  const int64_t idx = item.idx;
   
   std::string key = make_key("graph:conv", idx, "input");
-
   bool ok = overwrite_tensor_locked(st, input, key);
 
   fprintf(
@@ -691,7 +855,10 @@ void jin_overwrite_conv_weight(at::Tensor& t) {
   ensure_loaded_locked(st);
   if (st.role != "B") return;
 
-  const int64_t idx = st.conv2d_i;
+  JINExecItem item;
+  jin_next_exec_item_locked(st, "conv","weight",&item);
+
+  const int64_t idx = item.idx;
   std::string key = make_key("graph:conv", idx, "weight");
 
   bool ok = overwrite_tensor_locked(st, t, key);
@@ -701,8 +868,6 @@ void jin_overwrite_conv_weight(at::Tensor& t) {
             key.c_str());
     fflush(stderr);
   }
-
-  st.conv2d_i += 1;
 }
 
 // Old ReLU overwrite path (kept for compatibility)
@@ -713,26 +878,26 @@ void jin_overwrite_relu_saved(at::Tensor& t) {
   ensure_loaded_locked(st);
   if (st.role != "B") return;
 
-  const int64_t idx = st.relu_i;
+  JINExecItem item;
+  jin_next_exec_item_locked(st, "relu", "result", &item);
+
+  const int64_t idx = item.idx;
   const std::string key = make_key("graph:relu", idx, "result");
 
   bool ok = overwrite_tensor_locked(st, t, key);
-  // TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
 
   if (!ok){
-    // std::cout << "[JIN] SKIP key=" << key 
-    //           << "(payload missing, keep local ReLU output)" << std::endl;
-    fprintf(stderr, "[JIN][RELU] SKIP key=%s (payload missing, keep local ReLU output)\n", key.c_str());
-    
-    st.relu_i += 1;
+    fprintf(stderr, "[JIN][RELU] SKIP key=%s (payload missing, keep local ReLU output)\n", key.c_str()); 
+    // st.relu_i += 1;
     return;
   }
-
-  st.relu_i += 1;
+  // st.relu_i += 1;
   
 }
 
-void jin_overwrite_relu(at::Tensor& t) { jin_overwrite_relu_saved(t); }
+void jin_overwrite_relu(at::Tensor& t) { 
+  jin_overwrite_relu_saved(t); 
+}
 
 void jin_overwrite_addmm_mat1(at::Tensor& t) {
   std::lock_guard<std::mutex> lk(g_mu);
@@ -740,14 +905,20 @@ void jin_overwrite_addmm_mat1(at::Tensor& t) {
   ensure_loaded_locked(st);
   if (st.role != "B") return;
 
-  const int64_t idx = st.addmm_i;
-  std::string key = make_key("graph:addmm", idx, "mat1");
-  // TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
-  bool ok = overwrite_tensor_locked(st, t, key);
-  if (!ok){
-    fprintf(stderr, "[JIN][ADDMM] SKIP key=%s (payload missing, keep local addmm mat1)\n", key.c_str());
+  JINExecItem item; 
+
+  if(!jin_next_exec_item_locked(st,"addmm","mat1",&item)){
     return ;
   }
+
+  const int64_t idx = item.idx;
+  const std::string key = make_key("graph:addmm",idx,"mat1");
+
+  bool ok = overwrite_tensor_locked(st, t, key);
+  // if (!ok){
+  //   fprintf(stderr, "[JIN][ADDMM] SKIP key=%s (payload missing, keep local addmm mat1)\n", key.c_str());
+  //   return ;
+  // }
 }
 
 void jin_overwrite_addmm_mat2(at::Tensor& t) {
@@ -756,30 +927,52 @@ void jin_overwrite_addmm_mat2(at::Tensor& t) {
   ensure_loaded_locked(st);
   if (st.role != "B") return;
 
-  const int64_t idx = st.addmm_i;
-  std::string key = make_key("graph:addmm", idx, "mat2");
-  if (!t.defined()) {
-    fprintf(stderr, "[JIN] SKIP key=%s (target undefined)\n", key.c_str());
-    fflush(stderr);
-    st.addmm_i += 1;
-    return;
+  JINExecItem item; 
+    if(!jin_next_exec_item_locked(st,"addmm","mat2",&item)){
+    return ;
   }
+
+  const int64_t idx = item.idx;
+  const std::string key = make_key("graph:addmm",idx,"mat2");
+  
+  // if (!t.defined()) {
+  //   fprintf(stderr, "[JIN] SKIP key=%s (target undefined)\n", key.c_str());
+  //   fflush(stderr);
+  //   st.addmm_i += 1;
+  //   return;
+  // }
 
   bool ok = overwrite_tensor_locked(st, t, key);
-  if (!ok) {
-    fprintf(stderr,
-            "[JIN] SKIP key=%s (payload missing, keep local addmm mat2)\n",
-            key.c_str());
-    fflush(stderr);
-  }
+  // if (!ok) {
+  //   fprintf(stderr,
+  //           "[JIN] SKIP key=%s (payload missing, keep local addmm mat2)\n",
+  //           key.c_str());
+  //   fflush(stderr);
+  // }
 
-  st.addmm_i += 1;
+  // st.addmm_i += 1;
 }
 
 void jin_advance_addmm() {
   std::lock_guard<std::mutex> lk(g_mu);
   auto& st = S();
   st.addmm_i += 1;
+    if (st.role != "B") {
+    return;
+  }
+
+  JINExecItem item;
+  if (!jin_next_exec_item_locked(st, "addmm", "mat2", &item)) {
+    return;
+  }
+
+  fprintf(
+      stderr,
+      "[JIN][ADDMM_ADVANCE_PLAN] idx=%lld suffix=%s\n",
+      (long long)item.idx,
+      item.suffix.c_str()
+  );
+  fflush(stderr);
 }
 
 void jin_overwrite_maxpool2d_input(at::Tensor& t) {
@@ -788,7 +981,10 @@ void jin_overwrite_maxpool2d_input(at::Tensor& t) {
   ensure_loaded_locked(st);
   if (st.role != "B") return;
 
-  const int64_t idx = st.maxpool2d_i;
+  JINExecItem item;
+  jin_next_exec_item_locked(st, "maxpool2d", "input", &item);
+
+  const int64_t idx = item.idx;
   std::string key = make_key("graph:maxpool2d", idx, "input");
   // TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
   bool ok = overwrite_tensor_locked(st, t, key);
@@ -806,7 +1002,10 @@ void jin_overwrite_maxpool2d_indices(at::Tensor& t) {
   ensure_loaded_locked(st);
   if (st.role != "B") return;
 
-  const int64_t idx = st.maxpool2d_i;
+  JINExecItem item;
+  jin_next_exec_item_locked(st, "maxpool2d", "indices", &item);
+
+  const int64_t idx = item.idx;
   std::string key = make_key("graph:maxpool2d", idx, "indices");
   // TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
 
@@ -818,7 +1017,7 @@ void jin_overwrite_maxpool2d_indices(at::Tensor& t) {
     fflush(stderr);
   }
 
-  st.maxpool2d_i += 1;
+  // st.maxpool2d_i += 1;
 }
 
 void jin_set_payload_bytes(const void* data, uint64_t nbytes, int64_t step) {
@@ -861,15 +1060,16 @@ void jin_overwrite_batchnorm_input(at::Tensor& t) {
   ensure_loaded_locked(st);
   if (st.role != "B") return;
 
-  const int64_t idx = jin_begin_batchnorm_locked(st);
-  const std::string key = make_key("graph:bn", idx, "input");
-  bool ok = overwrite_tensor_locked(st, t, key);
-  if (!ok) {
-    fprintf(stderr,
-            "[JIN] SKIP key=%s (payload missing, keep local batchnorm input)\n",
-            key.c_str());
-    fflush(stderr);
+  JINExecItem item;
+  if (!jin_next_exec_item_locked(st, "bn", "input", &item)) {
+    return;
   }
+
+  const int64_t idx = item.idx;
+  st.current_bn_idx = idx;
+
+  const std::string key = make_key("graph:bn", idx, "input");
+  overwrite_tensor_locked(st, t, key);
 }
 
 void jin_overwrite_batchnorm_running_mean(at::Tensor& t) {
@@ -878,7 +1078,10 @@ void jin_overwrite_batchnorm_running_mean(at::Tensor& t) {
   ensure_loaded_locked(st);
   if (st.role != "B") return;
 
-  const std::string key = make_key("graph:bn", st.current_bn_idx, "running_mean");
+  JINExecItem item;
+  jin_next_exec_item_locked(st, "bn", "running_mean", &item);
+
+  const std::string key = make_key("graph:bn", item.idx, "running_mean");
 
   if (!t.defined()) {
     fprintf(stderr, "[JIN] SKIP key=%s (target undefined)\n", key.c_str());
@@ -900,9 +1103,11 @@ void jin_overwrite_batchnorm_running_var(at::Tensor& t) {
   auto& st = S();
   ensure_loaded_locked(st);
   if (st.role != "B") return;
+  JINExecItem item;
+  jin_next_exec_item_locked(st, "bn", "running_var", &item);
 
 
-  const std::string key = make_key("graph:bn", st.current_bn_idx, "running_var");
+  const std::string key = make_key("graph:bn", item.idx, "running_var");
 
   if (!t.defined()) {
     fprintf(stderr, "[JIN] SKIP key=%s (target undefined)\n", key.c_str());
@@ -924,8 +1129,10 @@ void jin_overwrite_batchnorm_weight(at::Tensor& t) {
   auto& st = S();
   ensure_loaded_locked(st);
   if (st.role != "B") return;
+  JINExecItem item;
+  jin_next_exec_item_locked(st, "bn", "weight", &item);
 
-  const std::string key = make_key("graph:bn", st.current_bn_idx, "weight");
+  const std::string key = make_key("graph:bn", item.idx, "weight");
 
   if (!t.defined()) {
     fprintf(stderr, "[JIN] SKIP key=%s (target undefined)\n", key.c_str());
@@ -949,8 +1156,11 @@ void jin_overwrite_batchnorm_result1(at::Tensor& t) {
   auto& st = S();
   ensure_loaded_locked(st);
   if (st.role != "B") return;
+  JINExecItem item;
+  jin_next_exec_item_locked(st, "bn", "result1", &item);
   
-  const std::string key = "graph:bn:" + current_bn_name_locked(st) + ":result1";
+  const int64_t idx = item.idx;
+  const std::string key = make_key("graph:bn", idx, "result1");
 
   fprintf(
     stderr,
@@ -972,6 +1182,9 @@ void jin_overwrite_batchnorm_result2(at::Tensor& t) {
   auto& st = S();
   ensure_loaded_locked(st);
   if (st.role != "B") return;
+
+  JINExecItem item;
+  jin_next_exec_item_locked(st, "bn", "result2", &item);
 
   const int64_t idx = st.current_bn_idx;
   const std::string key = make_key("graph:bn", idx, "result2");
@@ -1308,4 +1521,87 @@ void jin_trace_add_backward(
   //     sizes_str(grad).c_str()
   // );
   // fflush(stderr);
+}
+
+// Check whether the dryrun options is on.
+bool jin_is_dryrun(){
+
+  const char *v = std::getenv("JIN_DRYRUN");
+  return v != nullptr && std::string(v) == "1"; 
+
+}
+
+// Record the backward in autograd execution orders.
+void jin_record_exec(
+  const char* op,
+  int64_t idx,
+  const char* suffix,
+  const at::Tensor& t
+){
+  if (!jin_is_dryrun()) return;
+
+  std::lock_guard<std::mutex> lk(g_mu);
+
+  auto& st = S();
+  const int64_t row_id = st.dryrun_row_id++;
+
+  const std::string key =
+      std::string("graph:") + op + ":" +
+      std::to_string(idx) + ":" + suffix;
+
+  // 1. plan 기록
+  fprintf(stderr,
+    "[JIN][DRYRUN] row=%lld op=%s idx=%lld suffix=%s shape=%s key=%s\n",
+    (long long)row_id,
+    op,
+    (long long)idx,
+    suffix,
+    sizes_str(t).c_str(),
+    key.c_str()
+  );
+  fflush(stderr);
+
+  const char *path = std::getenv("JIN_DRYRUN_PATH");
+  if (path != nullptr) {
+    FILE *fp = fopen(path, "a");
+    if (fp != nullptr) {
+      fprintf(
+        fp,
+        "%lld\t%s\t%lld\t%s\t%s\n",
+        (long long)row_id,
+        op,
+        (long long)idx,
+        suffix,
+        sizes_str(t).c_str()
+      );
+      fclose(fp);
+    }
+  }
+
+  // 2. 핵심: dryrun saved tensor 자체 저장
+  // const char* save_tensors = std::getenv("JIN_DRYRUN_CAPTURE_TENSORS");
+  // if (save_tensors != nullptr && std::string(save_tensors) == "1") {
+  //   st.kv_cpu[key] = t.detach().cpu().contiguous();
+  // }
+  const char* save_dir = std::getenv("JIN_DRYRUN_TENSOR_DIR");
+  if (save_dir != nullptr) {
+    std::string path =
+        std::string(save_dir) + "/" + key + ".pt";
+
+    try {
+      auto tt = t.detach().cpu().contiguous();
+
+      torch::serialize::OutputArchive archive;
+      archive.write("tensor", tt);
+      archive.save_to(path);
+
+      fprintf(stderr, "[JIN][DRYRUN_TENSOR_SAVE] key=%s path=%s\n",
+              key.c_str(), path.c_str());
+      fflush(stderr);
+    } catch (const std::exception& e) {
+      fprintf(stderr, "[JIN][DRYRUN_TENSOR_SAVE_FAIL] key=%s err=%s\n",
+              key.c_str(), e.what());
+      fflush(stderr);
+    }
+  }
 }

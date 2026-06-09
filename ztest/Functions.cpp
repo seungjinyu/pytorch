@@ -66,6 +66,13 @@ variable_list AcosBackward0::apply_with_saved(const variable_list& grads, SwapSa
 }
 variable_list AddBackward0::apply(variable_list&& grads) {
 
+  // fprintf(stderr, "[JIN][ADD_BWD0_ENTER]\n");
+  // fflush(stderr);
+  
+  static int64_t g_add_idx = 0;
+  const int64_t idx = g_add_idx++;
+
+  jin_trace_add_backward(grads[0], idx);
 
   IndexRangeGenerator gen;
   auto self_ix = gen.range(1);
@@ -89,6 +96,7 @@ void AddBackward0::compiled_args(CompiledNodeArgs& args) {
     args.collect(self_scalar_type);
 }
 variable_list AddBackward0::apply_with_saved(const variable_list& grads, SwapSavedVariables& saved) {
+    fprintf(stderr, "[JIN][ADD_BWD0_SAVED_ENTER]\n");
     saved.before(alpha);
     saved.before(other_scalar_type);
     saved.before(self_scalar_type);
@@ -100,6 +108,13 @@ variable_list AddBackward0::apply_with_saved(const variable_list& grads, SwapSav
 }
 variable_list AddBackward1::apply(variable_list&& grads) {
 
+  fprintf(stderr, "[JIN][ADD_BWD1_ENTER]\n");
+  fflush(stderr);
+
+  static int64_t g_add1_idx = 0;
+  const int64_t idx = g_add1_idx++;
+
+  jin_trace_add_backward(grads[0], idx);
 
   IndexRangeGenerator gen;
   auto self_ix = gen.range(1);
@@ -284,17 +299,31 @@ variable_list AddmmBackward0::apply(variable_list&& grads) {
   variable_list grad_inputs(gen.size());
   const auto& grad = grads[0];
   auto mat1 = mat1_.unpack();
-  jin_overwrite_addmm_mat1(mat1);
-
   auto mat2 = mat2_.unpack();
-  // ✅ mat2 grad를 계산할 때만 overwrite + idx advance
-  if (task_should_compute_output({ mat2_ix })) {
-    jin_overwrite_addmm_mat2(mat2);
-  } else {
-    // 그래도 idx는 다음 addmm를 위해 advance 해야 함
-    jin_advance_addmm();
-  }
+  // dry run function testing
+  static int64_t jin_dryrun_addmm_i = 0;
+  // fprintf(stderr, "[JIN][ADDMM_APPLY_ENTER]\n");
+  // fflush(stderr);
 
+  // fprintf(stderr, "[JIN][DRYRUN_ENV] %s\n", std::getenv("JIN_DRYRUN"));
+  // fflush(stderr);
+
+  if(jin_is_dryrun()){  
+    int64_t idx = jin_dryrun_addmm_i++;
+    jin_record_exec("addmm",idx,"mat1",mat1);
+    jin_record_exec("addmm",idx,"mat2",mat2);
+  } else {
+    jin_overwrite_addmm_mat1(mat1);
+    // ✅ mat2 grad를 계산할 때만 overwrite + idx advance
+    if (task_should_compute_output({ mat2_ix })) {
+      jin_overwrite_addmm_mat2(mat2);
+    } else {
+      // 그래도 idx는 다음 addmm를 위해 advance 해야 함
+      jin_advance_addmm();
+    }
+  }
+  //
+  
   bool any_grad_defined = any_variable_defined(grads);
   if (task_should_compute_output({ mat1_ix })) {
     auto grad_result = any_grad_defined ? (mm_mat1_backward(grad, mat2, mat1_sym_sizes, mat1_sym_strides, mat1_layout, alpha)) : Tensor();
@@ -6261,11 +6290,33 @@ variable_list NativeBatchNormBackward0::apply(variable_list&& grads) {
   auto result1 = result1_.unpack(shared_from_this());
   auto result2 = result2_.unpack(shared_from_this());
 
+  // Dry run idx 
+  static int64_t jin_dryrun_bn_i = 0; 
+
+  // if the dry run option is on
+  if (jin_is_dryrun()){
+    int64_t idx = jin_dryrun_bn_i++;
+
+    jin_record_exec("bn",idx, "input",input);
+    if (weight.defined()) {
+      jin_record_exec("bn", idx, "weight", weight);
+    }
+    if (running_mean.defined()) {
+      jin_record_exec("bn", idx, "running_mean", running_mean);
+    }
+    if (running_var.defined()) {
+      jin_record_exec("bn", idx, "running_var", running_var);
+    }
+    jin_record_exec("bn",idx, "result1",result1);
+    jin_record_exec("bn",idx, "result2",result2);
+
+  }
+
   // [JIN] overwrite BN saved vars (Node B)
   jin_overwrite_batchnorm_input(input);
+  jin_overwrite_batchnorm_weight(weight);
   jin_overwrite_batchnorm_running_mean(running_mean);
   jin_overwrite_batchnorm_running_var(running_var);
-  jin_overwrite_batchnorm_weight(weight);
   jin_overwrite_batchnorm_result1(result1);
   jin_overwrite_batchnorm_result2(result2);
   
@@ -11659,26 +11710,33 @@ variable_list ReluBackward0::apply(variable_list&& grads) {
   variable_list grad_inputs(gen.size());
 
   const auto& grad = grads[0];
-  auto result = result_.unpack(shared_from_this());  // ✅ 원래 ReLU backward에 필요
+
   bool any_grad_defined = any_variable_defined(grads);
 
   if (task_should_compute_output({ self_ix })) {
     if (any_grad_defined) {
-      at::Tensor grad_result;
+      Tensor grad_result;
 
-      // ✅ B일 때만 mask 기반 backward
-      if (jin_is_role_B()) {
-        grad_result = jin_relu_backward_from_mask(grad);
-      } else {
-        // ✅ A(또는 role 미설정)에서는 "원래" relu backward
-        grad_result = threshold_backward(grad, result, 0);
+      auto result = result_.unpack(shared_from_this());
+
+      static int64_t jin_dry_run_relu_i = 0;
+      if (jin_is_dryrun()){
+        int64_t idx = jin_dry_run_relu_i++;
+        jin_record_exec("relu",idx, "result",result);
       }
+
+      if (jin_is_role_B()) {
+        jin_overwrite_relu_saved(result);
+      }
+
+      grad_result = threshold_backward(grad, result, 0);
 
       copy_range(grad_inputs, self_ix, grad_result);
     } else {
       copy_range(grad_inputs, self_ix, Tensor());
     }
   }
+
   return grad_inputs;
 }
 
@@ -13688,6 +13746,13 @@ variable_list MaxPool2DWithIndicesBackward0::apply(variable_list&& grads) {
   jin_overwrite_maxpool2d_input(self);
 
   auto result1 = result1_.unpack(shared_from_this());
+
+  static int64_t jin_dryrun_maxpool_i = 0;
+  if (jin_is_dryrun()){
+    int64_t idx = jin_dryrun_maxpool_i++;
+    jin_record_exec("maxpool2d", idx , "input",self);
+    jin_record_exec("maxpool2d",idx , "indices",result1);
+  }
   jin_overwrite_maxpool2d_indices(result1);
 
   bool any_grad_defined = any_variable_defined(grads);
@@ -13827,7 +13892,17 @@ variable_list ConvolutionBackward0::apply(variable_list&& grads) {
   auto input = input_.unpack();
   auto weight = weight_.unpack();
 
-  jin_overwrite_conv_input(input);
+  static int64_t jin_dryrun_conv_i = 0; 
+
+  if(jin_is_dryrun()){
+
+    int64_t idx = jin_dryrun_conv_i++;
+
+    jin_record_exec("conv",idx,"input",input);
+    jin_record_exec("conv",idx,"weight",weight);
+  }
+
+  jin_overwrite_conv_input(input,weight);
   jin_overwrite_conv_weight(weight);
 
   if (task_should_compute_output({ input_ix, weight_ix, bias_ix })) {
