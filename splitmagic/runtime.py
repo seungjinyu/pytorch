@@ -1364,11 +1364,11 @@ class SplitRuntime:
 
             grad_dump[name] = p.grad.detach().cpu().clone()
 
-            print(
-                f"[B][GRAD] {name} "
-                f"mean={p.grad.mean().item():.8f} "
-                f"absmax={p.grad.abs().max().item():.8f}"
-            )
+            # print(
+            #     f"[B][GRAD] {name} "
+            #     f"mean={p.grad.mean().item():.8f} "
+            #     f"absmax={p.grad.abs().max().item():.8f}"
+            # )
 
         torch.save(grad_dump, "/tmp/node_b_grads.pt")
 

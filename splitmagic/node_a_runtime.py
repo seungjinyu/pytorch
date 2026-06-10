@@ -35,6 +35,18 @@ def run_node_a(
     os.environ.pop("JIN_DRYRUN_PATH", None)
     os.environ.pop("JIN_DRYRUN_TENSOR_DIR", None)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+
+    if policy != "full":
+        print(f"[Node A][WARN] policy argument is currently unused: {policy}")
+
+    if optional_keys is not None:
+        print(f"[Node A][WARN] optional_keys argument is currently unused")
+
+    if key_mode != "module_debug":
+        print(f"[Node A][WARN] key_mode argument is currently unused: {key_mode}")
+
     runtime_a = SplitRuntime(model, role="A")
     client = ZMQClient(endpoint)
 
@@ -54,33 +66,45 @@ def run_node_a(
     global_step = 0
     model.train()
 
+    if not dryrun_plan:
+        raise RuntimeError(
+            "[Node A] dryrun_plan=False path is disabled. "
+            "Use dryrun_plan=True with B-generated template plan."
+        )
+    plan = read_dryrun_plan(template_plan_path)
+
+    if not plan:
+        raise RuntimeError(
+            f"[Node A] template plan is empty or missing: {template_plan_path}"
+        )
+    
+    print(
+        f"[Node A][TEMPLATE_PLAN_LOAD] "
+        f"path={template_plan_path} "
+        f"len={len(plan)}",
+        flush=True,
+    )
+    
     for epoch in range(num_epochs):
+
+        if global_step >= max_steps:
+            break
+
         for _, (x, y) in enumerate(train_loader):
             if global_step >= max_steps:
                 break
+            x = x.to(device)
+            y = y.to(device)
 
             t0 = time.perf_counter()
             t_capture0 = time.perf_counter()
 
-            if dryrun_plan:
-                plan = read_dryrun_plan(template_plan_path)
-
-                if not plan:
-                    raise RuntimeError(
-                        f"[Node A] template plan is empty or missing: {template_plan_path}"
-                    )
-
-                # 중요: A는 forward only. backward 호출 없음.
-                payload = runtime_a.capture_jin_forward_plan(
-                    x=x,
-                    y=y,
-                    plan=plan,
-                )
-            else:
-                raise RuntimeError(
-                    "[Node A] dryrun_plan=False path is disabled. "
-                    "Use dryrun_plan=True with B-generated template plan."
-                )
+            # 중요: A는 forward only. backward 호출 없음.
+            payload = runtime_a.capture_jin_forward_plan(
+                x=x,
+                y=y,
+                plan=plan,
+            )
 
             policy_meta = payload.meta.get("tensor_policy", {})
 
@@ -116,9 +140,14 @@ def run_node_a(
 
             t_load0 = time.perf_counter()
 
-            if "grads" in reply:
-                print("[Node A][GRADS] received:", sorted(reply["grads"].keys()))
-
+            if global_step == 0 and "grads" in reply:
+                grad_keys = sorted(reply["grads"].keys())
+                print(
+                    f"[Node A][GRADS] "
+                    f"num={len(grad_keys)} "
+                    f"grads={grad_keys}",
+                    flush=True,
+                )
             model.load_state_dict(reply["updated_state_dict"])
 
             t_load1 = time.perf_counter()
@@ -134,10 +163,12 @@ def run_node_a(
                 f"step={global_step} "
                 f"loss={reply['loss']:.6f} "
                 f"payload_mb={payload_mb:.3f} "
-                f"capture_ms={capture_ms:.2f} "
-                f"send_recv_ms={send_recv_ms:.2f} "
-                f"state_load_ms={state_load_ms:.2f} "
-                f"total_ms={total_ms:.2f}"
+                # f"capture_ms={capture_ms:.2f} "
+                # f"send_recv_ms={send_recv_ms:.2f} "
+                # f"state_load_ms={state_load_ms:.2f} "
+                # f"total_ms={total_ms:.2f}",
+                ,
+                flush=True
             )
 
             logger.write([
@@ -152,10 +183,10 @@ def run_node_a(
 
             global_step += 1
 
-    test_loss, test_acc = evaluate(model, test_loader)
+    test_loss, test_acc = evaluate(model, test_loader,device=device)
 
     if grad_save_path is not None:
-        torch.save(model.state_dict(), grad_save_path)
+        torch.save(model.state_dict(), "split_final.pt")
     else:
         torch.save(model.state_dict(), "split_final.pt")
 

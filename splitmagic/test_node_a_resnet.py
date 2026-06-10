@@ -44,7 +44,7 @@ def main():
         endpoint="tcp://127.0.0.1:5555",
         csv_path="node_a_vgg11bn_grad.csv",
         num_epochs=1,
-        max_steps=1000,
+        max_steps=1,
         policy="full",
         key_mode="graph",
         grad_save_path=SPLIT_GRADS,

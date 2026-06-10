@@ -1,4 +1,7 @@
 import os
+
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
 import random
 import numpy as np
 import torch
@@ -17,7 +20,11 @@ def seed_all(seed=SEED):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
 
 def main():
     for k in [
@@ -30,6 +37,10 @@ def main():
 
     seed_all()
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[LOCAL] device={device}")
+
+
     train_loader, _ = make_cifar10_loaders(
         batch_size=32,
         test_batch_size=128,
@@ -37,6 +48,8 @@ def main():
     )
 
     x, y = next(iter(train_loader))
+    x = x.to(device)
+    y = y.to(device)
 
     model = make_resnet18_cifar10()
 
@@ -44,7 +57,10 @@ def main():
         torch.save(model.state_dict(), INIT)
         print(f"[LOCAL] saved init state: {INIT}")
 
-    model.load_state_dict(torch.load(INIT, map_location="cpu"))
+    state = torch.load(INIT, map_location="cpu")
+    model.load_state_dict(state)
+    model = model.to(device)
+
     model.train()
     model.zero_grad(set_to_none=True)
 

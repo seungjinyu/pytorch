@@ -80,11 +80,13 @@ def run_node_b(
     csv_path="node_b_timing.csv",
     lr=0.1,
     template_batch_size=32,
+    log_level="2",
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
     os.environ["JIN_ROLE"] = "B"
+    os.environ["JIN_LOG_LEVEL"] = log_level
 
     template_plan = build_template_plan_on_b(
         model=model,
@@ -141,7 +143,13 @@ def run_node_b(
 
         optimizer.zero_grad(set_to_none=True)
 
-        print("[Node B][PAYLOAD_KEYS]", sorted(req["payload"].tensors.keys()))
+        payload_keys = sorted(req["payload"].tensors.keys())
+        print(
+            f"[Node B][PAYLOAD] "
+            f"num_keys={len(payload_keys)} "
+            f"first={payload_keys[:10]}",
+            flush=True,
+        )
 
         loss = runtime_b.backward_jin(
             x_dummy,

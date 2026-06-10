@@ -84,14 +84,17 @@ class SavedTensorResolver:
             except RuntimeError:
                 missing.append(key)
 
-        print("[RESOLVER][RESOLVED]")
-        for key, source in resolved:
-            print(f"  {key}: {source}")
+        # print("[RESOLVER][RESOLVED]")
+        # for key, source in resolved:
+        #     print(f"  {key}: {source}")
 
         print("[RESOLVER][MISSING]")
         for key in missing:
-            print(f"  {key}")
-
+            if len(key) == 0:
+                print(f"Nothing missing")
+            else :
+                print(f"  {key}")
+            
         if missing:
             raise RuntimeError(
                 "Missing required saved tensors: "
