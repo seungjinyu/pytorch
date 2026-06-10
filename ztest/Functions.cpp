@@ -72,7 +72,7 @@ variable_list AddBackward0::apply(variable_list&& grads) {
   static int64_t g_add_idx = 0;
   const int64_t idx = g_add_idx++;
 
-  jin_trace_add_backward(grads[0], idx);
+  // jin_trace_add_backward(grads[0], idx);
 
   IndexRangeGenerator gen;
   auto self_ix = gen.range(1);
@@ -114,7 +114,7 @@ variable_list AddBackward1::apply(variable_list&& grads) {
   static int64_t g_add1_idx = 0;
   const int64_t idx = g_add1_idx++;
 
-  jin_trace_add_backward(grads[0], idx);
+  // jin_trace_add_backward(grads[0], idx);
 
   IndexRangeGenerator gen;
   auto self_ix = gen.range(1);

@@ -47,10 +47,10 @@ void jin_overwrite_batchnorm_running_var(at::Tensor& t);
 void jin_overwrite_batchnorm_weight(at::Tensor& t);
 void jin_overwrite_batchnorm_result1(at::Tensor& t);
 void jin_overwrite_batchnorm_result2(at::Tensor& t);
-void jin_trace_add_backward(
-    const at::Tensor& grad,
-    int64_t idx
-);
+// void jin_trace_add_backward(
+//     const at::Tensor& grad,
+//     int64_t idx
+// );
 
 bool jin_is_role_dryrun();
 
