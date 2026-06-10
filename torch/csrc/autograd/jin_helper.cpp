@@ -137,6 +137,7 @@ struct JINState {
   std::string exec_plan_path;
   bool exec_plan_loaded = false;
   size_t exec_cursor = 0;
+  int64_t exec_plan_step = -1;
 
   int64_t dryrun_row_id = 0;
   
@@ -424,13 +425,18 @@ static void load_execution_plan_locked(JINState& st){
 
   std::string path(path_c);
 
-  if(st.exec_plan_loaded && st.exec_plan_path == path){
-    return ;
+  const int64_t cur_step = env_i64("JIN_STEP", -1);
+
+  if (st.exec_plan_loaded &&
+      st.exec_plan_path == path &&
+      st.exec_plan_step == cur_step) {
+    return;
   }
 
   st.exec_plan.clear();
-  st.exec_cursor = 0 ;
+  st.exec_cursor = 0;
   st.exec_plan_path = path;
+  st.exec_plan_step = cur_step;
   st.exec_plan_loaded = true;
 
   FILE* fp = fopen(path.c_str(),"r");
@@ -957,22 +963,7 @@ void jin_advance_addmm() {
   std::lock_guard<std::mutex> lk(g_mu);
   auto& st = S();
   st.addmm_i += 1;
-    if (st.role != "B") {
-    return;
-  }
-
-  JINExecItem item;
-  if (!jin_next_exec_item_locked(st, "addmm", "mat2", &item)) {
-    return;
-  }
-
-  fprintf(
-      stderr,
-      "[JIN][ADDMM_ADVANCE_PLAN] idx=%lld suffix=%s\n",
-      (long long)item.idx,
-      item.suffix.c_str()
-  );
-  fflush(stderr);
+  return;
 }
 
 void jin_overwrite_maxpool2d_input(at::Tensor& t) {
@@ -1052,6 +1043,11 @@ void jin_set_payload_bytes(const void* data, uint64_t nbytes, int64_t step) {
   st.current_bn_sig.clear();
   st.current_bn_idx = 0;
   st.current_bn_stack.clear();
+
+  st.exec_plan_loaded = false;
+  st.exec_plan.clear();
+  st.exec_cursor = 0;
+  load_execution_plan_locked(st);
 }
 
 void jin_overwrite_batchnorm_input(at::Tensor& t) {
@@ -1186,7 +1182,9 @@ void jin_overwrite_batchnorm_result2(at::Tensor& t) {
   JINExecItem item;
   jin_next_exec_item_locked(st, "bn", "result2", &item);
 
-  const int64_t idx = st.current_bn_idx;
+  const int64_t idx = item.idx;
+  st.current_bn_idx = idx;
+
   const std::string key = make_key("graph:bn", idx, "result2");
 
   fprintf(

@@ -862,7 +862,163 @@ class SplitRuntime:
             self.replay_engine = ReplayEngine(model)
         else:
             self.replay_engine = None
-        
+
+    def capture_jin_forward_plan(self, x, y, plan):
+        if self.role != "A":
+            raise RuntimeError("Only role 'A' can capture tensors")
+
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+
+        self.model.train()
+
+        tensors = {}
+        handles = []
+
+        queues = {}
+
+        for e in plan:
+            op = e["op"]
+            suffix = e["suffix"]
+            idx = e["idx"]
+
+            # B local parameter라 payload로 안 보냄
+            if op == "conv" and suffix == "weight":
+                continue
+            if op == "addmm" and suffix == "mat2":
+                continue
+
+            key = f"graph:{op}:{idx}:{suffix}"
+            queues.setdefault((op, suffix), []).append(key)
+
+        # plan은 backward order, forward hook은 forward order
+        # 그래서 각 op/suffix queue를 뒤집음
+        for k in queues:
+            queues[k] = list(reversed(queues[k]))
+
+        def pop_key(op, suffix):
+            q = queues.get((op, suffix), None)
+            if not q:
+                raise RuntimeError(f"[A][PLAN_KEY_EMPTY] op={op} suffix={suffix}")
+            return q.pop(0)
+
+        def save_tensor(key, tensor):
+            tensors[key] = tensor.detach().cpu().contiguous()
+
+        def make_hook(module):
+            def hook(mod, inputs, output):
+                if len(inputs) == 0:
+                    return
+
+                inp = inputs[0]
+
+                if isinstance(mod, nn.Conv2d):
+                    key = pop_key("conv", "input")
+                    save_tensor(key, inp)
+
+                elif isinstance(mod, nn.BatchNorm2d):
+                    # BN backward saved input
+                    save_tensor(pop_key("bn", "input"), inp)
+
+                    # BN weight
+                    if mod.weight is not None:
+                        save_tensor(pop_key("bn", "weight"), mod.weight)
+
+                    save_tensor(pop_key("bn", "running_mean"), mod.running_mean)
+                    save_tensor(pop_key("bn", "running_var"), mod.running_var)
+
+                    # BN result1/result2 = save_mean / save_invstd
+                    dims = (0, 2, 3)
+                    mean = inp.detach().mean(dim=dims)
+                    var = inp.detach().var(dim=dims, unbiased=False)
+                    invstd = torch.rsqrt(var + mod.eps)
+
+                    save_tensor(pop_key("bn", "result1"), mean)
+                    save_tensor(pop_key("bn", "result2"), invstd)
+
+                elif isinstance(mod, nn.ReLU):
+                    key = pop_key("relu", "result")
+                    save_tensor(key, output)
+
+                elif isinstance(mod, nn.Linear):
+                    key = pop_key("addmm", "mat1")
+                    save_tensor(key, inp)
+
+                elif isinstance(mod, nn.MaxPool2d):
+                    save_tensor(pop_key("maxpool2d", "input"), inp)
+
+                    _, indices = F.max_pool2d(
+                        inp,
+                        kernel_size=mod.kernel_size,
+                        stride=mod.stride,
+                        padding=mod.padding,
+                        dilation=mod.dilation,
+                        ceil_mode=mod.ceil_mode,
+                        return_indices=True,
+                    )
+
+                    save_tensor(pop_key("maxpool2d", "indices"), indices)
+
+            return hook
+
+        for _, m in self.model.named_modules():
+            if isinstance(
+                m,
+                (
+                    nn.Conv2d,
+                    nn.BatchNorm2d,
+                    nn.ReLU,
+                    nn.Linear,
+                    nn.MaxPool2d,
+                ),
+            ):
+                handles.append(m.register_forward_hook(make_hook(m)))
+
+        try:
+            out = self.model(x)
+        finally:
+            for h in handles:
+                h.remove()
+
+        tensors["model.output"] = out.detach().cpu().contiguous()
+
+        # 남은 queue가 있으면 A forward에서 못 채운 saved tensor가 있다는 뜻
+        leftovers = {
+            f"{op}:{suffix}": len(q)
+            for (op, suffix), q in queues.items()
+            if len(q) > 0
+        }
+
+        if leftovers:
+            raise RuntimeError(f"[A][PLAN_KEYS_LEFTOVER] {leftovers}")
+
+        items = []
+        for key, tensor in tensors.items():
+            items.append({
+                "key": key,
+                "jin_key": key,
+                "graph_key": key,
+                "tensor": tensor,
+                "node": key,
+                "attr": key,
+                "shape": tuple(tensor.shape),
+                "dtype": tensor.dtype,
+                "requires_grad": False,
+            })
+
+        payload = payload_from_jin_items(items)
+
+        payload.meta = getattr(payload, "meta", {})
+        payload.meta["dryrun_backward_plan"] = plan
+        payload.meta["tensor_policy"] = {
+            "policy": "forward_only_plan_keys",
+            "included_keys": sorted(tensors.keys()),
+            "num_payload_tensors": len(tensors),
+            "all_keys": sorted(tensors.keys()),
+        }
+
+        return payload    
     def info(self):
         return f"SplitRuntime(role={self.role}, model={self.model.__class__.__name__})"
     

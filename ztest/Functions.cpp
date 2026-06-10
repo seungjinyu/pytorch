@@ -6310,15 +6310,17 @@ variable_list NativeBatchNormBackward0::apply(variable_list&& grads) {
     jin_record_exec("bn",idx, "result1",result1);
     jin_record_exec("bn",idx, "result2",result2);
 
+  } else {
+    jin_overwrite_batchnorm_input(input);
+    jin_overwrite_batchnorm_weight(weight);
+    jin_overwrite_batchnorm_running_mean(running_mean);
+    jin_overwrite_batchnorm_running_var(running_var);
+    jin_overwrite_batchnorm_result1(result1);
+    jin_overwrite_batchnorm_result2(result2);
   }
 
   // [JIN] overwrite BN saved vars (Node B)
-  jin_overwrite_batchnorm_input(input);
-  jin_overwrite_batchnorm_weight(weight);
-  jin_overwrite_batchnorm_running_mean(running_mean);
-  jin_overwrite_batchnorm_running_var(running_var);
-  jin_overwrite_batchnorm_result1(result1);
-  jin_overwrite_batchnorm_result2(result2);
+  
   
   if (task_should_compute_output({ input_ix, weight_ix, bias_ix })) {
       auto grad_input_mask = std::array<bool, 3>{
@@ -11723,9 +11725,7 @@ variable_list ReluBackward0::apply(variable_list&& grads) {
       if (jin_is_dryrun()){
         int64_t idx = jin_dry_run_relu_i++;
         jin_record_exec("relu",idx, "result",result);
-      }
-
-      if (jin_is_role_B()) {
+      } else{
         jin_overwrite_relu_saved(result);
       }
 
@@ -13743,8 +13743,6 @@ variable_list MaxPool2DWithIndicesBackward0::apply(variable_list&& grads) {
   variable_list grad_inputs(gen.size());
   const auto& grad = grads[0];
   auto self = self_.unpack();
-  jin_overwrite_maxpool2d_input(self);
-
   auto result1 = result1_.unpack(shared_from_this());
 
   static int64_t jin_dryrun_maxpool_i = 0;
@@ -13752,8 +13750,11 @@ variable_list MaxPool2DWithIndicesBackward0::apply(variable_list&& grads) {
     int64_t idx = jin_dryrun_maxpool_i++;
     jin_record_exec("maxpool2d", idx , "input",self);
     jin_record_exec("maxpool2d",idx , "indices",result1);
+  } else {
+    jin_overwrite_maxpool2d_input(self);
+    jin_overwrite_maxpool2d_indices(result1);
   }
-  jin_overwrite_maxpool2d_indices(result1);
+  
 
   bool any_grad_defined = any_variable_defined(grads);
   if (task_should_compute_output({ self_ix })) {
@@ -13900,10 +13901,12 @@ variable_list ConvolutionBackward0::apply(variable_list&& grads) {
 
     jin_record_exec("conv",idx,"input",input);
     jin_record_exec("conv",idx,"weight",weight);
-  }
+  } else {
 
-  jin_overwrite_conv_input(input,weight);
-  jin_overwrite_conv_weight(weight);
+    jin_overwrite_conv_input(input,weight);
+    jin_overwrite_conv_weight(weight);
+
+  }
 
   if (task_should_compute_output({ input_ix, weight_ix, bias_ix })) {
       auto grad_input_mask = std::array<bool, 3>{
