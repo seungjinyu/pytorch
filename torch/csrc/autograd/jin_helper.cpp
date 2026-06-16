@@ -487,41 +487,42 @@ static void ensure_loaded_locked(JINState& st) {
 }
 
 static std::string resolve_alias_locked(JINState& st, const std::string& key) {
-  // auto it = st.alias_map.find(key);
-
-  // if (it == st.alias_map.end()) {
-  //   return key;
-  // }
-
-  // fprintf(
-  //     stderr,
-  //     "[JIN][ALIAS] %s -> %s\n",
-  //     key.c_str(),
-  //     it->second.c_str()
-  // );
-  // fflush(stderr);
-
-  // return it->second;
   return key;
 }
 
-// static std::string resolve_alias_locked(JINState& st, const std::string& key) {
-//   return key ;
-// }
+// Check whether they are local key and if they are we do not print out MISS
+static bool is_local_parameter_key(const std::string& key) {
+  if (key.rfind("graph:conv:", 0) == 0 &&
+      key.size() >= 7 &&
+      key.compare(key.size() - 7, 7, ":weight") == 0) {
+    return true;
+  }
+
+  if (key.rfind("graph:addmm:", 0) == 0 &&
+      key.size() >= 5 &&
+      key.compare(key.size() - 5, 5, ":mat2") == 0) {
+    return true;
+  }
+
+  return false;
+}
 
 static bool overwrite_tensor_locked(JINState& st, at::Tensor& target, const std::string& key) {
-  // check alias map first
+  
   const std::string actual_key = resolve_alias_locked(st, key);
 
   auto it = st.kv_cpu.find(actual_key);
   if (it == st.kv_cpu.end()) {
-    fprintf(stderr, "[JIN] MISS key=%s\n", actual_key.c_str());
-    fflush(stderr);
+    if (!is_local_parameter_key(actual_key)){
+
+      fprintf(stderr, "[JIN] MISS key=%s\n", actual_key.c_str());
+      fflush(stderr);
+    }
     return false;
   }
 
   at::Tensor src = it->second;
-  if(!jin_log_level()>= 4 ){
+  if(jin_log_level() >= 4 ){
 
   fprintf(stderr,
           "[JIN][CHECK] key=%s src_dtype=%s target_dtype=%s "
@@ -579,24 +580,24 @@ static bool overwrite_tensor_locked(JINState& st, at::Tensor& target, const std:
   auto log_stats = [&](const char* tag, const at::Tensor& t) {
     if (at::isFloatingType(stype) || at::isComplexType(stype)) {
       double m = (double)t.mean().item<double>();
-      if(!jin_log_level()>= 4 ){    
+      if(jin_log_level()>= 4 ){    
         fprintf(stderr, "%s_mean=%f", tag, m);
       }
     } else {
       auto mx = t.to(at::kLong).abs().max().item<int64_t>();
-      if(!jin_log_level()>= 4 ){
+      if(jin_log_level()>= 4 ){
         fprintf(stderr, "%s_absmax=%lld", tag, (long long)mx);
       }
     }
   };
-  if(!jin_log_level()>= 4 ){
+  if(jin_log_level()>= 4 ){
     fprintf(stderr, "[JIN] OK key=%s ", actual_key.c_str());
     log_stats("before", target);
   }
 
   target.copy_(src.to(target.device()));
 
-if(!jin_log_level()>= 4 ){
+if(jin_log_level()>= 4 ){
   fprintf(
     stderr,
     "[JIN][USED] key=%s\n",
@@ -711,7 +712,7 @@ static bool jin_next_exec_item_locked(
 
   const JINExecItem& item = st.exec_plan[st.exec_cursor];
 
-  if(!jin_log_level()>= 4 ){
+  if(jin_log_level()>= 4 ){
 
     fprintf(
         stderr,
@@ -802,7 +803,7 @@ void jin_overwrite_conv_input(at::Tensor& input, const at::Tensor& weight) {
   
   std::string key = make_key("graph:conv", idx, "input");
   bool ok = overwrite_tensor_locked(st, input, key);
-  if(!jin_log_level()>= 4 ){
+  if(jin_log_level()>= 4 ){
     fprintf(
         stderr,
         "[JIN][CONV_INPUT] key=%s shape=%s\n",
@@ -835,7 +836,7 @@ void jin_overwrite_conv_weight(at::Tensor& t) {
   std::string key = make_key("graph:conv", idx, "weight");
 
   bool ok = overwrite_tensor_locked(st, t, key);
-  if(!jin_log_level()>= 4 ){
+  if(jin_log_level()>= 4 ){
     if (!ok) {
       fprintf(stderr,
               "[JIN] SKIP key=%s (payload missing, keep local conv weight)\n",
@@ -860,7 +861,7 @@ void jin_overwrite_relu_saved(at::Tensor& t) {
   const std::string key = make_key("graph:relu", idx, "result");
 
   bool ok = overwrite_tensor_locked(st, t, key);
-  if(!jin_log_level()>= 4 ){
+  if(jin_log_level()>= 4 ){
 
     if (!ok){
       fprintf(stderr, "[JIN][RELU] SKIP key=%s (payload missing, keep local ReLU output)\n", key.c_str()); 
@@ -892,7 +893,7 @@ void jin_overwrite_addmm_mat1(at::Tensor& t) {
   const std::string key = make_key("graph:addmm",idx,"mat1");
 
   bool ok = overwrite_tensor_locked(st, t, key);
-  if(!jin_log_level()>= 4 ){
+  if(jin_log_level()>= 4 ){
     if (!ok){
       fprintf(stderr, "[JIN][ADDMM] SKIP key=%s (payload missing, keep local addmm mat1)\n", key.c_str());
       return ;
@@ -913,7 +914,7 @@ void jin_overwrite_addmm_mat2(at::Tensor& t) {
 
   const int64_t idx = item.idx;
   const std::string key = make_key("graph:addmm",idx,"mat2");
-  if(!jin_log_level()>= 4 ){
+  if(jin_log_level()>= 4 ){
 
     if (!t.defined()) {
       fprintf(stderr, "[JIN] SKIP key=%s (target undefined)\n", key.c_str());
@@ -924,7 +925,7 @@ void jin_overwrite_addmm_mat2(at::Tensor& t) {
   }
 
   bool ok = overwrite_tensor_locked(st, t, key);
-  if(!jin_log_level()>= 4 ){
+  if(jin_log_level()>= 4 ){
     if (!ok) {
       fprintf(stderr,
               "[JIN] SKIP key=%s (payload missing, keep local addmm mat2)\n",
@@ -954,7 +955,7 @@ void jin_overwrite_maxpool2d_input(at::Tensor& t) {
   std::string key = make_key("graph:maxpool2d", idx, "input");
   
   bool ok = overwrite_tensor_locked(st, t, key);
-  if(!jin_log_level()>= 4 ){
+  if(jin_log_level()>= 4 ){
     if (!ok) {
       fprintf(stderr,
               "[JIN][MAXPOOL] SKIP key=%s (payload missing, keep local maxpool input)\n",
@@ -978,7 +979,7 @@ void jin_overwrite_maxpool2d_indices(at::Tensor& t) {
   // TORCH_CHECK(overwrite_tensor_locked(st, t, key), "[JIN] missing key=", key);
 
   bool ok = overwrite_tensor_locked(st, t, key);
-  if(!jin_log_level()>= 4 ){
+  if(jin_log_level()>= 4 ){
 
     if (!ok) {
       fprintf(stderr,
@@ -1057,7 +1058,7 @@ void jin_overwrite_batchnorm_running_mean(at::Tensor& t) {
   jin_next_exec_item_locked(st, "bn", "running_mean", &item);
 
   const std::string key = make_key("graph:bn", item.idx, "running_mean");
-  if(!jin_log_level()>= 4 ){
+  if(jin_log_level()>= 4 ){
     if (!t.defined()) {
       fprintf(stderr, "[JIN] SKIP key=%s (target undefined)\n", key.c_str());
       fflush(stderr);
@@ -1066,7 +1067,7 @@ void jin_overwrite_batchnorm_running_mean(at::Tensor& t) {
   }
 
   bool ok = overwrite_tensor_locked(st, t, key);
-  if(!jin_log_level()>= 4 ){
+  if(jin_log_level()>= 4 ){
     if (!ok) {
       fprintf(stderr,
               "[JIN] SKIP key=%s (payload missing, keep local batchnorm running_mean)\n",
@@ -1086,7 +1087,7 @@ void jin_overwrite_batchnorm_running_var(at::Tensor& t) {
 
 
   const std::string key = make_key("graph:bn", item.idx, "running_var");
-  if(!jin_log_level()>= 4 ){
+  if(jin_log_level()>= 4 ){
 
     if (!t.defined()) {
       fprintf(stderr, "[JIN] SKIP key=%s (target undefined)\n", key.c_str());
@@ -1095,7 +1096,7 @@ void jin_overwrite_batchnorm_running_var(at::Tensor& t) {
     }
   }
   bool ok = overwrite_tensor_locked(st, t, key);
-  if(!jin_log_level()>= 4 ){
+  if(jin_log_level()>= 4 ){
 
     if (!ok) {
       fprintf(stderr,
@@ -1115,7 +1116,7 @@ void jin_overwrite_batchnorm_weight(at::Tensor& t) {
   jin_next_exec_item_locked(st, "bn", "weight", &item);
 
   const std::string key = make_key("graph:bn", item.idx, "weight");
-  if(!jin_log_level()>= 4 ){
+  if(jin_log_level()>= 4 ){
 
   if (!t.defined()) {
     fprintf(stderr, "[JIN] SKIP key=%s (target undefined)\n", key.c_str());
@@ -1125,7 +1126,7 @@ void jin_overwrite_batchnorm_weight(at::Tensor& t) {
   }
 
   bool ok = overwrite_tensor_locked(st, t, key);
-    if(!jin_log_level()>= 4 ){
+    if(jin_log_level()>= 4 ){
 
   if (!ok) {
     fprintf(stderr,
@@ -1148,7 +1149,7 @@ void jin_overwrite_batchnorm_result1(at::Tensor& t) {
   
   const int64_t idx = item.idx;
   const std::string key = make_key("graph:bn", idx, "result1");
-  if(!jin_log_level()>= 4 ){
+  if(jin_log_level()>= 4 ){
 
   fprintf(
     stderr,
@@ -1158,7 +1159,7 @@ void jin_overwrite_batchnorm_result1(at::Tensor& t) {
   );
   }  
   bool ok = overwrite_tensor_locked(st, t, key);
-    if(!jin_log_level()>= 4 ){
+    if(jin_log_level()>= 4 ){
 
   if (!ok) {
     fprintf(stderr,
@@ -1181,7 +1182,7 @@ void jin_overwrite_batchnorm_result2(at::Tensor& t) {
   st.current_bn_idx = idx;
 
   const std::string key = make_key("graph:bn", idx, "result2");
-  if(!jin_log_level()>= 4 ){
+  if(jin_log_level()>= 4 ){
 
   fprintf(
       stderr,
@@ -1193,7 +1194,7 @@ void jin_overwrite_batchnorm_result2(at::Tensor& t) {
 }
 
   overwrite_tensor_locked(st, t, key);
-  if(!jin_log_level()>= 4 ){
+  if(jin_log_level()>= 4 ){
 
   fprintf(
       stderr,
@@ -1254,7 +1255,7 @@ at::Tensor jin_relu_backward_from_mask(const at::Tensor& grad) {
 
   const int64_t i = st.relu_i++;
   const std::string key = relu_mask_key(i);
-    if(!jin_log_level()>= 4 ){
+    if(jin_log_level()>= 4 ){
 
   fprintf(
       stderr,
@@ -1274,7 +1275,7 @@ at::Tensor jin_relu_backward_from_mask(const at::Tensor& grad) {
   }
 
   at::Tensor mask_bytes = it->second;
-    if(!jin_log_level()>= 4 ){
+    if(jin_log_level()>= 4 ){
 
   fprintf(
     stderr,
