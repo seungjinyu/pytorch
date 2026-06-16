@@ -5,7 +5,52 @@ import torch.nn.functional as F
 from splitmagic import SplitRuntime, ZMQServer
 from splitmagic.utils.timing import CSVLogger
 from splitmagic.runtime import read_dryrun_plan
+from splitmagic.resolver import read_jin1_payload
 
+def tensor_nbytes(t):
+    return t.numel() * t.element_size()
+
+def print_payload_size_summary(payload, topk=20):
+    by_op = {}
+    rows = []
+
+    for k, t in payload.tensors.items():
+        nbytes = tensor_nbytes(t)
+        mb = nbytes / 1024 / 1024
+
+        parts = k.split(":")
+        if len(parts) >= 4 and parts[0] == "graph":
+            op = parts[1]
+            suffix = parts[3]
+            group = f"{op}:{suffix}"
+        else:
+            group = k
+
+        by_op[group] = by_op.get(group, 0) + nbytes
+        rows.append((nbytes, k, tuple(t.shape), str(t.dtype)))
+
+    total = sum(n for n, *_ in rows)
+
+    print(
+        f"[Node B][PAYLOAD_SIZE] total={total / 1024 / 1024:.3f} MB "
+        f"num_keys={len(rows)}",
+        flush=True,
+    )
+
+    print("[Node B][PAYLOAD_SIZE_BY_GROUP]", flush=True)
+    for group, nbytes in sorted(by_op.items(), key=lambda x: x[1], reverse=True):
+        print(
+            f"  {group:24s} {nbytes / 1024 / 1024:10.3f} MB",
+            flush=True,
+        )
+
+    print(f"[Node B][PAYLOAD_TOP{topk}]", flush=True)
+    for nbytes, k, shape, dtype in sorted(rows, reverse=True)[:topk]:
+        print(
+            f"  {nbytes / 1024 / 1024:10.3f} MB  {k:35s} "
+            f"shape={shape} dtype={dtype}",
+            flush=True,
+        )
 
 def clone_grads(model):
     return {
@@ -49,8 +94,8 @@ def build_template_plan_on_b(model, batch_size, device):
     return plan
 
 
-def write_execution_plan(plan, step):
-    plan_path = f"/tmp/jin_execution_plan_step{step}.tsv"
+def write_execution_plan(plan, path = "/tmp/jin_execution_plan.tsv"):
+    plan_path = path
 
     with open(plan_path, "w") as f:
         for e in plan:
@@ -80,8 +125,11 @@ def run_node_b(
     csv_path="node_b_timing.csv",
     lr=0.1,
     template_batch_size=32,
-    log_level="2",
+    log_level="4",
 ):
+    
+    printed_payload_summary = False
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
@@ -93,6 +141,8 @@ def run_node_b(
         batch_size=template_batch_size,
         device=device,
     )
+
+    write_execution_plan(template_plan)
 
     optimizer = torch.optim.SGD(model.parameters(), lr=lr)
     runtime_b = SplitRuntime(model, role="B")
@@ -117,7 +167,32 @@ def run_node_b(
 
         if req is None:
             break
+        if isinstance(req, dict) and req.get("kind") == "get_template_plan":
+            server.send_reply({
+                "status": "ok",
+                "kind": "template_plan",
+                "template_plan": template_plan,
+            })
+            print(
+                f"[Node B][TEMPLATE_PLAN_SEND] len={len(template_plan)}",
+                flush=True,
+            )
+            continue
 
+        jin_payload = read_jin1_payload(req["payload_path"])
+        req["payload"] = jin_payload
+
+        payload_keys = sorted(req["payload"].tensors.keys())
+        print(
+            f"[Node B][JIN1_PAYLOAD_RELOAD] "
+            f"num_keys={len(payload_keys)} "
+            f"first={payload_keys[:10]}",
+            flush=True,
+        )
+        if not printed_payload_summary:
+            print_payload_size_summary(req["payload"], topk=30)
+            printed_payload_summary = True
+        
         if "state_dict" in req:
             model.load_state_dict(req["state_dict"])
 
@@ -125,7 +200,7 @@ def run_node_b(
         if not plan:
             plan = template_plan
 
-        write_execution_plan(plan, step)
+        # write_execution_plan(plan, step)
 
         os.environ["JIN_ROLE"] = "B"
         os.environ["JIN_PAYLOAD_PATH"] = req["payload_path"]
@@ -158,6 +233,7 @@ def run_node_b(
             loss_fn=F.cross_entropy,
             payload_path=req["payload_path"],
             tensor_policy=req.get("tensor_policy", None),
+            dryrun_backward_plan=plan
         )
 
         grads = clone_grads(model)

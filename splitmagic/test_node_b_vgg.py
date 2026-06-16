@@ -34,6 +34,7 @@ def main():
         endpoint="tcp://*:5555",
         csv_path="node_b_vgg11bn_grad.csv",
         lr=0.1,
+        log_level="2",
     )
 
 

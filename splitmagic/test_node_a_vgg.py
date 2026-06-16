@@ -48,6 +48,7 @@ def main():
         policy="full",
         key_mode="graph",
         grad_save_path=SPLIT_GRADS,
+        dryrun_plan=True
     )
 
 

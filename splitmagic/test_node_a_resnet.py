@@ -10,7 +10,7 @@ from splitmagic.data import make_cifar10_loaders
 
 SEED = 1234
 INIT = "./resnet18_init_state.pt"
-SPLIT_GRADS = "./resnet18_split_grads.pt"
+SPLIT_GRADS = "./resnet18_split_grads_1000.pt"
 
 
 def seed_all(seed=SEED):
@@ -43,8 +43,8 @@ def main():
         test_loader=test_loader,
         endpoint="tcp://127.0.0.1:5555",
         csv_path="node_a_vgg11bn_grad.csv",
-        num_epochs=1,
-        max_steps=1,
+        num_epochs=10,
+        max_steps=10000,
         policy="full",
         key_mode="graph",
         grad_save_path=SPLIT_GRADS,

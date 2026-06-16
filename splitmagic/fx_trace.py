@@ -4,12 +4,14 @@ import torch.nn as nn
 
 SUPPORTED_RECOMPUTE_TYPES = {
     "Conv2d",
+    "BatchNorm2d",
     "ReLU",
     "MaxPool2d",
     "Linear",
     "flatten",
     "view",
     "reshape",
+    
 }
 
 def build_fx_node_list(model):
@@ -198,6 +200,7 @@ def build_jin_key_to_fx_node(model):
     relu_nodes = []
     pool_nodes = []
     linear_nodes = []
+    bn_nodes = []
 
     for n in nodes:
         if n["type"] == "Conv2d":
@@ -208,6 +211,8 @@ def build_jin_key_to_fx_node(model):
             pool_nodes.append(n)
         elif n["type"] == "Linear":
             linear_nodes.append(n)
+        elif n["type"] == "BatchNorm2d":
+            bn_nodes.append(n)
 
     # IMPORTANT:
     # Autograd saved tensors are collected in backward graph order.
@@ -217,24 +222,35 @@ def build_jin_key_to_fx_node(model):
     relu_nodes = list(reversed(relu_nodes))
     pool_nodes = list(reversed(pool_nodes))
     linear_nodes = list(reversed(linear_nodes))
+    bn_nodes = list(reversed(bn_nodes))
 
     mapping = {}
 
     for i, n in enumerate(conv_nodes):
         if n["args"]:
-            mapping[f"conv2d:{i}:input"] = n["args"][0]
+            mapping[f"graph:conv:{i}:input"] = n["args"][0]
 
     for i, n in enumerate(relu_nodes):
-        mapping[f"relu:{i}:out"] = n["name"]
+        mapping[f"graph:relu:{i}:result"] = n["name"]
 
     for i, n in enumerate(pool_nodes):
-        mapping[f"maxpool2d:{i}:indices"] = n["name"]
+        mapping[f"graph:maxpool2d:{i}:indices"] = n["name"]
         if n["args"]:
-            mapping[f"maxpool2d:{i}:input"] = n["args"][0]
+            mapping[f"graph:maxpool2d:{i}:input"] = n["args"][0]
 
     for i, n in enumerate(linear_nodes):
         if n["args"]:
-            mapping[f"addmm:{i}:mat1"] = n["args"][0]
+            mapping[f"graph:addmm:{i}:mat1"] = n["args"][0]
+    for i, n in enumerate(bn_nodes):
+        if n["args"]:
+            mapping[f"graph:bn:{i}:input"] = n["args"][0]
+
+        # mapping[f"graph:bn:{i}:result1"] = n["target"]
+        # mapping[f"graph:bn:{i}:result2"] = n["target"]
+
+        # mapping[f"graph:bn:{i}:running_mean"] = n["target"]
+        # mapping[f"graph:bn:{i}:running_var"] = n["target"]
+        # mapping[f"graph:bn:{i}:weight"] = n["target"]
 
     return mapping
 

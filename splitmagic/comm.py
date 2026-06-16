@@ -43,6 +43,21 @@ class ZMQClient:
     def stop(self):
         self.sock.send_pyobj({"type": "STOP"})
         return self.sock.recv_pyobj()
+    
+    def request_template_plan(self):
+        self.sock.send_pyobj({
+            "kind": "get_template_plan",
+        })
+
+        reply = self.sock.recv_pyobj()
+
+        if reply.get("status") != "ok":
+            raise RuntimeError(f"[ZMQClient] template plan request failed: {reply}")
+
+        if reply.get("kind") != "template_plan":
+            raise RuntimeError(f"[ZMQClient] unexpected reply: {reply}")
+
+        return reply["template_plan"]
 
 
 class ZMQServer:
@@ -52,7 +67,11 @@ class ZMQServer:
         self.sock.bind(bind_address)
 
     def recv_payload(self, payload_path="/tmp/jin_payload_recv.bin"):
+
         msg = self.sock.recv_pyobj()
+
+        if isinstance(msg, dict) and msg.get("kind") == "get_template_plan":
+            return msg
 
         if msg["type"] == "STOP":
             self.sock.send_pyobj({"status": "stopped"})

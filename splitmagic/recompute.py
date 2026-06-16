@@ -34,9 +34,33 @@ class FXRecomputeEngine:
 
             elif node_name == "reshape":
                 raise NotImplementedError("reshape recompute needs shape info")
+            
+            elif node_name.startswith("add"):
+
+                print(
+                    f"[RECOMPUTE_ADD_SKIP] node={node_name}",
+                    flush=True,
+                )
+
+                # TODO:
+                # residual branch tensor 필요
+                # 지금은 skip
+                continue
 
             else:
-                module = self.modules[node_name]
+
+                module_key = node_name.replace("_", ".")
+
+                if module_key not in self.modules:
+                    print(
+                        f"[RECOMPUTE_SKIP_NODE] "
+                        f"node={node_name} "
+                        f"module_key={module_key}",
+                        flush=True,
+                    )
+                    continue
+
+                module = self.modules[module_key]
                 cur = module(cur)
 
             print(

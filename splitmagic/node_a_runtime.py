@@ -28,14 +28,15 @@ def run_node_a(
     grad_save_path=None,
     key_mode="module_debug",
     dryrun_plan=False,
-    template_plan_path="/tmp/jin_template_plan.tsv",
+    template_plan_path="/tmp/jin_template_plan_a.tsv",
 ):
     os.environ["JIN_ROLE"] = "A"
     os.environ.pop("JIN_DRYRUN", None)
     os.environ.pop("JIN_DRYRUN_PATH", None)
     os.environ.pop("JIN_DRYRUN_TENSOR_DIR", None)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cpu"
     model = model.to(device)
 
     if policy != "full":
@@ -71,12 +72,23 @@ def run_node_a(
             "[Node A] dryrun_plan=False path is disabled. "
             "Use dryrun_plan=True with B-generated template plan."
         )
-    plan = read_dryrun_plan(template_plan_path)
+    # plan = read_dryrun_plan(template_plan_path)
+
+    plan = client.request_template_plan()
 
     if not plan:
         raise RuntimeError(
             f"[Node A] template plan is empty or missing: {template_plan_path}"
         )
+    with open(template_plan_path,"w") as f:
+        for e in plan:
+            f.write(
+                f"{e['row_id']}\t"
+                f"{e['op']}\t"
+                f"{e['idx']}\t"
+                f"{e['suffix']}\t"
+                f"{e['shape']}\n"
+            )
     
     print(
         f"[Node A][TEMPLATE_PLAN_LOAD] "
@@ -105,6 +117,53 @@ def run_node_a(
                 y=y,
                 plan=plan,
             )
+            # drop_keys = {
+            #     "graph:relu:7:result",
+            #     "graph:relu:6:result",
+            #     "graph:relu:5:result",
+            #     "graph:relu:4:result",
+            #     "graph:relu:3:result",
+            #     "graph:relu:2:result",
+            #     "graph:relu:1:result",
+            #     "graph:conv:3:input",
+            #     "graph:conv:1:input",
+            #     "graph:conv:0:input",
+            #     "graph:bn:7:input",
+            #     "graph:bn:6:input",
+            #     "graph:bn:5:input",
+            #     "graph:bn:4:input",
+            #     "graph:bn:3:input",
+            #     "graph:bn:2:input",
+            #     "graph:bn:1:input",
+            #     # "graph:conv:7:input",
+            #     # "graph:maxpool2d:4:input",
+            #     # "graph:maxpool2d:4:indices",
+            # }
+            # drop_keys = {
+            #     "graph:addmm:0:mat1",
+            #     "graph:conv:18:input",
+            #     "graph:conv:17:input",
+            #     "graph:conv:16:input",
+            #     "graph:conv:15:input",
+            #     "graph:conv:14:input",
+            #     "graph:conv:13:input",
+            #     "graph:conv:12:input",
+            #     "graph:conv:11:input",
+            #     "graph:conv:10:input",
+            #     "graph:conv:9:input",
+            #     "graph:conv:8:input",
+            #     "graph:bn:19:input",
+            #     "graph:bn:18:input",
+            #     "graph:bn:17:input",
+            #     "graph:bn:16:input",
+            #     "graph:bn:15:input",
+            #     "graph:bn:14:input",
+            #     "graph:bn:13:input",
+            #     "graph:bn:12:input",
+            # }
+
+            # for k in drop_keys:
+            #     payload.tensors.pop(k, None)
 
             policy_meta = payload.meta.get("tensor_policy", {})
 
@@ -133,10 +192,26 @@ def run_node_a(
                 print("[Node A] bad reply:", reply)
                 break
 
-            if grad_save_path is not None and "grads" in reply:
-                torch.save(reply["grads"], grad_save_path)
-                print(f"[Node A] saved grads to {grad_save_path}")
-                return
+            payload_mb = reply["bytes"] / 1024 / 1024
+
+            # if grad_save_path is not None and "grads" in reply:
+            #     torch.save(reply["grads"], grad_save_path)
+            #     print(f"[Node A] saved grads to {grad_save_path}")
+
+                # print(
+                #     f"[Node A] epoch={epoch} "
+                #     f"step={global_step} "
+                #     f"loss={reply['loss']:.6f} "
+                #     f"payload_mb={payload_mb:.3f} "
+                #     # f"capture_ms={capture_ms:.2f} "
+                #     # f"send_recv_ms={send_recv_ms:.2f} "
+                #     # f"state_load_ms={state_load_ms:.2f} "
+                #     # f"total_ms={total_ms:.2f}",
+                #     ,
+                #     flush=True
+                # )
+
+                # return
 
             t_load0 = time.perf_counter()
 
@@ -156,7 +231,7 @@ def run_node_a(
             capture_ms = (t_capture1 - t_capture0) * 1000
             send_recv_ms = (t_send1 - t_send0) * 1000
             state_load_ms = (t_load1 - t_load0) * 1000
-            payload_mb = reply["bytes"] / 1024 / 1024
+            # payload_mb = reply["bytes"] / 1024 / 1024
 
             print(
                 f"[Node A] epoch={epoch} "

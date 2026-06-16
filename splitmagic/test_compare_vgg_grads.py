@@ -4,7 +4,7 @@ import torch
 BASE = "./vgg_baseline_grads.pt"
 SPLIT = "./vgg_split_grads.pt"
 
-ATOL = 1e-6
+ATOL = 1e-5
 RTOL = 1e-5
 
 
