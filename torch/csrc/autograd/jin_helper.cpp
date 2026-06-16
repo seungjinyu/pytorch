@@ -487,7 +487,24 @@ static void ensure_loaded_locked(JINState& st) {
 }
 
 static std::string resolve_alias_locked(JINState& st, const std::string& key) {
-  return key;
+  auto it = st.alias_map.find(key);
+
+  if (it == st.alias_map.end()) {
+    return key;
+  }
+
+  if (jin_log_level() >= 3) {
+    fprintf(
+        stderr,
+        "[JIN][ALIAS] %s -> %s\n",
+        key.c_str(),
+        it->second.c_str()
+    );
+    fflush(stderr);
+  }
+
+  return it->second;
+  // return key;
 }
 
 // Check whether they are local key and if they are we do not print out MISS
@@ -1253,21 +1270,30 @@ at::Tensor jin_relu_backward_from_mask(const at::Tensor& grad) {
 
   TORCH_CHECK(grad.defined(), "jin_relu_backward_from_mask: grad is undefined");
 
-  const int64_t i = st.relu_i++;
-  const std::string key = relu_mask_key(i);
-    if(jin_log_level()>= 4 ){
+  // const int64_t i = st.relu_i++;
+  // const std::string key = relu_mask_key(i);
+  JINExecItem item;
+  if (!jin_next_exec_item_locked(st, "relu", "result", &item)) {
+    return grad;
+  }
 
-  fprintf(
-      stderr,
-      "[JIN][RELU_BWD] idx=%lld grad_shape=%s grad_numel=%lld key=%s\n",
-      (long long)i,
-      sizes_str(grad).c_str(),
-      (long long)grad.numel(),
-      key.c_str()
-  );
+  const int64_t i = item.idx;
+  const std::string key =
+  std::string("graph:relu_mask:") + std::to_string(i) + ":result";
+  if(jin_log_level()>= 4 ){
 
-  fflush(stderr);
-}
+    fprintf(
+        stderr,
+        "[JIN][RELU_BWD] idx=%lld grad_shape=%s grad_numel=%lld key=%s\n",
+        (long long)i,
+        sizes_str(grad).c_str(),
+        (long long)grad.numel(),
+        key.c_str()
+    );
+
+    fflush(stderr);
+  }
+  
   auto it = st.kv_cpu.find(key);
   if (it == st.kv_cpu.end()) {
     // mask가 없으면 안전하게 통과 (순서 mismatch 디버그에 도움)

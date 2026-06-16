@@ -16,6 +16,18 @@ from .recompute import FXRecomputeEngine
 
 ALWAYS_LOCAL_KEYS = set()
 
+def relu_mask_key_for(relu_key):
+    # graph:relu:16:result -> graph:relu_mask:16:result
+    return relu_key.replace("graph:relu:", "graph:relu_mask:", 1)
+
+
+def has_relu_mask_for(key, payload):
+    if not (key.startswith("graph:relu:") and key.endswith(":result")):
+        return False
+
+    mask_key = relu_mask_key_for(key)
+    return mask_key in payload.tensors
+
 def is_always_local_key(key):
     if key.startswith("conv2d:") and key.endswith(":weight"):
         return True
@@ -209,8 +221,18 @@ class SplitRuntime:
                     save_tensor(pop_key("bn", "result2"), invstd)
 
                 elif isinstance(mod, nn.ReLU):
+                    # 
                     key = pop_key("relu", "result")
                     save_tensor(key, output)
+
+                    # ReLU for Mask
+                    # key = pop_key("relu", "result")
+
+                    # mask_key = key.replace("graph:relu:", "graph:relu_mask:")
+
+                    # mask = (output > 0).to(torch.uint8).detach().cpu().contiguous()
+                    # save_tensor(mask_key, mask)
+                    
 
                 elif isinstance(mod, nn.Linear):
                     key = pop_key("addmm", "mat1")
@@ -329,15 +351,27 @@ class SplitRuntime:
 
         required_keys = get_required_keys_from_plan(plan)
 
+        aliases = getattr(payload, "meta", {}).get("aliases", {})
+
         # missing_keys = get_missing_keys(
         #     required_keys=required_keys,
         #     payload=payload,
         #     payload_path=payload_path,
         # )
+
         missing_keys = sorted([
             k for k in required_keys
-            if (not is_always_local_key(k)) and (k not in payload.tensors)
+            if (not is_always_local_key(k))
+            and (k not in payload.tensors)
+            and (k not in aliases)
+            and (not has_relu_mask_for(k, payload))
         ])
+
+        print(
+            f"[B][ALIAS_AWARE] aliases={len(aliases)}",
+            flush=True,
+        )
+    
         
         print(
             f"[B][RECOMPUTE_CHECK] "
@@ -354,22 +388,24 @@ class SplitRuntime:
                 f"first={missing_keys[:10]}",
                 flush=True
             )
-            recomputed = self.recompute_missing_keys(
-                missing_keys=missing_keys,
-                payload=payload,
-                payload_path=payload_path,
-                device=x_dummy.device,
-            )
+            # recomputed = self.recompute_missing_keys(
+            #     missing_keys=missing_keys,
+            #     payload=payload,
+            #     payload_path=payload_path,
+            #     device=x_dummy.device,
+            # )
 
-            inject_recomputed_tensors(
-                payload=payload,
-                payload_path=payload_path,
-                recomputed=recomputed,
-            )
+            # inject_recomputed_tensors(
+            #     payload=payload,
+            #     payload_path=payload_path,
+            #     recomputed=recomputed,
+            # )
 
             missing_keys = sorted([
                 k for k in required_keys
-                if (not is_always_local_key(k)) and (k not in payload.tensors)
+                if (not is_always_local_key(k))    
+                and (k not in payload.tensors)
+                and (k not in aliases)
             ])
 
             print(
@@ -382,6 +418,7 @@ class SplitRuntime:
                 raise RuntimeError(
                     f"[B][RECOMPUTE_FAIL] still missing keys: {missing_keys[:20]}"
                 )                            
+            # missing_keys = []
         #
         loss.backward()
 

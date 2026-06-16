@@ -119,13 +119,25 @@ def write_execution_plan(plan, path = "/tmp/jin_execution_plan.tsv"):
     return plan_path
 
 
+def write_alias_tsv(aliases, path="/tmp/jin_payload_alias.tsv"):
+    with open(path, "w") as f:
+        for alias_key, canonical_key in aliases.items():
+            f.write(f"{alias_key}\t{canonical_key}\n")
+
+    print(
+        f"[Node B][ALIAS_WRITE] path={path} n={len(aliases)}",
+        flush=True,
+    )
+
+    return path
+
 def run_node_b(
     model,
     endpoint="tcp://*:5555",
     csv_path="node_b_timing.csv",
     lr=0.1,
-    template_batch_size=32,
-    log_level="4",
+    template_batch_size=16,
+    log_level="2",
 ):
     
     printed_payload_summary = False
@@ -181,6 +193,19 @@ def run_node_b(
 
         jin_payload = read_jin1_payload(req["payload_path"])
         req["payload"] = jin_payload
+
+        aliases = req.get("aliases", {})
+        alias_path = req["payload_path"] + ".alias"
+        write_alias_tsv(aliases,alias_path)
+
+        req["payload"].meta = getattr(req["payload"], "meta", {})
+        req["payload"].meta["aliases"] = aliases
+
+        print(
+            f"[Node B][ALIAS] n={len(aliases)} "
+            f"path={alias_path}",
+            flush=True,
+        )
 
         payload_keys = sorted(req["payload"].tensors.keys())
         print(

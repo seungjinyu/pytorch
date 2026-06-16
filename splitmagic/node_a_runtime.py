@@ -2,6 +2,7 @@ import time
 import torch
 import torch.nn.functional as F
 import os
+import hashlib
 
 from splitmagic import SplitRuntime, ZMQClient
 from splitmagic.utils.timing import CSVLogger
@@ -13,6 +14,92 @@ def clone_state_dict(model):
         k: v.detach().cpu().clone()
         for k, v in model.state_dict().items()
     }
+
+def tensor_fingerprint(t):
+    tc = t.detach().cpu().contiguous()
+    h = hashlib.sha256(tc.numpy().tobytes()).hexdigest()
+
+    return (
+        tuple(tc.shape),
+        str(tc.dtype),
+        h,
+    )
+
+def alias_conv_inputs(payload):
+    import hashlib
+
+    if not hasattr(payload, "aliases"):
+        payload.aliases = {}
+
+    # 기존 성공한 conv input 19개 + BN input 1개만 테스트
+    SAFE_ALIAS_KEYS = {
+        "graph:conv:18:input", "graph:conv:17:input", "graph:conv:16:input",
+        "graph:conv:15:input", "graph:conv:14:input", "graph:conv:13:input",
+        "graph:conv:12:input", "graph:conv:11:input", "graph:conv:10:input",
+        "graph:conv:9:input",  "graph:conv:8:input",  "graph:conv:7:input",
+        "graph:conv:6:input",  "graph:conv:5:input",  "graph:conv:4:input",
+        "graph:conv:3:input",  "graph:conv:2:input",  "graph:conv:1:input",
+        "graph:conv:0:input",
+
+        # 새로 테스트할 것
+        "graph:bn:19:input",
+    }
+
+    def tensor_fingerprint(t):
+        tc = t.detach().cpu().contiguous()
+        h = hashlib.sha256(tc.numpy().tobytes()).hexdigest()
+        return (
+            tuple(tc.shape),
+            str(tc.dtype),
+            h,
+        )
+
+    seen = {}
+
+    # alias 대상이 아닌 tensor들을 canonical 후보로 등록
+    for key, tensor in list(payload.tensors.items()):
+        if key in SAFE_ALIAS_KEYS:
+            continue
+        seen[tensor_fingerprint(tensor)] = key
+
+    removed = 0
+    saved_bytes = 0
+
+    for key, tensor in list(payload.tensors.items()):
+        if key not in SAFE_ALIAS_KEYS:
+            continue
+
+        fp = tensor_fingerprint(tensor)
+
+        if fp not in seen:
+            continue
+
+        canonical_key = seen[fp]
+
+        payload.aliases[key] = canonical_key
+        payload.tensors.pop(key)
+
+        nbytes = tensor.numel() * tensor.element_size()
+        saved_bytes += nbytes
+        removed += 1
+
+        kind = "BN_INPUT" if key.startswith("graph:bn:") else "CONV_INPUT"
+
+        print(
+            f"[ALIAS][{kind}] {key} -> {canonical_key} "
+            f"saved_mb={nbytes / 1024 / 1024:.3f}",
+            flush=True,
+        )
+
+    payload.meta["aliases"] = payload.aliases
+
+    print(
+        f"[ALIAS][SUMMARY] removed={removed} "
+        f"saved_mb={saved_bytes / 1024 / 1024:.3f}",
+        flush=True,
+    )
+
+    return payload
 
 
 def run_node_a(
@@ -117,53 +204,16 @@ def run_node_a(
                 y=y,
                 plan=plan,
             )
+
+            payload = alias_conv_inputs(payload)
             # drop_keys = {
-            #     "graph:relu:7:result",
-            #     "graph:relu:6:result",
-            #     "graph:relu:5:result",
-            #     "graph:relu:4:result",
-            #     "graph:relu:3:result",
-            #     "graph:relu:2:result",
-            #     "graph:relu:1:result",
-            #     "graph:conv:3:input",
-            #     "graph:conv:1:input",
-            #     "graph:conv:0:input",
-            #     "graph:bn:7:input",
-            #     "graph:bn:6:input",
-            #     "graph:bn:5:input",
-            #     "graph:bn:4:input",
-            #     "graph:bn:3:input",
-            #     "graph:bn:2:input",
-            #     "graph:bn:1:input",
-            #     # "graph:conv:7:input",
-            #     # "graph:maxpool2d:4:input",
-            #     # "graph:maxpool2d:4:indices",
-            # }
-            # drop_keys = {
-            #     "graph:addmm:0:mat1",
-            #     "graph:conv:18:input",
-            #     "graph:conv:17:input",
-            #     "graph:conv:16:input",
-            #     "graph:conv:15:input",
-            #     "graph:conv:14:input",
-            #     "graph:conv:13:input",
-            #     "graph:conv:12:input",
-            #     "graph:conv:11:input",
-            #     "graph:conv:10:input",
-            #     "graph:conv:9:input",
-            #     "graph:conv:8:input",
             #     "graph:bn:19:input",
-            #     "graph:bn:18:input",
-            #     "graph:bn:17:input",
-            #     "graph:bn:16:input",
-            #     "graph:bn:15:input",
-            #     "graph:bn:14:input",
-            #     "graph:bn:13:input",
-            #     "graph:bn:12:input",
             # }
 
             # for k in drop_keys:
             #     payload.tensors.pop(k, None)
+            
+
 
             policy_meta = payload.meta.get("tensor_policy", {})
 
@@ -172,6 +222,8 @@ def run_node_a(
             extra = {
                 "tensor_policy": policy_meta,
                 "dryrun_backward_plan": payload.meta.get("dryrun_backward_plan", []),
+                "aliases": payload.meta.get("aliases", {}),
+
             }
 
             if global_step == 0:
@@ -261,9 +313,11 @@ def run_node_a(
     test_loss, test_acc = evaluate(model, test_loader,device=device)
 
     if grad_save_path is not None:
+        print("The PATH was not set so saving int split_final.pt")
         torch.save(model.state_dict(), "split_final.pt")
     else:
-        torch.save(model.state_dict(), "split_final.pt")
+        print(f"The PATH for the gradient is {grad_save_path}")
+        torch.save(model.state_dict(), grad_save_path)
 
     print(
         f"[Eval] "
