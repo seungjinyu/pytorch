@@ -388,18 +388,19 @@ class SplitRuntime:
                 f"first={missing_keys[:10]}",
                 flush=True
             )
-            # recomputed = self.recompute_missing_keys(
-            #     missing_keys=missing_keys,
-            #     payload=payload,
-            #     payload_path=payload_path,
-            #     device=x_dummy.device,
-            # )
+            
+            recomputed = self.recompute_missing_keys(
+                missing_keys=missing_keys,
+                payload=payload,
+                payload_path=payload_path,
+                device=x_dummy.device,
+            )
 
-            # inject_recomputed_tensors(
-            #     payload=payload,
-            #     payload_path=payload_path,
-            #     recomputed=recomputed,
-            # )
+            inject_recomputed_tensors(
+                payload=payload,
+                payload_path=payload_path,
+                recomputed=recomputed,
+            )
 
             missing_keys = sorted([
                 k for k in required_keys

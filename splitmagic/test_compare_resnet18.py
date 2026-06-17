@@ -3,8 +3,8 @@ import torch
 
 BASE = "./resnet18_baseline_grads.pt"
 # SPLIT = "./resnet18_split_grads_1000.pt"
-# SPLIT ="/tmp/node_b_grads.pt"
-SPLIT = "./split_final.pt"
+SPLIT ="/tmp/node_b_grads.pt"
+# SPLIT = "./split_final.pt"
 
 ATOL = 1e-5
 RTOL = 1e-5

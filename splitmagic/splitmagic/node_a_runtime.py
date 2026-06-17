@@ -85,11 +85,11 @@ def alias_conv_inputs(payload):
 
         kind = "BN_INPUT" if key.startswith("graph:bn:") else "CONV_INPUT"
 
-        print(
-            f"[ALIAS][{kind}] {key} -> {canonical_key} "
-            f"saved_mb={nbytes / 1024 / 1024:.3f}",
-            flush=True,
-        )
+        # print(
+        #     f"[ALIAS][{kind}] {key} -> {canonical_key} "
+        #     f"saved_mb={nbytes / 1024 / 1024:.3f}",
+        #     flush=True,
+        # )
 
     payload.meta["aliases"] = payload.aliases
 
@@ -206,12 +206,41 @@ def run_node_a(
             )
 
             payload = alias_conv_inputs(payload)
-            # drop_keys = {
-            #     "graph:bn:19:input",
-            # }
 
-            # for k in drop_keys:
-            #     payload.tensors.pop(k, None)
+            drop_keys = {
+                "graph:bn:19:input",
+                "graph:bn:18:input",                
+                "graph:bn:17:input",
+                "graph:bn:16:input",
+                "graph:bn:15:input",
+                "graph:bn:14:input",
+                "graph:bn:13:input",
+                "graph:bn:12:input",
+                "graph:bn:11:input",
+                "graph:bn:10:input",
+                "graph:bn:9:input",
+                "graph:bn:8:input",
+                "graph:bn:7:input",
+                "graph:bn:6:input",
+                "graph:bn:5:input",
+                "graph:bn:4:input",
+                "graph:bn:3:input",
+                "graph:bn:2:input",
+                "graph:bn:1:input",
+                "graph:bn:0:input",
+                "graph:relu:15:result",
+                "graph:relu:13:result",
+                "graph:relu:11:result",
+                "graph:relu:9:result",
+                "graph:relu:7:result",
+                "graph:relu:5:result",
+                "graph:relu:3:result",
+                "graph:relu:1:result",
+                
+            }
+
+            for k in drop_keys:
+                payload.tensors.pop(k, None)
             
 
 
@@ -310,20 +339,21 @@ def run_node_a(
 
             global_step += 1
 
-    test_loss, test_acc = evaluate(model, test_loader,device=device)
+    # test_loss, test_acc = evaluate(model, test_loader,device=device)
 
-    if grad_save_path is not None:
-        print("The PATH was not set so saving int split_final.pt")
-        torch.save(model.state_dict(), "split_final.pt")
-    else:
-        print(f"The PATH for the gradient is {grad_save_path}")
-        torch.save(model.state_dict(), grad_save_path)
+    # temp skip
+    # if grad_save_path is not None:
+    #     print("The PATH was not set so saving int split_final.pt")
+    #     torch.save(model.state_dict(), "split_final.pt")
+    # else:
+    #     print(f"The PATH for the gradient is {grad_save_path}")
+    #     torch.save(model.state_dict(), grad_save_path)
 
-    print(
-        f"[Eval] "
-        f"test_loss={test_loss:.6f} "
-        f"test_acc={test_acc * 100:.2f}%"
-    )
+    # print(
+    #     f"[Eval] "
+    #     f"test_loss={test_loss:.6f} "
+    #     f"test_acc={test_acc * 100:.2f}%"
+    # )
 
     print("[Node A] done")
 

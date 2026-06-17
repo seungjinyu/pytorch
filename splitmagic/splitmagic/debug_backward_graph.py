@@ -1,6 +1,5 @@
 import torch
 
-
 def tensor_info(x):
     if torch.is_tensor(x):
         return {

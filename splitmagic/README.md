@@ -1,300 +1,132 @@
-# 현재 목표
 
-네 연구의 핵심:
+# SplitMagic Documentation
 
-```text
-Node A:
-forward only
+## Overview 
 
-Node B:
-backward only
-```
+SplitMagic is a framework that seperates forward and backward execution across two nodes while preserving PyTorch autograd semantics.
 
-그런데 backward는 원래 forward 때 저장된 tensor(saved tensor)가 필요함.
+Node A performs forward execution and captures tensors required for backward computation. 
 
-그래서:
+Node B reconstructs the backward pass using the captured tensors and executes gradient computation without access to the original input data.
 
-```text
-Node A가 saved tensor를 수집해서 보내고
-Node B가 그걸 사용해 backward 수행
-```
+## High-Level flow 
 
-이 구조를 만들고 있는 중.
+### Node A 
+|- forward 
+|- Capture Saved Tensors 
+|- Build Payload
+|- Send Payload
+    |
+    |
+    V
+### Node B 
+|- Load Payload 
+|- Overwrite Saved Tensors 
+|- Execute Backward 
+|- Compute Gradient 
 
----
+## Main Components 
 
-# 지금까지 만든 구조
+### Tensor Capture 
+- Collects tensors required by backward operators
 
-05.18.26
+### Payload Serialization
+- Serializes captured tensors
 
-## 프로젝트 구조
+### Dry-Run Plannings
+- Generates execution plans 
+
+### Runtime State
+- Loads payload tensors into C++ runtimes 
+
+### Tensor Overwrite
+- Replaces saved tensors during backward 
+
+### Execution Plan 
+- Provides a stable operator ordering mechanism independent of operator-local counters. 
+
+
+## Core Functions and Modules
+| Module / Function Group | Main Files | Role |
+|---|---|---|
+| Node A Runtime | `node_a_runtime.py`, `test_node_a_resnet.py` | Runs forward on Node A, captures tensors, builds payload, sends data to Node B. |
+| Node B Runtime | `node_b_runtime.py`, `test_node_b_resnet.py` | Receives payload, reconstructs backward, runs loss/backward, compares gradients. |
+| Shared Runtime | `runtime.py` | Common runtime logic used by both Node A and Node B. |
+| Payload Handling | `payload.py`, `data.py`, `comm.py` | Defines payload structure, tensor serialization, communication utilities. |
+| Dry-Run / Plan | `plan.py`, `op_indexer.py`, `dryrun_resnet18_saved_tensors.py` | Builds and manages execution plans used to match saved tensors with backward operators. |
+| Graph / FX Utilities | `graph.py`, `fx_trace.py`, `fx_recompute.py`, `debug_backward_graph.py` | Inspects model graphs and supports recomputation or graph-level debugging. |
+| Tensor Matching / Key Mapping | `keymap.py`, `matcher.py`, `resolver.py`, `inspector.py` | Maps captured tensors to execution-plan keys and resolves tensor/operator matching. |
+| Hooks | `hooks.py` | Registers hooks or capture logic around model execution. |
+| Recompute / Replay | `recompute.py`, `replay.py` | Provides recomputation or replay-based reconstruction utilities. |
+| Models | `models.py` | Defines model architectures used in experiments. |
+| Verification / Tests | `test_compare_resnet18.py`, `test_single_resnet.py`, `eval_resnet18_split_final.py` | Compares baseline gradients with SplitMagic gradients and evaluates correctness. |
+| Logs / Artifacts | `log/`, `*.csv`, `*.pt`, `resnet_a.txt`, `resnet_b.txt` | Stores experiment outputs, gradients, model states, and debugging logs. |
+
+## Repository Structure
 
 ```text
 splitmagic/
-├── splitmagic/
-│   ├── __init__.py
-│   ├── runtime.py
-│   ├── inspector.py
-│   ├── hooks.py
-│   └── payload.py
+├── node_a_runtime.py              # Node A forward/capture runtime
+├── node_b_runtime.py              # Node B backward/reconstruction runtime
+├── runtime.py                     # Shared SplitMagic runtime logic
+├── payload.py                     # Payload data structure and serialization
+├── comm.py                        # Communication utilities
+├── data.py                        # Dataset/data loading utilities
+├── plan.py                        # Execution plan utilities
+├── op_indexer.py                  # Operator indexing / ordering utilities
+├── hooks.py                       # Hook registration and tensor capture helpers
+├── keymap.py                      # Tensor key mapping utilities
+├── matcher.py                     # Tensor/operator matching utilities
+├── resolver.py                    # Resolves keys, tensors, or plan entries
+├── inspector.py                   # Debugging and inspection utilities
+├── graph.py                       # Graph inspection utilities
+├── fx_trace.py                    # FX tracing utilities
+├── fx_recompute.py                # FX-based recomputation utilities
+├── recompute.py                   # Recompute utilities
+├── replay.py                      # Replay utilities
+├── models.py                      # Model definitions
+├── data/                          # Dataset directory
+├── log/                           # Runtime logs
+├── test_codes/                    # Additional test scripts
+├── utils/                         # Utility functions
+├── Doc/                           # Documentation directory
+└── README.md
+
+SplitMagic
+
+├── Runtime Layer
+│   ├── node_a_runtime.py
+│   ├── node_b_runtime.py
+│   └── runtime.py
 │
-├── test_import.py
-├── test_inspector.py
-└── test_payload.py
-```
-
----
-
-# 각 파일 역할
-
-## 1. runtime.py
-
-아직 껍데기 단계.
-
-```python
-SplitRuntime(model, role="A")
-SplitRuntime(model, role="B")
-```
-
-이런 형태의 framework API 시작점.
-
-즉:
-
-```text
-사용자는 splitmagic만 import
-```
-
-하게 만들기 위한 입구.
-
----
-
-## 2. hooks.py
-
-PyTorch module hook 관리.
-
-역할:
-
-```text
-Conv2d
-ReLU
-MaxPool
-Linear
-...
-```
-
-같은 layer들의:
-
-```text
-input shape
-output shape
-module 이름
-```
-
-을 기록.
-
-예:
-
-```text
-conv1 (Conv2d):
-(4,3,32,32)
-→
-(4,8,32,32)
-```
-
----
-
-## 3. inspector.py
-
-핵심.
-
-여기서 사용한 기능:
-
-```python
-torch.autograd.graph.saved_tensors_hooks
-```
-
-이걸 통해:
-
-```text
-PyTorch가 backward를 위해 실제 저장한 tensor
-```
-
-를 자동 추적.
-
-즉:
-
-```text
-Conv backward가 뭘 저장하는지
-BN backward가 뭘 저장하는지
-MaxPool이 indices를 저장하는지
-```
-
-를 직접 보기 시작함.
-
----
-
-# 지금 가능한 것
-
-현재는:
-
-```python
-report = inspect_saved_tensors(...)
-```
-
-하면:
-
-## A. Saved tensor 목록
-
-```text
-[0] shape=(...)
-[1] shape=(...)
-...
-```
-
-## B. Module trace
-
-```text
-conv1
-relu
-pool
-fc
-...
-```
-
-를 얻을 수 있음.
-
-즉:
-
-```text
-이 모델에서 backward를 위해 어떤 tensor가 필요한지
-```
-
-를 자동 조사 가능해짐.
-
----
-
-# 4. payload.py
-
-Node A가 전송할 데이터 구조.
-
-현재 기능:
-
-```python
-payload.add_tensor(...)
-payload.save(...)
-payload.load(...)
-```
-
-즉:
-
-```text
-saved tensor들을 파일 형태로 저장 가능
-```
-
----
-
-# 현재 전체 흐름
-
-지금 구현된 흐름은:
-
-```text
-model forward
-↓
-saved_tensors_hooks가
-PyTorch 내부 saved tensor 감지
-↓
-inspector가 기록
-↓
-payload로 저장
-↓
-payload.pt 생성
-```
-
----
-
-# 아직 안 한 것
-
-아직 중요한 것들은 남아 있음.
-
-## 아직 없음
-
-```text
-❌ Node B replay
-❌ saved tensor overwrite
-❌ autograd graph 재구성
-❌ ZeroMQ 전송
-❌ gradient matching
-```
-
----
-
-# 지금 단계의 의미
-
-사실 지금 단계가 매우 중요함.
-
-왜냐면 네 연구의 첫 번째 난제가:
-
-```text
-"대체 어떤 tensor를 보내야 하는가?"
-```
-
-였는데,
-
-이제는:
-
-```text
-PyTorch가 실제 저장하는 tensor를 자동으로 조사 가능
-```
-
-한 상태가 됐기 때문.
-
-즉:
-
-```text
-payload schema 자동 추출의 시작점
-```
-
-까지 온 거야.
-
----
-
-# 다음 단계 후보
-
-다음부터는 갈림길이 있음.
-
-## 방향 1
-
-saved tensor와 module trace 연결
-
-```text
-saved_tensor:0
-→ conv1.input
-
-saved_tensor:1
-→ conv1.weight
-```
-
-같은 semantic naming.
-
----
-
-## 방향 2
-
-payload를 실제 replay 가능한 형태로 구성.
-
----
-
-## 방향 3
-
-Node B dummy forward 실험 시작.
-
----
-
-지금은 사실:
-
-```text
-PyTorch가 backward를 위해 뭘 저장하는지
-관찰 가능한 framework
-```
-
-까지 만든 상태라고 보면 돼.
+├── Capture Layer
+│   └── hooks.py
+│
+├── Payload Layer
+│   ├── payload.py
+│   └── data.py
+│
+├── Planning Layer
+│   ├── plan.py
+│   └── op_indexer.py
+│
+├── Matching Layer
+│   ├── keymap.py
+│   ├── matcher.py
+│   ├── resolver.py
+│   └── inspector.py
+│
+├── Graph Analysis Layer
+│   ├── graph.py
+│   ├── fx_trace.py
+│   └── debug_backward_graph.py
+│
+├── Recomputation Layer
+│   ├── recompute.py
+│   ├── fx_recompute.py
+│   └── replay.py
+│
+└── Verification Layer
+    ├── test_compare_resnet18.py
+    ├── test_single_resnet.py
+    └── eval_resnet18_split_final.py
