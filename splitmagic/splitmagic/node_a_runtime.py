@@ -6,7 +6,6 @@ import hashlib
 
 from splitmagic import SplitRuntime, ZMQClient
 from splitmagic.utils.timing import CSVLogger
-from splitmagic.runtime import read_dryrun_plan
 
 
 def clone_state_dict(model):
@@ -275,9 +274,9 @@ def run_node_a(
 
             payload_mb = reply["bytes"] / 1024 / 1024
 
-            # if grad_save_path is not None and "grads" in reply:
-            #     torch.save(reply["grads"], grad_save_path)
-            #     print(f"[Node A] saved grads to {grad_save_path}")
+            if grad_save_path is not None and "grads" in reply:
+                torch.save(reply["grads"], grad_save_path)
+                print(f"[Node A] saved grads to {grad_save_path}")
 
                 # print(
                 #     f"[Node A] epoch={epoch} "

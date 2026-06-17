@@ -1,7 +1,6 @@
 import torch
 import os 
 
-from .replay import ReplayEngine
 from .payload import  payload_from_jin_items
 from .resolver import read_jin1_payload, SavedTensorResolver
 
@@ -140,11 +139,6 @@ class SplitRuntime:
 
         if self.role not in ("A","B"):
             raise ValueError("Role must be either 'A' or 'B'")
-        
-        if self.role == "B":
-            self.replay_engine = ReplayEngine(model)
-        else:
-            self.replay_engine = None
 
     def capture_jin_forward_plan(self, x, y, plan):
         if self.role != "A":

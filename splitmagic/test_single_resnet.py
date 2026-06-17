@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from splitmagic.models import make_resnet18_cifar10
-from splitmagic.data import make_cifar10_loaders
+from splitmagic.splitmagic.data import make_cifar10_loaders
 
 
 SEED = 1234
