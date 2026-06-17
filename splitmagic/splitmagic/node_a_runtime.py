@@ -23,72 +23,36 @@ def tensor_fingerprint(t):
         str(tc.dtype),
         h,
     )
+def alias_duplicate_tensors(payload):
+    """
+    Generic tensor aliasing.
 
-def alias_conv_inputs(payload):
-    import hashlib
+    If two payload tensors have exactly the same shape, dtype, and value,
+    keep only one canonical tensor and replace the duplicate with an alias.
 
+    This is model-agnostic and does not depend on ResNet/VGG row IDs.
+    """
     if not hasattr(payload, "aliases"):
         payload.aliases = {}
 
-    # 기존 성공한 conv input 19개 + BN input 1개만 테스트
-    SAFE_ALIAS_KEYS = {
-        "graph:conv:18:input", "graph:conv:17:input", "graph:conv:16:input",
-        "graph:conv:15:input", "graph:conv:14:input", "graph:conv:13:input",
-        "graph:conv:12:input", "graph:conv:11:input", "graph:conv:10:input",
-        "graph:conv:9:input",  "graph:conv:8:input",  "graph:conv:7:input",
-        "graph:conv:6:input",  "graph:conv:5:input",  "graph:conv:4:input",
-        "graph:conv:3:input",  "graph:conv:2:input",  "graph:conv:1:input",
-        "graph:conv:0:input",
-
-        # 새로 테스트할 것
-        "graph:bn:19:input",
-    }
-
-    def tensor_fingerprint(t):
-        tc = t.detach().cpu().contiguous()
-        h = hashlib.sha256(tc.numpy().tobytes()).hexdigest()
-        return (
-            tuple(tc.shape),
-            str(tc.dtype),
-            h,
-        )
-
     seen = {}
-
-    # alias 대상이 아닌 tensor들을 canonical 후보로 등록
-    for key, tensor in list(payload.tensors.items()):
-        if key in SAFE_ALIAS_KEYS:
-            continue
-        seen[tensor_fingerprint(tensor)] = key
-
     removed = 0
     saved_bytes = 0
 
     for key, tensor in list(payload.tensors.items()):
-        if key not in SAFE_ALIAS_KEYS:
-            continue
-
         fp = tensor_fingerprint(tensor)
 
-        if fp not in seen:
-            continue
+        if fp in seen:
+            canonical_key = seen[fp]
 
-        canonical_key = seen[fp]
+            payload.aliases[key] = canonical_key
+            payload.tensors.pop(key)
 
-        payload.aliases[key] = canonical_key
-        payload.tensors.pop(key)
-
-        nbytes = tensor.numel() * tensor.element_size()
-        saved_bytes += nbytes
-        removed += 1
-
-        kind = "BN_INPUT" if key.startswith("graph:bn:") else "CONV_INPUT"
-
-        # print(
-        #     f"[ALIAS][{kind}] {key} -> {canonical_key} "
-        #     f"saved_mb={nbytes / 1024 / 1024:.3f}",
-        #     flush=True,
-        # )
+            nbytes = tensor.numel() * tensor.element_size()
+            saved_bytes += nbytes
+            removed += 1
+        else:
+            seen[fp] = key
 
     payload.meta["aliases"] = payload.aliases
 
@@ -100,6 +64,38 @@ def alias_conv_inputs(payload):
 
     return payload
 
+def drop_payload_keys(payload, drop_keys=None):
+    """
+    Drop selected payload tensors by key.
+
+    This is intentionally config-driven.
+    The runtime should not hard-code model-specific keys such as
+    ResNet18 BN/ReLU row IDs.
+    """
+    if not drop_keys:
+        payload.meta["dropped_keys"] = []
+        return payload
+    
+    drop_keys = set(drop_keys)
+    removed = 0
+    saved_bytes = 0
+
+    for key in drop_keys:
+        tensor = payload.tensors.pop(key, None)
+
+        if tensor is not None:
+            removed += 1
+            saved_bytes += tensor.numel() * tensor.element_size()
+
+    payload.meta["dropped_keys"] = sorted(drop_keys)
+
+    print(
+        f"[DROP][SUMMARY] removed={removed} "
+        f"saved_mb={saved_bytes / 1024 / 1024:.3f}",
+        flush=True,
+    )
+
+    return payload
 
 def run_node_a(
     model,
@@ -115,6 +111,8 @@ def run_node_a(
     key_mode="module_debug",
     dryrun_plan=False,
     template_plan_path="/tmp/jin_template_plan_a.tsv",
+    drop_keys=None,
+    enable_alias=True,
 ):
     os.environ["JIN_ROLE"] = "A"
     os.environ.pop("JIN_DRYRUN", None)
@@ -203,44 +201,10 @@ def run_node_a(
                 y=y,
                 plan=plan,
             )
-
-            payload = alias_conv_inputs(payload)
-
-            drop_keys = {
-                "graph:bn:19:input",
-                "graph:bn:18:input",                
-                "graph:bn:17:input",
-                "graph:bn:16:input",
-                "graph:bn:15:input",
-                "graph:bn:14:input",
-                "graph:bn:13:input",
-                "graph:bn:12:input",
-                "graph:bn:11:input",
-                "graph:bn:10:input",
-                "graph:bn:9:input",
-                "graph:bn:8:input",
-                "graph:bn:7:input",
-                "graph:bn:6:input",
-                "graph:bn:5:input",
-                "graph:bn:4:input",
-                "graph:bn:3:input",
-                "graph:bn:2:input",
-                "graph:bn:1:input",
-                "graph:bn:0:input",
-                "graph:relu:15:result",
-                "graph:relu:13:result",
-                "graph:relu:11:result",
-                "graph:relu:9:result",
-                "graph:relu:7:result",
-                "graph:relu:5:result",
-                "graph:relu:3:result",
-                "graph:relu:1:result",
-                
-            }
-
-            for k in drop_keys:
-                payload.tensors.pop(k, None)
+            payload = drop_payload_keys(payload, drop_keys)
             
+            if enable_alias:
+                payload = alias_duplicate_tensors(payload)
 
 
             policy_meta = payload.meta.get("tensor_policy", {})

@@ -3,4 +3,4 @@
 __pycache__/
 data
 *.txt
-test_codes/
+tests/
