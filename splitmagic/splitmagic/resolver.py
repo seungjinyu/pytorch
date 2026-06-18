@@ -234,10 +234,3 @@ def read_jin1_payload(path):
             payload.add_tensor(key, tensor)
 
     return payload
-
-def append_tensors_to_jin1(path, tensor_dict):
-    import torch
-
-    from splitmagic.payload import Payload
-
-    payload = Payload()

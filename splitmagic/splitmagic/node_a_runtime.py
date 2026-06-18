@@ -7,6 +7,26 @@ import hashlib
 from splitmagic import SplitRuntime, ZMQClient
 from splitmagic.utils.timing import CSVLogger
 
+VALID_RECOMPUTE_KEYS = {
+    # BN input 20개
+    "graph:bn:19:input", "graph:bn:18:input", "graph:bn:17:input",
+    "graph:bn:16:input", "graph:bn:15:input", "graph:bn:14:input",
+    "graph:bn:13:input", "graph:bn:12:input", "graph:bn:11:input",
+    "graph:bn:10:input", "graph:bn:9:input",  "graph:bn:8:input",
+    "graph:bn:7:input",  "graph:bn:6:input",  "graph:bn:5:input",
+    "graph:bn:4:input",  "graph:bn:3:input",  "graph:bn:2:input",
+    "graph:bn:1:input",  "graph:bn:0:input",
+
+    # ReLU 일부
+    "graph:relu:15:result",
+    "graph:relu:13:result",
+    "graph:relu:11:result",
+    "graph:relu:9:result",
+    "graph:relu:7:result",
+    "graph:relu:5:result",
+    "graph:relu:3:result",
+    "graph:relu:1:result",
+}
 
 def clone_state_dict(model):
     return {
@@ -63,6 +83,82 @@ def alias_duplicate_tensors(payload):
     )
 
     return payload
+    
+def auto_drop_for_recompute_probe(payload, drop_keys=None):
+    if drop_keys is None:
+        drop_keys = set()
+
+    dropped = []
+    dropped_bytes = 0
+
+    for key in sorted(drop_keys):
+        tensor = payload.tensors.pop(key, None)
+
+        if tensor is None:
+            print(f"[DROP_PROBE_SKIP] missing key={key}", flush=True)
+            continue
+
+        nbytes = tensor.numel() * tensor.element_size()
+        dropped.append(key)
+        dropped_bytes += nbytes
+
+        print(
+            f"[DROP_PROBE] key={key} "
+            f"saved_mb={nbytes / 1024 / 1024:.3f}",
+            flush=True,
+        )
+
+    payload.meta["drop_probe_keys"] = dropped
+
+    print(
+        f"[DROP_PROBE_SUMMARY] dropped={len(dropped)} "
+        f"saved_mb={dropped_bytes / 1024 / 1024:.3f}",
+        flush=True,
+    )
+
+    return payload
+
+def auto_drop_by_ratio(payload, candidate_keys, drop_ratio=0.5):
+    rows = []
+
+    for key in candidate_keys:
+        t = payload.tensors.get(key)
+        if t is None:
+            continue
+
+        nbytes = t.numel() * t.element_size()
+        rows.append((nbytes, key))
+
+    total_bytes = sum(
+        t.numel() * t.element_size()
+        for t in payload.tensors.values()
+    )
+
+    target = int(total_bytes * drop_ratio)
+
+    rows.sort(reverse=True)
+
+    dropped = []
+    saved = 0
+
+    for nbytes, key in rows:
+        if saved >= target:
+            break
+
+        payload.tensors.pop(key, None)
+        dropped.append(key)
+        saved += nbytes
+
+    payload.meta["auto_dropped_keys"] = dropped
+
+    print(
+        f"[AUTO_DROP] ratio={drop_ratio} "
+        f"dropped={len(dropped)} "
+        f"saved_mb={saved / 1024 / 1024:.3f}",
+        flush=True,
+    )
+
+    return payload
 
 def drop_payload_keys(payload, drop_keys=None):
     """
@@ -111,7 +207,7 @@ def run_node_a(
     key_mode="module_debug",
     dryrun_plan=False,
     template_plan_path="/tmp/jin_template_plan_a.tsv",
-    drop_keys=None,
+    auto_drop_ratio=0.5,
     enable_alias=True,
 ):
     os.environ["JIN_ROLE"] = "A"
@@ -201,11 +297,15 @@ def run_node_a(
                 y=y,
                 plan=plan,
             )
-            payload = drop_payload_keys(payload, drop_keys)
-            
+
             if enable_alias:
                 payload = alias_duplicate_tensors(payload)
 
+            payload = auto_drop_by_ratio(
+                payload,
+                candidate_keys=VALID_RECOMPUTE_KEYS,
+                drop_ratio=auto_drop_ratio,
+            )
 
             policy_meta = payload.meta.get("tensor_policy", {})
 
@@ -242,21 +342,6 @@ def run_node_a(
                 torch.save(reply["grads"], grad_save_path)
                 print(f"[Node A] saved grads to {grad_save_path}")
 
-                # print(
-                #     f"[Node A] epoch={epoch} "
-                #     f"step={global_step} "
-                #     f"loss={reply['loss']:.6f} "
-                #     f"payload_mb={payload_mb:.3f} "
-                #     # f"capture_ms={capture_ms:.2f} "
-                #     # f"send_recv_ms={send_recv_ms:.2f} "
-                #     # f"state_load_ms={state_load_ms:.2f} "
-                #     # f"total_ms={total_ms:.2f}",
-                #     ,
-                #     flush=True
-                # )
-
-                # return
-
             t_load0 = time.perf_counter()
 
             if global_step == 0 and "grads" in reply:
@@ -282,10 +367,6 @@ def run_node_a(
                 f"step={global_step} "
                 f"loss={reply['loss']:.6f} "
                 f"payload_mb={payload_mb:.3f} "
-                # f"capture_ms={capture_ms:.2f} "
-                # f"send_recv_ms={send_recv_ms:.2f} "
-                # f"state_load_ms={state_load_ms:.2f} "
-                # f"total_ms={total_ms:.2f}",
                 ,
                 flush=True
             )

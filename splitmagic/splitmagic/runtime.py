@@ -32,7 +32,6 @@ def is_always_local_key(key):
         return True
     if key.startswith("addmm:") and key.endswith(":mat2"):
         return True
-
     if key.startswith("graph:conv:") and key.endswith(":weight"):
         return True
     if key.startswith("graph:addmm:") and key.endswith(":mat2"):

@@ -7,8 +7,6 @@ def dump_autograd_graph(loss, max_depth=20, show_saved=True):
 
         if fn is None:
             return 
-        
-        indent = " " * depth
 
         if id(fn) in seen:
             print("  " * depth + f"{fn.__class__.__name__}")

@@ -1,5 +1,3 @@
-import torch
-
 
 class FXRecomputeEngine:
     def __init__(self, model):

@@ -6,6 +6,7 @@ import torch
 from .payload import Payload
 
 
+# Client Class for node A 
 class ZMQClient:
     def __init__(self, address):
         self.ctx = zmq.Context()
@@ -59,7 +60,7 @@ class ZMQClient:
 
         return reply["template_plan"]
 
-
+# Server Class for node B 
 class ZMQServer:
     def __init__(self, bind_address):
         self.ctx = zmq.Context()
@@ -79,7 +80,7 @@ class ZMQServer:
 
         payload_bytes = msg["payload"]
 
-        # network로 받은 bytes를 C++ JIN이 읽을 파일로 저장
+        # Saves the payload from the node A to use it when the server overwrites the value.
         with open(payload_path, "wb") as f:
             f.write(payload_bytes)
 
@@ -109,5 +110,6 @@ class ZMQServer:
                 req[k] = v
 
         return req
+    
     def send_reply(self, reply):
         self.sock.send_pyobj(reply)

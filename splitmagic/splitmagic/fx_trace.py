@@ -10,8 +10,7 @@ SUPPORTED_RECOMPUTE_TYPES = {
     "Linear",
     "flatten",
     "view",
-    "reshape",
-    
+    "reshape",   
 }
 
 def build_fx_node_list(model):
@@ -244,13 +243,6 @@ def build_jin_key_to_fx_node(model):
     for i, n in enumerate(bn_nodes):
         if n["args"]:
             mapping[f"graph:bn:{i}:input"] = n["args"][0]
-
-        # mapping[f"graph:bn:{i}:result1"] = n["target"]
-        # mapping[f"graph:bn:{i}:result2"] = n["target"]
-
-        # mapping[f"graph:bn:{i}:running_mean"] = n["target"]
-        # mapping[f"graph:bn:{i}:running_var"] = n["target"]
-        # mapping[f"graph:bn:{i}:weight"] = n["target"]
 
     return mapping
 
