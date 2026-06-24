@@ -142,12 +142,15 @@ def run_node_b(
     
     printed_payload_summary = False
 
+    # We are assuming the node B has a better computation power
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
     os.environ["JIN_ROLE"] = "B"
     os.environ["JIN_LOG_LEVEL"] = log_level
 
+
+    # Build template plan 
     template_plan = build_template_plan_on_b(
         model=model,
         batch_size=template_batch_size,

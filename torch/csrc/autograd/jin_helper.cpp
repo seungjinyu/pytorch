@@ -1388,157 +1388,157 @@ bool jin_is_role_B() {
 
 // maxpool temp functions
 
-std::vector<uint8_t> jin_pack_maxpool2x2_flat_indices_to_2bit(
-    const at::Tensor& flat_indices,
-    int64_t input_h,
-    int64_t input_w) {
-  TORCH_CHECK(flat_indices.scalar_type() == at::kLong, "flat_indices must be int64");
-  TORCH_CHECK(flat_indices.dim() == 4, "flat_indices must be [N,C,Hout,Wout]");
-  TORCH_CHECK(input_h > 0 && input_w > 0, "invalid input_h/input_w");
+// std::vector<uint8_t> jin_pack_maxpool2x2_flat_indices_to_2bit(
+//     const at::Tensor& flat_indices,
+//     int64_t input_h,
+//     int64_t input_w) {
+//   TORCH_CHECK(flat_indices.scalar_type() == at::kLong, "flat_indices must be int64");
+//   TORCH_CHECK(flat_indices.dim() == 4, "flat_indices must be [N,C,Hout,Wout]");
+//   TORCH_CHECK(input_h > 0 && input_w > 0, "invalid input_h/input_w");
 
-  auto idx = flat_indices.contiguous().to(at::kCPU);
+//   auto idx = flat_indices.contiguous().to(at::kCPU);
 
-  const int64_t N = idx.size(0);
-  const int64_t C = idx.size(1);
-  const int64_t Hout = idx.size(2);
-  const int64_t Wout = idx.size(3);
+//   const int64_t N = idx.size(0);
+//   const int64_t C = idx.size(1);
+//   const int64_t Hout = idx.size(2);
+//   const int64_t Wout = idx.size(3);
 
-  const int64_t numel = idx.numel();
-  const int64_t packed_size = (numel + 3) / 4;
+//   const int64_t numel = idx.numel();
+//   const int64_t packed_size = (numel + 3) / 4;
 
-  std::vector<uint8_t> packed((size_t)packed_size, 0);
-  const int64_t* p = idx.data_ptr<int64_t>();
+//   std::vector<uint8_t> packed((size_t)packed_size, 0);
+//   const int64_t* p = idx.data_ptr<int64_t>();
 
-  for (int64_t n = 0; n < N; ++n) {
-    for (int64_t c = 0; c < C; ++c) {
-      for (int64_t oh = 0; oh < Hout; ++oh) {
-        for (int64_t ow = 0; ow < Wout; ++ow) {
-          const int64_t linear_idx = ((n * C + c) * Hout + oh) * Wout + ow;
-          const int64_t flat = p[linear_idx];
+//   for (int64_t n = 0; n < N; ++n) {
+//     for (int64_t c = 0; c < C; ++c) {
+//       for (int64_t oh = 0; oh < Hout; ++oh) {
+//         for (int64_t ow = 0; ow < Wout; ++ow) {
+//           const int64_t linear_idx = ((n * C + c) * Hout + oh) * Wout + ow;
+//           const int64_t flat = p[linear_idx];
 
-          TORCH_CHECK(
-              flat >= 0 && flat < input_h * input_w,
-              "flat index out of range: flat=", flat,
-              " input_h=", input_h,
-              " input_w=", input_w);
+//           TORCH_CHECK(
+//               flat >= 0 && flat < input_h * input_w,
+//               "flat index out of range: flat=", flat,
+//               " input_h=", input_h,
+//               " input_w=", input_w);
 
-          const int64_t ih = flat / input_w;
-          const int64_t iw = flat % input_w;
+//           const int64_t ih = flat / input_w;
+//           const int64_t iw = flat % input_w;
 
-          const int64_t h0 = oh * 2;
-          const int64_t w0 = ow * 2;
+//           const int64_t h0 = oh * 2;
+//           const int64_t w0 = ow * 2;
 
-          const int64_t local_h = ih - h0;
-          const int64_t local_w = iw - w0;
+//           const int64_t local_h = ih - h0;
+//           const int64_t local_w = iw - w0;
 
-          TORCH_CHECK(
-              local_h >= 0 && local_h < 2 && local_w >= 0 && local_w < 2,
-              "flat index does not belong to its 2x2 window: "
-              "flat=", flat,
-              " -> (ih,iw)=(", ih, ",", iw, ")",
-              " but window start (h0,w0)=(", h0, ",", w0, ")");
+//           TORCH_CHECK(
+//               local_h >= 0 && local_h < 2 && local_w >= 0 && local_w < 2,
+//               "flat index does not belong to its 2x2 window: "
+//               "flat=", flat,
+//               " -> (ih,iw)=(", ih, ",", iw, ")",
+//               " but window start (h0,w0)=(", h0, ",", w0, ")");
 
-          const int64_t local = local_h * 2 + local_w; // 0..3
-          const int64_t byte_index = linear_idx >> 2;
-          const int64_t shift = (linear_idx & 3) << 1;
+//           const int64_t local = local_h * 2 + local_w; // 0..3
+//           const int64_t byte_index = linear_idx >> 2;
+//           const int64_t shift = (linear_idx & 3) << 1;
 
-          packed[(size_t)byte_index] |= (uint8_t)(local << shift);
-        }
-      }
-    }
-  }
+//           packed[(size_t)byte_index] |= (uint8_t)(local << shift);
+//         }
+//       }
+//     }
+//   }
 
-  return packed;
-}
+//   return packed;
+// }
 
-at::Tensor jin_unpack_maxpool2x2_2bit_to_flat_indices(
-    const std::vector<uint8_t>& packed,
-    int64_t N,
-    int64_t C,
-    int64_t Hout,
-    int64_t Wout,
-    int64_t input_h,
-    int64_t input_w,
-    c10::Device device) {
-  TORCH_CHECK(N > 0 && C > 0 && Hout > 0 && Wout > 0, "invalid output shape");
-  TORCH_CHECK(input_h > 0 && input_w > 0, "invalid input_h/input_w");
+// at::Tensor jin_unpack_maxpool2x2_2bit_to_flat_indices(
+//     const std::vector<uint8_t>& packed,
+//     int64_t N,
+//     int64_t C,
+//     int64_t Hout,
+//     int64_t Wout,
+//     int64_t input_h,
+//     int64_t input_w,
+//     c10::Device device) {
+//   TORCH_CHECK(N > 0 && C > 0 && Hout > 0 && Wout > 0, "invalid output shape");
+//   TORCH_CHECK(input_h > 0 && input_w > 0, "invalid input_h/input_w");
 
-  const int64_t numel = N * C * Hout * Wout;
-  const int64_t need_bytes = (numel + 3) / 4;
+//   const int64_t numel = N * C * Hout * Wout;
+//   const int64_t need_bytes = (numel + 3) / 4;
 
-  TORCH_CHECK(
-      (int64_t)packed.size() == need_bytes,
-      "packed size mismatch: got=", (int64_t)packed.size(),
-      " expected=", need_bytes);
+//   TORCH_CHECK(
+//       (int64_t)packed.size() == need_bytes,
+//       "packed size mismatch: got=", (int64_t)packed.size(),
+//       " expected=", need_bytes);
 
-  auto out = at::empty(
-      {N, C, Hout, Wout},
-      at::TensorOptions().dtype(at::kLong).device(at::kCPU));
+//   auto out = at::empty(
+//       {N, C, Hout, Wout},
+//       at::TensorOptions().dtype(at::kLong).device(at::kCPU));
 
-  int64_t* out_ptr = out.data_ptr<int64_t>();
+//   int64_t* out_ptr = out.data_ptr<int64_t>();
 
-  for (int64_t n = 0; n < N; ++n) {
-    for (int64_t c = 0; c < C; ++c) {
-      for (int64_t oh = 0; oh < Hout; ++oh) {
-        for (int64_t ow = 0; ow < Wout; ++ow) {
-          const int64_t linear_idx = ((n * C + c) * Hout + oh) * Wout + ow;
-          const int64_t byte_index = linear_idx >> 2;
-          const int64_t shift = (linear_idx & 3) << 1;
-          const uint8_t local =
-              (uint8_t)((packed[(size_t)byte_index] >> shift) & 0x3);
+//   for (int64_t n = 0; n < N; ++n) {
+//     for (int64_t c = 0; c < C; ++c) {
+//       for (int64_t oh = 0; oh < Hout; ++oh) {
+//         for (int64_t ow = 0; ow < Wout; ++ow) {
+//           const int64_t linear_idx = ((n * C + c) * Hout + oh) * Wout + ow;
+//           const int64_t byte_index = linear_idx >> 2;
+//           const int64_t shift = (linear_idx & 3) << 1;
+//           const uint8_t local =
+//               (uint8_t)((packed[(size_t)byte_index] >> shift) & 0x3);
 
-          int64_t local_h = 0;
-          int64_t local_w = 0;
-          switch (local) {
-            case 0: local_h = 0; local_w = 0; break;
-            case 1: local_h = 0; local_w = 1; break;
-            case 2: local_h = 1; local_w = 0; break;
-            case 3: local_h = 1; local_w = 1; break;
-            default:
-              TORCH_CHECK(false, "invalid local code: ", (int)local);
-          }
+//           int64_t local_h = 0;
+//           int64_t local_w = 0;
+//           switch (local) {
+//             case 0: local_h = 0; local_w = 0; break;
+//             case 1: local_h = 0; local_w = 1; break;
+//             case 2: local_h = 1; local_w = 0; break;
+//             case 3: local_h = 1; local_w = 1; break;
+//             default:
+//               TORCH_CHECK(false, "invalid local code: ", (int)local);
+//           }
 
-          const int64_t h0 = oh * 2;
-          const int64_t w0 = ow * 2;
-          const int64_t ih = h0 + local_h;
-          const int64_t iw = w0 + local_w;
+//           const int64_t h0 = oh * 2;
+//           const int64_t w0 = ow * 2;
+//           const int64_t ih = h0 + local_h;
+//           const int64_t iw = w0 + local_w;
 
-          TORCH_CHECK(
-              ih >= 0 && ih < input_h && iw >= 0 && iw < input_w,
-              "reconstructed (ih,iw) out of range: (", ih, ",", iw,
-              ") input_h=", input_h,
-              " input_w=", input_w);
+//           TORCH_CHECK(
+//               ih >= 0 && ih < input_h && iw >= 0 && iw < input_w,
+//               "reconstructed (ih,iw) out of range: (", ih, ",", iw,
+//               ") input_h=", input_h,
+//               " input_w=", input_w);
 
-          out_ptr[linear_idx] = ih * input_w + iw;
-        }
-      }
-    }
-  }
+//           out_ptr[linear_idx] = ih * input_w + iw;
+//         }
+//       }
+//     }
+//   }
 
-  return out.to(device);
-}
+//   return out.to(device);
+// }
 
-at::Tensor jin_make_maxpool2d_indices_2bit_tensor(const at::Tensor& flat_indices) {
-  TORCH_CHECK(flat_indices.defined(), "flat_indices undefined");
-  TORCH_CHECK(flat_indices.dim() == 4, "flat_indices must be [N,C,Hout,Wout]");
-  TORCH_CHECK(flat_indices.scalar_type() == at::kLong, "flat_indices must be int64");
+// at::Tensor jin_make_maxpool2d_indices_2bit_tensor(const at::Tensor& flat_indices) {
+//   TORCH_CHECK(flat_indices.defined(), "flat_indices undefined");
+//   TORCH_CHECK(flat_indices.dim() == 4, "flat_indices must be [N,C,Hout,Wout]");
+//   TORCH_CHECK(flat_indices.scalar_type() == at::kLong, "flat_indices must be int64");
 
-  const int64_t Hout = flat_indices.size(2);
-  const int64_t Wout = flat_indices.size(3);
+//   const int64_t Hout = flat_indices.size(2);
+//   const int64_t Wout = flat_indices.size(3);
 
-  const int64_t Hin = Hout * 2;
-  const int64_t Win = Wout * 2;
+//   const int64_t Hin = Hout * 2;
+//   const int64_t Win = Wout * 2;
 
-  auto packed = jin_pack_maxpool2x2_flat_indices_to_2bit(flat_indices, Hin, Win);
+//   auto packed = jin_pack_maxpool2x2_flat_indices_to_2bit(flat_indices, Hin, Win);
 
-  auto t = at::empty(
-      {(int64_t)packed.size()},
-      at::TensorOptions().dtype(at::kByte).device(at::kCPU));
-  if (!packed.empty()) {
-    std::memcpy(t.data_ptr(), packed.data(), packed.size());
-  }
-  return t;
-}
+//   auto t = at::empty(
+//       {(int64_t)packed.size()},
+//       at::TensorOptions().dtype(at::kByte).device(at::kCPU));
+//   if (!packed.empty()) {
+//     std::memcpy(t.data_ptr(), packed.data(), packed.size());
+//   }
+//   return t;
+// }
 
 
 // Check whether the dryrun options is on.

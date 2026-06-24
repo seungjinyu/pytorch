@@ -1,38 +1,17 @@
+import hashlib
+import os
 import time
+
 import torch
 import torch.nn.functional as F
-import os
-import hashlib
-
 from splitmagic import SplitRuntime, ZMQClient
+from splitmagic.recompute_policy import RECOMPUTE_POLICIES
 from splitmagic.utils.timing import CSVLogger
 
-VALID_RECOMPUTE_KEYS = {
-    # BN input 20개
-    "graph:bn:19:input", "graph:bn:18:input", "graph:bn:17:input",
-    "graph:bn:16:input", "graph:bn:15:input", "graph:bn:14:input",
-    "graph:bn:13:input", "graph:bn:12:input", "graph:bn:11:input",
-    "graph:bn:10:input", "graph:bn:9:input",  "graph:bn:8:input",
-    "graph:bn:7:input",  "graph:bn:6:input",  "graph:bn:5:input",
-    "graph:bn:4:input",  "graph:bn:3:input",  "graph:bn:2:input",
-    "graph:bn:1:input",  "graph:bn:0:input",
-
-    # ReLU 일부
-    "graph:relu:15:result",
-    "graph:relu:13:result",
-    "graph:relu:11:result",
-    "graph:relu:9:result",
-    "graph:relu:7:result",
-    "graph:relu:5:result",
-    "graph:relu:3:result",
-    "graph:relu:1:result",
-}
 
 def clone_state_dict(model):
-    return {
-        k: v.detach().cpu().clone()
-        for k, v in model.state_dict().items()
-    }
+    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
 
 def tensor_fingerprint(t):
     tc = t.detach().cpu().contiguous()
@@ -43,6 +22,8 @@ def tensor_fingerprint(t):
         str(tc.dtype),
         h,
     )
+
+
 def alias_duplicate_tensors(payload):
     """
     Generic tensor aliasing.
@@ -77,13 +58,13 @@ def alias_duplicate_tensors(payload):
     payload.meta["aliases"] = payload.aliases
 
     print(
-        f"[ALIAS][SUMMARY] removed={removed} "
-        f"saved_mb={saved_bytes / 1024 / 1024:.3f}",
+        f"[ALIAS][SUMMARY] removed={removed} saved_mb={saved_bytes / 1024 / 1024:.3f}",
         flush=True,
     )
 
     return payload
-    
+
+
 def auto_drop_for_recompute_probe(payload, drop_keys=None):
     if drop_keys is None:
         drop_keys = set()
@@ -103,23 +84,28 @@ def auto_drop_for_recompute_probe(payload, drop_keys=None):
         dropped_bytes += nbytes
 
         print(
-            f"[DROP_PROBE] key={key} "
-            f"saved_mb={nbytes / 1024 / 1024:.3f}",
+            f"[DROP_PROBE] key={key} saved_mb={nbytes / 1024 / 1024:.3f}",
             flush=True,
         )
 
     payload.meta["drop_probe_keys"] = dropped
 
     print(
-        f"[DROP_PROBE_SUMMARY] dropped={len(dropped)} "
-        f"saved_mb={dropped_bytes / 1024 / 1024:.3f}",
+        f"[DROP_PROBE_SUMMARY] dropped={len(dropped)} saved_mb={dropped_bytes / 1024 / 1024:.3f}",
         flush=True,
     )
 
     return payload
 
-def auto_drop_by_ratio(payload, candidate_keys, drop_ratio=0.5):
+
+def auto_drop_by_ratio(
+    payload,
+    candidate_keys,
+    # protected_keys=None,
+    drop_ratio=0.5,
+):
     rows = []
+    # protected_keys = protected_keys or set()
 
     for key in candidate_keys:
         t = payload.tensors.get(key)
@@ -129,10 +115,7 @@ def auto_drop_by_ratio(payload, candidate_keys, drop_ratio=0.5):
         nbytes = t.numel() * t.element_size()
         rows.append((nbytes, key))
 
-    total_bytes = sum(
-        t.numel() * t.element_size()
-        for t in payload.tensors.values()
-    )
+    total_bytes = sum(t.numel() * t.element_size() for t in payload.tensors.values())
 
     target = int(total_bytes * drop_ratio)
 
@@ -152,13 +135,12 @@ def auto_drop_by_ratio(payload, candidate_keys, drop_ratio=0.5):
     payload.meta["auto_dropped_keys"] = dropped
 
     print(
-        f"[AUTO_DROP] ratio={drop_ratio} "
-        f"dropped={len(dropped)} "
-        f"saved_mb={saved / 1024 / 1024:.3f}",
+        f"[AUTO_DROP] ratio={drop_ratio} dropped={len(dropped)} saved_mb={saved / 1024 / 1024:.3f}",
         flush=True,
     )
 
     return payload
+
 
 def drop_payload_keys(payload, drop_keys=None):
     """
@@ -171,7 +153,7 @@ def drop_payload_keys(payload, drop_keys=None):
     if not drop_keys:
         payload.meta["dropped_keys"] = []
         return payload
-    
+
     drop_keys = set(drop_keys)
     removed = 0
     saved_bytes = 0
@@ -186,12 +168,12 @@ def drop_payload_keys(payload, drop_keys=None):
     payload.meta["dropped_keys"] = sorted(drop_keys)
 
     print(
-        f"[DROP][SUMMARY] removed={removed} "
-        f"saved_mb={saved_bytes / 1024 / 1024:.3f}",
+        f"[DROP][SUMMARY] removed={removed} saved_mb={saved_bytes / 1024 / 1024:.3f}",
         flush=True,
     )
 
     return payload
+
 
 def run_node_a(
     model,
@@ -209,28 +191,38 @@ def run_node_a(
     template_plan_path="/tmp/jin_template_plan_a.tsv",
     auto_drop_ratio=0.5,
     enable_alias=True,
+    recompute_policy_name=None,
 ):
+    # environment setting
     os.environ["JIN_ROLE"] = "A"
     os.environ.pop("JIN_DRYRUN", None)
     os.environ.pop("JIN_DRYRUN_PATH", None)
     os.environ.pop("JIN_DRYRUN_TENSOR_DIR", None)
 
+    # we are assuming node a is running on cpu.
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = "cpu"
+
+    # move model to cpu
     model = model.to(device)
 
+    # if policy is not "full", print a warning
     if policy != "full":
         print(f"[Node A][WARN] policy argument is currently unused: {policy}")
-
+    # if optional_keys is not None, print a warning
     if optional_keys is not None:
         print(f"[Node A][WARN] optional_keys argument is currently unused")
-
+    # if key_mode is not "module_debug", print a warning
     if key_mode != "module_debug":
         print(f"[Node A][WARN] key_mode argument is currently unused: {key_mode}")
 
+    # Split Runtime for Node A
     runtime_a = SplitRuntime(model, role="A")
+
+    # Split ZMQ Client for Node A
     client = ZMQClient(endpoint)
 
+    # CSV Logger for Node A
     logger = CSVLogger(
         csv_path,
         [
@@ -244,39 +236,31 @@ def run_node_a(
         ],
     )
 
+    # initialize global_step and model train mode settings
     global_step = 0
     model.train()
 
+    #  raise error if dryrun_plan is False
     if not dryrun_plan:
         raise RuntimeError(
-            "[Node A] dryrun_plan=False path is disabled. "
-            "Use dryrun_plan=True with B-generated template plan."
+            "[Node A] dryrun_plan=False path is disabled. Use dryrun_plan=True with B-generated template plan."
         )
-    # plan = read_dryrun_plan(template_plan_path)
 
+    # request template plan from Node B
     plan = client.request_template_plan()
 
     if not plan:
-        raise RuntimeError(
-            f"[Node A] template plan is empty or missing: {template_plan_path}"
-        )
-    with open(template_plan_path,"w") as f:
+        raise RuntimeError(f"[Node A] template plan is empty or missing: {template_plan_path}")
+    with open(template_plan_path, "w") as f:
         for e in plan:
-            f.write(
-                f"{e['row_id']}\t"
-                f"{e['op']}\t"
-                f"{e['idx']}\t"
-                f"{e['suffix']}\t"
-                f"{e['shape']}\n"
-            )
-    
+            f.write(f"{e['row_id']}\t{e['op']}\t{e['idx']}\t{e['suffix']}\t{e['shape']}\n")
+
     print(
-        f"[Node A][TEMPLATE_PLAN_LOAD] "
-        f"path={template_plan_path} "
-        f"len={len(plan)}",
+        f"[Node A][TEMPLATE_PLAN_LOAD] path={template_plan_path} len={len(plan)}",
         flush=True,
     )
-    
+
+    # Actual Training 
     for epoch in range(num_epochs):
 
         if global_step >= max_steps:
@@ -300,10 +284,13 @@ def run_node_a(
 
             if enable_alias:
                 payload = alias_duplicate_tensors(payload)
+            if recompute_policy_name is not None:
+                policy_conf = RECOMPUTE_POLICIES[recompute_policy_name]
 
             payload = auto_drop_by_ratio(
                 payload,
-                candidate_keys=VALID_RECOMPUTE_KEYS,
+                candidate_keys=policy_conf["drop"],
+                # protected_keys=policy_conf["keep"],
                 drop_ratio=auto_drop_ratio,
             )
 
@@ -315,7 +302,6 @@ def run_node_a(
                 "tensor_policy": policy_meta,
                 "dryrun_backward_plan": payload.meta.get("dryrun_backward_plan", []),
                 "aliases": payload.meta.get("aliases", {}),
-
             }
 
             if global_step == 0:
@@ -347,9 +333,7 @@ def run_node_a(
             if global_step == 0 and "grads" in reply:
                 grad_keys = sorted(reply["grads"].keys())
                 print(
-                    f"[Node A][GRADS] "
-                    f"num={len(grad_keys)} "
-                    f"grads={grad_keys}",
+                    f"[Node A][GRADS] num={len(grad_keys)} grads={grad_keys}",
                     flush=True,
                 )
             model.load_state_dict(reply["updated_state_dict"])
@@ -363,23 +347,21 @@ def run_node_a(
             # payload_mb = reply["bytes"] / 1024 / 1024
 
             print(
-                f"[Node A] epoch={epoch} "
-                f"step={global_step} "
-                f"loss={reply['loss']:.6f} "
-                f"payload_mb={payload_mb:.3f} "
-                ,
-                flush=True
+                f"[Node A] epoch={epoch} step={global_step} loss={reply['loss']:.6f} payload_mb={payload_mb:.3f} ",
+                flush=True,
             )
 
-            logger.write([
-                global_step,
-                reply["loss"],
-                payload_mb,
-                capture_ms,
-                send_recv_ms,
-                state_load_ms,
-                total_ms,
-            ])
+            logger.write(
+                [
+                    global_step,
+                    reply["loss"],
+                    payload_mb,
+                    capture_ms,
+                    send_recv_ms,
+                    state_load_ms,
+                    total_ms,
+                ]
+            )
 
             global_step += 1
 

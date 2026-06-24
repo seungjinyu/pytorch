@@ -1,25 +1,120 @@
+import torch
 
 class FXRecomputeEngine:
-    def __init__(self, model):
+    def __init__(self, model, gm=None, node_values=None):
         self.model = model
         self.modules = dict(model.named_modules())
 
+        self.gm = gm 
+        self.node_values = node_values or {}
+
+        self.fx_nodes = {}
+
+        if gm is not None :
+            self.fx_nodes = {
+                n.name: n
+                for n in gm.graph.nodes
+            }
+    def _value_for_node(self, node_name):
+        if node_name in self.node_values:
+            return self.node_values[node_name]
+
+        raise RuntimeError(f"[RECOMPUTE] missing value for node={node_name}")
+
+    def _compute_node_from_start(self, target_node_name):
+        """
+        현재 recompute start node에서 target_node_name까지 path를 찾아 재계산.
+        """
+        if target_node_name in self.node_values:
+            return self.node_values[target_node_name]
+
+        if self.current_start is None:
+            raise RuntimeError(
+                f"[RECOMPUTE] current_start is None; cannot compute {target_node_name}"
+            )
+
+        path = self._find_path(self.current_start, target_node_name)
+
+        if path is None:
+            raise RuntimeError(
+                f"[RECOMPUTE] no path from {self.current_start} to {target_node_name}"
+            )
+
+        return self.recompute_path(
+            start_tensor=self.node_values[self.current_start],
+            path=path,
+        )
+    
+    def _find_path(self, start, target):
+        if self.gm is None:
+            return None
+
+        graph = {
+            n.name: [
+                user.name
+                for user in n.users
+            ]
+            for n in self.gm.graph.nodes
+        }
+
+        q = [(start, [start])]
+        seen = {start}
+
+        while q:
+            cur, path = q.pop(0)
+
+            if cur == target:
+                return path
+
+            for nxt in graph.get(cur, []):
+                if nxt in seen:
+                    continue
+
+                seen.add(nxt)
+                q.append((nxt, path + [nxt]))
+
+        return None
+    def _compute_add(self, add_node_name, cur):
+        if add_node_name not in self.fx_nodes:
+            raise RuntimeError(f"[RECOMPUTE] missing fx add node={add_node_name}")
+
+        node = self.fx_nodes[add_node_name]
+        args = list(node.args)
+
+        if len(args) != 2:
+            raise RuntimeError(
+                f"[RECOMPUTE] add node expects 2 args: {add_node_name}, args={args}"
+            )
+
+        lhs_node = args[0]
+        rhs_node = args[1]
+
+        lhs_name = lhs_node.name
+        rhs_name = rhs_node.name
+
+        if lhs_name in self.node_values:
+            lhs = self.node_values[lhs_name]
+        else:
+            lhs = self._compute_node_from_start(lhs_name)
+
+        if rhs_name in self.node_values:
+            rhs = self.node_values[rhs_name]
+        else:
+            rhs = self._compute_node_from_start(rhs_name)
+
+        return lhs + rhs
+    
     def recompute_path(
         self,
         start_tensor,
         path,
     ):
-        """
-        path example:
-            ["pool1", "conv2", "relu2"]
-
-        start_tensor:
-            tensor corresponding to pool1
-        """
 
         cur = start_tensor
+        self.current_start = path[0]
+        self.node_values[path[0]] = start_tensor
 
-        print(f"[RECOMPUTE] start path={' -> '.join(path)}")
+        # print(f"[RECOMPUTE] start path={' -> '.join(path)}")
 
         for node_name in path[1:]:
 
@@ -34,17 +129,28 @@ class FXRecomputeEngine:
                 raise NotImplementedError("reshape recompute needs shape info")
             
             elif node_name.startswith("add"):
+                
+                before_shape = tuple(cur.shape)
+
+                cur = self._compute_add(node_name, cur)
+
+                self.node_values[node_name] = cur
 
                 print(
-                    f"[RECOMPUTE_ADD_SKIP] node={node_name}",
+                    f"[RECOMPUTE] {node_name} "
+                    f"{before_shape} -> {tuple(cur.shape)}",
                     flush=True,
                 )
+            elif "relu" in node_name and node_name not in self.modules:
+                before_shape = tuple(cur.shape)
+                cur = torch.relu(cur)
+                self.node_values[node_name] = cur
 
-                # TODO:
-                # residual branch tensor 필요
-                # 지금은 skip
-                continue
-
+                print(
+                    f"[RECOMPUTE] {node_name} "
+                    f"{before_shape} -> {tuple(cur.shape)}",
+                    flush=True,
+                )
             else:
 
                 module_key = node_name.replace("_", ".")
@@ -61,9 +167,9 @@ class FXRecomputeEngine:
                 module = self.modules[module_key]
                 cur = module(cur)
 
-            print(
-                f"[RECOMPUTE] {node_name} "
-                f"{before_shape} -> {tuple(cur.shape)}"
-            )
+            # print(
+            #     f"[RECOMPUTE] {node_name} "
+            #     f"{before_shape} -> {tuple(cur.shape)}"
+            # )
 
         return cur

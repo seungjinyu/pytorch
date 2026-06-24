@@ -15,6 +15,43 @@ from .recompute import FXRecomputeEngine
 
 ALWAYS_LOCAL_KEYS = set()
 
+# Find seed keyss
+def build_node_to_payload_key(fx_key_map):
+
+    return{
+        node_name: key
+        for key, node_name in fx_key_map.items()
+    }
+
+def find_recompute_seed_keys(
+    missing_keys,
+    key_to_fx_node,
+    fx_path_finder,
+):
+    seed_nodes = set()
+
+    for key in missing_keys:
+        target_node = key_to_fx_node.get(key)
+        if target_node is None:
+            continue
+
+        start, path = fx_path_finder.find_start_and_path(target_node)
+
+        if start is None or path is None:
+            continue
+
+        seed_nodes.add(start)
+
+    node_to_key = build_node_to_payload_key(key_to_fx_node)
+
+    seed_keys = {
+        node_to_key[n]
+        for n in seed_nodes
+        if n in node_to_key
+    }
+
+    return seed_keys
+
 def relu_mask_key_for(relu_key):
     # graph:relu:16:result -> graph:relu_mask:16:result
     return relu_key.replace("graph:relu:", "graph:relu_mask:", 1)
@@ -135,11 +172,19 @@ class SplitRuntime:
     def __init__(self, model, role: str):
         self.model = model 
         self.role = role.upper()
+        try:
+            import torch.fx as fx
+            self.fx_gm = fx.symbolic_trace(self.model)
+            print("[SplitRuntime][FX_TRACE] ok", flush=True)
+        except Exception as e:
+            self.fx_gm = None
+            print(f"[SplitRuntime][FX_TRACE_FAIL] {type(e).__name__}: {e}", flush=True)
 
         if self.role not in ("A","B"):
             raise ValueError("Role must be either 'A' or 'B'")
 
     def capture_jin_forward_plan(self, x, y, plan):
+
         if self.role != "A":
             raise RuntimeError("Only role 'A' can capture tensors")
 
@@ -148,10 +193,9 @@ class SplitRuntime:
         import torch.nn.functional as F
 
         self.model.train()
-
+        
         tensors = {}
         handles = []
-
         queues = {}
 
         for e in plan:
@@ -346,12 +390,6 @@ class SplitRuntime:
 
         aliases = getattr(payload, "meta", {}).get("aliases", {})
 
-        # missing_keys = get_missing_keys(
-        #     required_keys=required_keys,
-        #     payload=payload,
-        #     payload_path=payload_path,
-        # )
-
         missing_keys = sorted([
             k for k in required_keys
             if (not is_always_local_key(k))
@@ -365,7 +403,6 @@ class SplitRuntime:
             flush=True,
         )
     
-        
         print(
             f"[B][RECOMPUTE_CHECK] "
             f"required={len(required_keys)} "
@@ -468,7 +505,13 @@ class SplitRuntime:
         key_to_node = build_jin_key_to_fx_node(self.model)
         available_tensor_nodes = set(available_tensors.keys())
 
-        recompute_engine = FXRecomputeEngine(self.model)
+        gm = getattr(self, "fx_gm",None)
+
+        recompute_engine = FXRecomputeEngine(
+            self.model,
+            gm=gm,
+            node_values=dict(available_tensors)
+        )
 
         recomputed = {}
 
@@ -499,10 +542,25 @@ class SplitRuntime:
                 print(f"[B][RECOMPUTE_SKIP] empty path for key={key}")
                 continue
 
+            print(
+                f"[B][RECOMPUTE_PATH] key={key} "
+                f"start={start} target={target_node} "
+                f"path={' -> '.join(path)}",
+                flush=True,
+            )
+
             out = recompute_engine.recompute_path(
                 start_tensor=available_tensors[start],
                 path=path,
             )
+
+            if out is None:
+                print(
+                    f"[B][RECOMPUTE_UNSAFE_SKIP] key={key} "
+                    f"start={start} path={' -> '.join(path)}",
+                    flush=True,
+                )
+                continue
 
             recomputed[key] = out.detach().cpu().contiguous()
 

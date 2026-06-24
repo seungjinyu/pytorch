@@ -66,14 +66,6 @@ variable_list AcosBackward0::apply_with_saved(const variable_list& grads, SwapSa
 }
 variable_list AddBackward0::apply(variable_list&& grads) {
 
-  // fprintf(stderr, "[JIN][ADD_BWD0_ENTER]\n");
-  // fflush(stderr);
-  
-  static int64_t g_add_idx = 0;
-  const int64_t idx = g_add_idx++;
-
-  // jin_trace_add_backward(grads[0], idx);
-
   IndexRangeGenerator gen;
   auto self_ix = gen.range(1);
   auto other_ix = gen.range(1);
@@ -96,7 +88,7 @@ void AddBackward0::compiled_args(CompiledNodeArgs& args) {
     args.collect(self_scalar_type);
 }
 variable_list AddBackward0::apply_with_saved(const variable_list& grads, SwapSavedVariables& saved) {
-    fprintf(stderr, "[JIN][ADD_BWD0_SAVED_ENTER]\n");
+
     saved.before(alpha);
     saved.before(other_scalar_type);
     saved.before(self_scalar_type);
@@ -107,14 +99,6 @@ variable_list AddBackward0::apply_with_saved(const variable_list& grads, SwapSav
     return result;
 }
 variable_list AddBackward1::apply(variable_list&& grads) {
-
-  fprintf(stderr, "[JIN][ADD_BWD1_ENTER]\n");
-  fflush(stderr);
-
-  static int64_t g_add1_idx = 0;
-  const int64_t idx = g_add1_idx++;
-
-  // jin_trace_add_backward(grads[0], idx);
 
   IndexRangeGenerator gen;
   auto self_ix = gen.range(1);
@@ -6315,6 +6299,7 @@ variable_list NativeBatchNormBackward0::apply(variable_list&& grads) {
     jin_overwrite_batchnorm_weight(weight);
     jin_overwrite_batchnorm_running_mean(running_mean);
     jin_overwrite_batchnorm_running_var(running_var);
+    // jin_overwrite_batchnorm_result2(result2);
     jin_overwrite_batchnorm_result1(result1);
     jin_overwrite_batchnorm_result2(result2);
   }
@@ -11728,6 +11713,11 @@ variable_list ReluBackward0::apply(variable_list&& grads) {
       } else{
         jin_overwrite_relu_saved(result);
       }
+      // } else if (jin_is_role_B()) {
+      //   grad_result = jin_relu_backward_from_mask(grad);
+      // } else {
+      //   grad_result = threshold_backward(grad, result, 0);
+      // }
 
       grad_result = threshold_backward(grad, result, 0);
 

@@ -11,6 +11,7 @@ Node B reconstructs the backward pass using the captured tensors and executes gr
 
 ## High-Level flow 
 
+
 ### Node A 
 |- forward 
 |- Capture Saved Tensors 
@@ -130,3 +131,12 @@ SplitMagic
     ├── test_compare_resnet18.py
     ├── test_single_resnet.py
     └── eval_resnet18_split_final.py
+```
+
+## How to install on node A 
+
+``` 
+rsync -av splitmagic/ <USER_NAME>@:~/splitmagic_project/
+// login to the node 
+pip3 install -e .
+```
