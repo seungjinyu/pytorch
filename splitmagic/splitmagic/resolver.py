@@ -282,3 +282,67 @@ def read_jin1_payload(path):
     )
 
     return payload
+
+def read_jin1_payload_bytes(payload_bytes):
+    import io
+    import struct
+    import torch
+    import numpy as np
+
+    from splitmagic.payload import Payload
+
+    id_to_dtype = {
+        0: torch.float32,
+        1: torch.float64,
+        2: torch.int64,
+        3: torch.int32,
+        4: torch.int16,
+        5: torch.int8,
+        6: torch.uint8,
+        7: torch.bool,
+    }
+
+    torch_to_numpy = {
+        torch.float32: np.float32,
+        torch.float64: np.float64,
+        torch.int64: np.int64,
+        torch.int32: np.int32,
+        torch.int16: np.int16,
+        torch.int8: np.int8,
+        torch.uint8: np.uint8,
+        torch.bool: np.bool_,
+    }
+
+    payload = Payload()
+
+    f = io.BytesIO(payload_bytes)
+
+    magic = f.read(4)
+    if magic != b"JIN1":
+        raise ValueError("Invalid JIN1 bytes")
+
+    n_tensors = struct.unpack("<I", f.read(4))[0]
+
+    for _ in range(n_tensors):
+        key_len = struct.unpack("<I", f.read(4))[0]
+        key = f.read(key_len).decode("utf-8")
+
+        dtype_id = struct.unpack("<B", f.read(1))[0]
+        ndim = struct.unpack("<B", f.read(1))[0]
+
+        shape = []
+        for _ in range(ndim):
+            shape.append(struct.unpack("<q", f.read(8))[0])
+
+        raw_len = struct.unpack("<Q", f.read(8))[0]
+        raw = f.read(raw_len)
+
+        torch_dtype = id_to_dtype[dtype_id]
+        np_dtype = torch_to_numpy[torch_dtype]
+
+        arr = np.frombuffer(raw, dtype=np_dtype).copy()
+        tensor = torch.from_numpy(arr).reshape(shape)
+
+        payload.tensors[key] = tensor
+
+    return payload

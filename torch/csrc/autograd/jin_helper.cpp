@@ -1009,8 +1009,14 @@ void jin_overwrite_maxpool2d_indices(at::Tensor& t) {
 }
 
 void jin_set_payload_bytes(const void* data, uint64_t nbytes, int64_t step) {
+
+
   std::lock_guard<std::mutex> lk(g_mu);
   auto& st = S();
+
+  st.role = env_cstr("JIN_ROLE");
+  st.payload_path = env_cstr("JIN_PAYLOAD_PATH");
+  if (st.payload_path.empty()) st.payload_path = "/tmp/jin_payload.bin";
 
   TORCH_CHECK(data != nullptr, "[JIN] data is null");
   TORCH_CHECK(nbytes > 0, "[JIN] nbytes=0");

@@ -417,6 +417,8 @@ class SplitRuntime:
         required_keys = get_required_keys_from_plan(plan)
 
         aliases = getattr(payload, "meta", {}).get("aliases", {})
+        payload.meta = getattr(payload, "meta",{})
+        payload.meta["aliases"] = aliases
 
         missing_keys = sorted([
             k for k in required_keys
@@ -635,19 +637,55 @@ class SplitRuntime:
         return recomputed
 
 def inject_recomputed_tensors(payload, payload_path, recomputed):
+    profile_t0 = time.perf_counter()
+
+    total_bytes = 0
+
+    t0 = time.perf_counter()
     for key, tensor in recomputed.items():
-        payload.tensors[key] = tensor.detach().cpu().contiguous()
-
-    if payload_path is not None:
-        jin_payload = read_jin1_payload(payload_path)
-
-        for key, tensor in recomputed.items():
-            jin_payload.tensors[key] = tensor.detach().cpu().contiguous()
-
-        jin_payload.save_jin1(payload_path)
+        t = tensor.detach().cpu().contiguous()
+        payload.tensors[key] = t
+        total_bytes += t.numel() * t.element_size()
+    t1 = time.perf_counter()
+    inject_mem_ms = (t1 - t0) * 1000
 
     print(
-        f"[B][RECOMPUTE_INJECT] n={len(recomputed)} "
+        f"[PY][SET_MEM_PAYLOAD] "
+        f"JIN_ROLE={os.environ.get('JIN_ROLE')} "
+        f"JIN_STEP={os.environ.get('JIN_STEP')} "
+        f"JIN_PAYLOAD_PATH={os.environ.get('JIN_PAYLOAD_PATH')} "
+        f"alias_exists={os.path.exists(os.environ.get('JIN_PAYLOAD_PATH', '') + '.alias')}",
+        flush=True,
+    )
+
+    t0 = time.perf_counter()
+    payload_bytes = payload.to_jin1_bytes()
+    t1 = time.perf_counter()
+    to_jin1_bytes_ms = (t1 - t0) * 1000
+
+    step = int(os.environ.get("JIN_STEP", "0"))
+
+    t0 = time.perf_counter()
+    jin_set_payload_bytes_from_python(
+        payload_bytes=payload_bytes,
+        step=step,
+    )
+    t1 = time.perf_counter()
+    set_payload_bytes_ms = (t1 - t0) * 1000
+
+    profile_t1 = time.perf_counter()
+    total_ms = (profile_t1 - profile_t0) * 1000
+
+    print(
+        f"[B][RECOMPUTE_INJECT_PROFILE] "
+        f"n={len(recomputed)} "
+        f"mb={total_bytes / 1024 / 1024:.3f} "
+        f"inject_mem_ms={inject_mem_ms:.3f} "
+        f"to_jin1_bytes_ms={to_jin1_bytes_ms:.3f} "
+        f"set_payload_bytes_ms={set_payload_bytes_ms:.3f} "
+        f"read_jin1_ms=0.000 "
+        f"save_jin1_ms=0.000 "
+        f"total_ms={total_ms:.3f} "
         f"keys={list(recomputed.keys())[:10]}",
         flush=True,
     )

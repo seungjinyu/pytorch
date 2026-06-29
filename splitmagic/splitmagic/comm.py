@@ -5,6 +5,7 @@ import zmq
 import torch
 
 from .payload import Payload
+from .resolver import read_jin1_payload_bytes
 
 
 # Client Class for node A 
@@ -17,15 +18,17 @@ class ZMQClient:
     def send_payload(self, payload: Payload, y, batch_size=None, extra=None):
 
         t0 = time.perf_counter()
+
         with tempfile.NamedTemporaryFile(delete=False) as f:
             tmp_path = f.name
+
         t_save0 = time.perf_counter()
-        payload.save_jin1(tmp_path)
+        payload_bytes = payload.to_jin1_bytes()
         t_save1 = time.perf_counter()
 
         t_read0 = time.perf_counter()
-        with open(tmp_path, "rb") as f:
-            payload_bytes = f.read()
+        # with open(tmp_path, "rb") as f:
+        #     payload_bytes = f.read()
         t_read1 = time.perf_counter()
 
         os.remove(tmp_path)
@@ -54,7 +57,7 @@ class ZMQClient:
         t1 = time.perf_counter()
         print(
             f"[ZMQClient][PROFILE] "
-            f"save_jin1_ms={(t_save1 - t_save0) * 1000:.3f} "
+            f"to_jin1_bytes_ms={(t_save1 - t_save0) * 1000:.3f} "
             f"read_payload_bytes_ms={(t_read1 - t_read0) * 1000:.3f} "
             f"send_pyobj_ms={(t_send1 - t_send0) * 1000:.3f} "
             f"recv_pyobj_ms={(t_recv1 - t_recv0) * 1000:.3f} "
@@ -105,17 +108,16 @@ class ZMQServer:
             return None
 
         t_write0 = time.perf_counter()
+
         payload_bytes = msg["payload"]
 
         # Saves the payload from the node A to use it when the server overwrites the value.
-        with open(payload_path, "wb") as f:
-            f.write(payload_bytes)
+        # with open(payload_path, "wb") as f:
+        #     f.write(payload_bytes)
         t_write1 = time.perf_counter()
-
         t_req0 = time.perf_counter()
         # Python 쪽 payload는 model.output만 있으면 됨
-        payload = Payload()
-        payload.add_tensor("model.output", msg["model_output"])
+        payload = read_jin1_payload_bytes(payload_bytes)
 
         print("[RECV_PAYLOAD_BYTES]", len(payload_bytes))
         print("[RECV_KEYS]", list(payload.tensors.keys()))

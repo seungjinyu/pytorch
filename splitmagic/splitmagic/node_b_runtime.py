@@ -7,6 +7,7 @@ from splitmagic import SplitRuntime, ZMQServer
 from splitmagic.utils.timing import CSVLogger
 from splitmagic.runtime import read_dryrun_plan
 from splitmagic.resolver import read_jin1_payload
+from splitmagic.runtime import jin_set_payload_bytes_from_python
 
 def tensor_nbytes(t):
     return t.numel() * t.element_size()
@@ -230,7 +231,8 @@ def run_node_b(
         # Read saved tensor from payload from Node A
         t_read0 = time.perf_counter()
 
-        jin_payload = read_jin1_payload(req["payload_path"])
+        # jin_payload = read_jin1_payload(req["payload_path"])
+        jin_payload = req["payload"]
         req["payload"] = jin_payload
         t_read1 = time.perf_counter()
 
@@ -302,6 +304,12 @@ def run_node_b(
         )
 
         t_backward0 = time.perf_counter()
+
+        payload_bytes = req["payload"].to_jin1_bytes()
+        jin_set_payload_bytes_from_python(
+            payload_bytes=payload_bytes,
+            step=step,
+        )
 
         loss = runtime_b.backward_jin(
             x_dummy,

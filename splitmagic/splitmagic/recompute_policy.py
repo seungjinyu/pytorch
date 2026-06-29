@@ -6,12 +6,19 @@ RECOMPUTE_POLICIES = {
             "graph:relu:16:result",
             "graph:relu:14:result",
             "graph:relu:12:result",
+
         },
         "drop": {
             # bn input
             *{f"graph:bn:{i}:input" for i in range(20)},
 
             # non-critical relu
+            "graph:relu:10:result",
+            "graph:relu:8:result",
+            "graph:relu:6:result",
+            "graph:relu:4:result",
+            "graph:relu:2:result",
+
             "graph:relu:15:result",
             "graph:relu:13:result",
             "graph:relu:11:result",
