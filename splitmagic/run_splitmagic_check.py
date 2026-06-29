@@ -6,9 +6,9 @@ import sys
 import time
 
 
-def run(cmd):
+def run(cmd,env=None):
     print(f"\n[RUN] {' '.join(cmd)}", flush=True)
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, env=env)
 
 
 def run_split_test(

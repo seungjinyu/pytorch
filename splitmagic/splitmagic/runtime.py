@@ -1,5 +1,6 @@
 import torch
 import os 
+import time 
 
 from .payload import  payload_from_jin_items
 from .resolver import read_jin1_payload, SavedTensorResolver
@@ -14,6 +15,27 @@ from .fx_trace import (
 from .recompute import FXRecomputeEngine
 
 ALWAYS_LOCAL_KEYS = set()
+
+def jin_set_payload_bytes_from_python(payload_bytes, step):
+    import ctypes
+    import torch
+
+    lib = ctypes.CDLL(torch._C.__file__)
+
+    fn = lib.jin_set_payload_bytes
+    fn.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        ctypes.c_int64,
+    ]
+    fn.restype = None
+
+    buf = ctypes.create_string_buffer(payload_bytes)
+    fn(
+        ctypes.cast(buf, ctypes.c_void_p),
+        ctypes.c_uint64(len(payload_bytes)),
+        ctypes.c_int64(step),
+    )
 
 # Find seed keyss
 def build_node_to_payload_key(fx_key_map):
@@ -192,7 +214,7 @@ class SplitRuntime:
         import torch.nn as nn
         import torch.nn.functional as F
 
-        self.model.train()
+        # self.model.train()
         
         tensors = {}
         handles = []
@@ -226,6 +248,7 @@ class SplitRuntime:
         def save_tensor(key, tensor):
             tensors[key] = tensor.detach().cpu().contiguous()
 
+        # make a hook to save the saved tensors
         def make_hook(module):
             def hook(mod, inputs, output):
                 if len(inputs) == 0:
@@ -261,16 +284,7 @@ class SplitRuntime:
                     # 
                     key = pop_key("relu", "result")
                     save_tensor(key, output)
-
-                    # ReLU for Mask
-                    # key = pop_key("relu", "result")
-
-                    # mask_key = key.replace("graph:relu:", "graph:relu_mask:")
-
-                    # mask = (output > 0).to(torch.uint8).detach().cpu().contiguous()
-                    # save_tensor(mask_key, mask)
                     
-
                 elif isinstance(mod, nn.Linear):
                     key = pop_key("addmm", "mat1")
                     save_tensor(key, inp)
@@ -292,6 +306,7 @@ class SplitRuntime:
 
             return hook
 
+        # register the hooks
         for _, m in self.model.named_modules():
             if isinstance(
                 m,
@@ -365,19 +380,30 @@ class SplitRuntime:
     ):
         if self.role != "B":
             raise RuntimeError("backward_jin() is only available for Node B")
+        
+        profile_t0 = time.perf_counter()
+        t0 = time.perf_counter()
 
         self.model.train()
         self.model.zero_grad(set_to_none=True)
 
-        out_dummy = self.model(x_dummy)
+        t1 = time.perf_counter()
+        zero_grad_ms = (t1 - t0) * 1000
 
+        t0 = time.perf_counter()
+        out_dummy = self.model(x_dummy)
+        t1 = time.perf_counter()
+        dummy_forward_ms = (t1 - t0) * 1000
+        
+        t0 = time.perf_counter()
         if "model.output" not in payload.tensors:
             raise KeyError("payload does not contain 'model.output'")
 
         out_real = payload.tensors["model.output"].detach().to(out_dummy.device)
         out = out_dummy + (out_real - out_dummy).detach()
         loss = loss_fn(out, y)
-
+        t1 = time.perf_counter()
+        loss_build_ms= ( t1 - t0 ) * 1000
         print("[B][BACKWARD] start")
 
         #
@@ -385,6 +411,8 @@ class SplitRuntime:
 
         if not plan:
             raise RuntimeError("[B][RECOMPUTE] missing dryrun_backward_plan")
+        
+        t0 = time.perf_counter()
 
         required_keys = get_required_keys_from_plan(plan)
 
@@ -397,6 +425,9 @@ class SplitRuntime:
             and (k not in aliases)
             and (not has_relu_mask_for(k, payload))
         ])
+
+        t1 = time.perf_counter()
+        required_check_ms = (t1 - t0) * 1000
 
         print(
             f"[B][ALIAS_AWARE] aliases={len(aliases)}",
@@ -411,6 +442,8 @@ class SplitRuntime:
             flush=True,
         )
 
+        recompute_ms = 0.0
+
         if missing_keys:
 
             print(
@@ -418,6 +451,8 @@ class SplitRuntime:
                 f"first={missing_keys[:10]}",
                 flush=True
             )
+
+            t0 = time.perf_counter()
             
             recomputed = self.recompute_missing_keys(
                 missing_keys=missing_keys,
@@ -431,6 +466,9 @@ class SplitRuntime:
                 payload_path=payload_path,
                 recomputed=recomputed,
             )
+
+            t1 = time.perf_counter()
+            recompute_ms = (t1 - t0 ) * 1000
 
             missing_keys = sorted([
                 k for k in required_keys
@@ -451,7 +489,13 @@ class SplitRuntime:
                 )                            
             # missing_keys = []
         #
+        t0 = time.perf_counter()
         loss.backward()
+        t1 = time.perf_counter()
+
+        torch_backward_ms = (t1 - t0) * 1000
+
+        t0 = time.perf_counter()
 
         grad_dump = {}
 
@@ -462,6 +506,24 @@ class SplitRuntime:
             grad_dump[name] = p.grad.detach().cpu().clone()
 
         torch.save(grad_dump, "/tmp/node_b_grads.pt")
+        t1 = time.perf_counter()
+        grad_dump_ms = (t1 -t0) * 1000
+
+        grad_dump_ms = 0.0
+        profile_t1 = time.perf_counter()
+        total_backward_jin_ms = (profile_t1 - profile_t0) * 1000
+        print(
+            f"[B][PROFILE] "
+            f"zero_grad_ms={zero_grad_ms:.3f} "
+            f"dummy_forward_ms={dummy_forward_ms:.3f} "
+            f"loss_build_ms={loss_build_ms:.3f} "
+            f"required_check_ms={required_check_ms:.3f} "
+            f"recompute_ms={recompute_ms:.3f} "
+            f"torch_backward_ms={torch_backward_ms:.3f} "
+            f"grad_dump_ms={grad_dump_ms:.3f} "
+            f"total_backward_jin_ms={total_backward_jin_ms:.3f}",
+            flush=True,
+        )
 
         print("[B][BACKWARD] done")
 
@@ -607,3 +669,4 @@ def is_recomputable_key(key):
     #     return True
 
     return False
+

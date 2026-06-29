@@ -1,4 +1,6 @@
+import time 
 import torch
+
 
 class FXRecomputeEngine:
     def __init__(self, model, gm=None, node_values=None):
@@ -115,8 +117,11 @@ class FXRecomputeEngine:
         self.node_values[path[0]] = start_tensor
 
         # print(f"[RECOMPUTE] start path={' -> '.join(path)}")
+        op_profiles = []
 
         for node_name in path[1:]:
+
+            op_t0 = time.perf_counter()
 
             before_shape = tuple(cur.shape)
             if node_name == "flatten":
@@ -163,13 +168,36 @@ class FXRecomputeEngine:
                         flush=True,
                     )
                     continue
+                else:
 
-                module = self.modules[module_key]
-                cur = module(cur)
+                    module = self.modules[module_key]
+                    cur = module(cur)
 
-            # print(
-            #     f"[RECOMPUTE] {node_name} "
-            #     f"{before_shape} -> {tuple(cur.shape)}"
-            # )
+            op_t1 = time.perf_counter()
+            op_profiles.append(
+                (
+                    node_name,
+                    before_shape,
+                    tuple(cur.shape),
+                    (op_t1 - op_t0) * 1000,
+                )
+            )
 
+        total_ms = sum(x[3] for x in op_profiles)
+
+        print(
+            f"[RECOMPUTE][PATH_PROFILE] "
+            f"path_len={len(path)} "
+            f"total_ms={total_ms:.3f}",
+            flush=True,
+        )
+
+        for node_name, before_shape, after_shape, ms in op_profiles:
+            print(
+                f"[RECOMPUTE][OP_PROFILE] "
+                f"node={node_name} "
+                f"shape={before_shape}->{after_shape} "
+                f"ms={ms:.3f}",
+                flush=True,
+            )
         return cur

@@ -229,7 +229,9 @@ def run_node_a(
             "step",
             "loss",
             "payload_mb",
-            "capture_ms",
+            "capture_forward_ms",
+            "alias_ms",
+            "auto_drop_ms",
             "send_recv_ms",
             "state_load_ms",
             "total_ms",
@@ -272,8 +274,9 @@ def run_node_a(
             x = x.to(device)
             y = y.to(device)
 
+            iter_t0 = time.perf_counter()
+
             t0 = time.perf_counter()
-            t_capture0 = time.perf_counter()
 
             # 중요: A는 forward only. backward 호출 없음.
             payload = runtime_a.capture_jin_forward_plan(
@@ -281,22 +284,35 @@ def run_node_a(
                 y=y,
                 plan=plan,
             )
-
-            if enable_alias:
-                payload = alias_duplicate_tensors(payload)
-            if recompute_policy_name is not None:
-                policy_conf = RECOMPUTE_POLICIES[recompute_policy_name]
-
-            payload = auto_drop_by_ratio(
-                payload,
-                candidate_keys=policy_conf["drop"],
-                # protected_keys=policy_conf["keep"],
-                drop_ratio=auto_drop_ratio,
+            payload.print_add_tensor_profile(
+                prefix="[Payload][CAPTURE_ADD_TENSOR_PROFILE]"
             )
 
-            policy_meta = payload.meta.get("tensor_policy", {})
+            t1 = time.perf_counter()
+            capture_forward_ms = (t1 - t0) * 1000
 
-            t_capture1 = time.perf_counter()
+            t0 = time.perf_counter()
+            if enable_alias:
+                payload = alias_duplicate_tensors(payload)
+
+            t1 = time.perf_counter()
+            alias_ms = (t1 - t0) * 1000
+            
+            t0 = time.perf_counter()
+
+            if recompute_policy_name is not None:
+                policy_conf = RECOMPUTE_POLICIES[recompute_policy_name]
+            
+                payload = auto_drop_by_ratio(
+                    payload,
+                    candidate_keys=policy_conf["drop"],
+                    # protected_keys=policy_conf["keep"],
+                    drop_ratio=auto_drop_ratio,
+                )
+            t1 = time.perf_counter()
+            auto_drop_ms = (t1 - t0) * 1000
+
+            policy_meta = payload.meta.get("tensor_policy", {})
 
             extra = {
                 "tensor_policy": policy_meta,
@@ -339,15 +355,28 @@ def run_node_a(
             model.load_state_dict(reply["updated_state_dict"])
 
             t_load1 = time.perf_counter()
-
-            total_ms = (time.perf_counter() - t0) * 1000
-            capture_ms = (t_capture1 - t_capture0) * 1000
             send_recv_ms = (t_send1 - t_send0) * 1000
             state_load_ms = (t_load1 - t_load0) * 1000
-            # payload_mb = reply["bytes"] / 1024 / 1024
+
+            total_ms = (
+                capture_forward_ms
+                + alias_ms
+                + auto_drop_ms
+                + send_recv_ms
+                + state_load_ms
+            )
+            iteration_wall_ms = (time.perf_counter() - iter_t0) * 1000
 
             print(
-                f"[Node A] epoch={epoch} step={global_step} loss={reply['loss']:.6f} payload_mb={payload_mb:.3f} ",
+                f"[Node A] epoch={epoch} step={global_step} "
+                f"loss={reply['loss']:.6f} "
+                f"payload_mb={payload_mb:.3f} "
+                f"capture_forward_ms={capture_forward_ms:.3f} "
+                f"alias_ms={alias_ms:.3f} "
+                f"auto_drop_ms={auto_drop_ms:.3f} "
+                f"send_recv_ms={send_recv_ms:.3f} "
+                f"state_load_ms={state_load_ms:.3f} "
+                f"total_ms={total_ms:.3f}",
                 flush=True,
             )
 
@@ -356,7 +385,9 @@ def run_node_a(
                     global_step,
                     reply["loss"],
                     payload_mb,
-                    capture_ms,
+                    capture_forward_ms,
+                    alias_ms,
+                    auto_drop_ms,
                     send_recv_ms,
                     state_load_ms,
                     total_ms,

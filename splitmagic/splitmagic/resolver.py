@@ -172,6 +172,7 @@ def read_jin1_payload(path):
     import struct
     import torch
     import numpy as np
+    import time 
 
     from splitmagic.payload import Payload
 
@@ -197,17 +198,32 @@ def read_jin1_payload(path):
         torch.bool: np.bool_,
     }
 
+    profile_t0 = time.perf_counter()
+
+    header_ms = 0.0
+    meta_ms = 0.0
+    raw_read_ms = 0.0
+    tensor_create_ms = 0.0
+    payload_add_ms = 0.0
+
     payload = Payload()
 
     with open(path, "rb") as f:
+        t0 = time.perf_counter()
+
         magic = f.read(4)
 
         if magic != b"JIN1":
             raise ValueError(f"Invalid JIN1 file: {path}")
 
         n_tensors = struct.unpack("<I", f.read(4))[0]
+        t1 = time.perf_counter()
+
+        header_ms += (t1-t0) * 1000
 
         for _ in range(n_tensors):
+
+            t0 = time.perf_counter()
 
             key_len = struct.unpack("<I", f.read(4))[0]
             key = f.read(key_len).decode("utf-8")
@@ -221,8 +237,16 @@ def read_jin1_payload(path):
                 shape.append(struct.unpack("<q", f.read(8))[0])
 
             raw_len = struct.unpack("<Q", f.read(8))[0]
+            t1 = time.perf_counter()
 
+            meta_ms += (t1 - t0) * 1000
+
+            t0 = time.perf_counter()
             raw = f.read(raw_len)
+            t1 = time.perf_counter()
+            raw_read_ms += (t1 - t0) * 1000
+
+            t0 = time.perf_counter()
 
             torch_dtype = id_to_dtype[dtype_id]
             np_dtype = torch_to_numpy[torch_dtype]
@@ -231,6 +255,30 @@ def read_jin1_payload(path):
 
             tensor = torch.from_numpy(arr).reshape(shape)
 
+            t1 = time.perf_counter()
+            tensor_create_ms += (t1 - t0) * 1000
+
+            t0 = time.perf_counter()
             payload.add_tensor(key, tensor)
+            t1 = time.perf_counter()
+            payload_add_ms += (t1 - t0) * 1000
+
+    profile_t1 = time.perf_counter()
+    total_ms = (profile_t1 - profile_t0) * 1000
+
+    print(
+        f"[Payload][READ_JIN1_PROFILE] "
+        f"num_tensors={len(payload.tensors)} "
+        f"header_ms={header_ms:.3f} "
+        f"meta_ms={meta_ms:.3f} "
+        f"raw_read_ms={raw_read_ms:.3f} "
+        f"tensor_create_ms={tensor_create_ms:.3f} "
+        f"payload_add_ms={payload_add_ms:.3f} "
+        f"total_read_jin1_ms={total_ms:.3f}",
+        flush=True,
+    )
+    payload.print_add_tensor_profile(
+        prefix="[Payload][READ_JIN1_ADD_TENSOR_PROFILE]"
+    )
 
     return payload
