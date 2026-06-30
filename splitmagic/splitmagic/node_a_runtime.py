@@ -12,7 +12,6 @@ from splitmagic.utils.timing import CSVLogger
 def clone_state_dict(model):
     return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-
 def tensor_fingerprint(t):
     tc = t.detach().cpu().contiguous()
     h = hashlib.sha256(tc.numpy().tobytes()).hexdigest()
@@ -22,7 +21,6 @@ def tensor_fingerprint(t):
         str(tc.dtype),
         h,
     )
-
 
 def alias_duplicate_tensors(payload):
     """
@@ -192,6 +190,7 @@ def run_node_a(
     auto_drop_ratio=0.5,
     enable_alias=True,
     recompute_policy_name=None,
+    send_grads=False,
 ):
     # environment setting
     os.environ["JIN_ROLE"] = "A"
@@ -352,6 +351,7 @@ def run_node_a(
                     f"[Node A][GRADS] num={len(grad_keys)} grads={grad_keys}",
                     flush=True,
                 )
+                
             model.load_state_dict(reply["updated_state_dict"])
 
             t_load1 = time.perf_counter()
@@ -395,22 +395,6 @@ def run_node_a(
             )
 
             global_step += 1
-
-    # test_loss, test_acc = evaluate(model, test_loader,device=device)
-
-    # temp skip
-    # if grad_save_path is not None:
-    #     print("The PATH was not set so saving int split_final.pt")
-    #     torch.save(model.state_dict(), "split_final.pt")
-    # else:
-    #     print(f"The PATH for the gradient is {grad_save_path}")
-    #     torch.save(model.state_dict(), grad_save_path)
-
-    # print(
-    #     f"[Eval] "
-    #     f"test_loss={test_loss:.6f} "
-    #     f"test_acc={test_acc * 100:.2f}%"
-    # )
 
     print("[Node A] done")
 

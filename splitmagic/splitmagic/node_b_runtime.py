@@ -6,7 +6,7 @@ import time
 from splitmagic import SplitRuntime, ZMQServer
 from splitmagic.utils.timing import CSVLogger
 from splitmagic.runtime import read_dryrun_plan
-from splitmagic.resolver import read_jin1_payload
+# from splitmagic.resolver import read_jin1_payload
 from splitmagic.runtime import jin_set_payload_bytes_from_python
 
 def tensor_nbytes(t):
@@ -150,12 +150,14 @@ def run_node_b(
     lr=0.1,
     template_batch_size=16,
     log_level="2",
+    send_grads=False,
 ):
     
     printed_payload_summary = False
 
     # We are assuming the node B has a better computation power
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = "cpu"
     model = model.to(device)
 
     os.environ["JIN_ROLE"] = "B"
@@ -186,8 +188,8 @@ def run_node_b(
             "state_load_ms",
             "backward_jin_ms",
             "clone_grads_ms",
-            "grads_mb",
-            "grad_tensors",
+            # "grads_mb",
+            # "grad_tensors",
             "optimizer_step_ms",
             "state_dump_ms",
             "state_mb",
@@ -231,7 +233,6 @@ def run_node_b(
         # Read saved tensor from payload from Node A
         t_read0 = time.perf_counter()
 
-        # jin_payload = read_jin1_payload(req["payload_path"])
         jin_payload = req["payload"]
         req["payload"] = jin_payload
         t_read1 = time.perf_counter()
@@ -254,12 +255,6 @@ def run_node_b(
         )
 
         payload_keys = sorted(req["payload"].tensors.keys())
-        print(
-            f"[Node B][JIN1_PAYLOAD_RELOAD] "
-            f"num_keys={len(payload_keys)} "
-            f"first={payload_keys[:10]}",
-            flush=True,
-        )
 
         if not printed_payload_summary:
             print_payload_size_summary(req["payload"], topk=30)
@@ -275,8 +270,6 @@ def run_node_b(
         plan = req.get("dryrun_backward_plan", None)
         if not plan:
             plan = template_plan
-
-        # write_execution_plan(plan, step)
 
         os.environ["JIN_ROLE"] = "B"
         os.environ["JIN_PAYLOAD_PATH"] = req["payload_path"]
@@ -322,8 +315,14 @@ def run_node_b(
         )
         t_backward1 = time.perf_counter()
 
-        t_grads0 = time.perf_counter()
-        grads, grad_bytes, grad_tensors = clone_grads(model)
+        if send_grads:
+            t_grads0 = time.perf_counter()
+            grads, grad_bytes, grad_tensors = clone_grads(model)
+            t_grads1 = time.perf_counter()
+        else:
+            grads = None 
+            grad_bytes = 0 
+            grad_tensors = 0
         t_grads1 = time.perf_counter()
 
         t_opt0 = time.perf_counter()
@@ -347,22 +346,27 @@ def run_node_b(
 
         payload_mb = req["num_bytes"] / 1024 / 1024
 
-        server.send_reply({
+        t_send0 = time.perf_counter()
+
+        reply = {
             "status": "ok",
             "step": step,
             "loss": float(loss.detach().cpu()),
             "bytes": req["num_bytes"],
             "updated_state_dict": updated_state,
-            "grads": grads,
-        })
+        }
 
-        t_send0 = time.perf_counter()
+        if send_grads:
+            reply["grads"] = grads
 
+        server.send_reply(reply)
+            
         print(
             f"[Node B] step={step} "
             f"loss={loss.item():.6f} "
             f"payload_mb={payload_mb:.3f}"
         )
+
         t_send1 = time.perf_counter()
 
         t_step1 = time.perf_counter()
@@ -390,8 +394,8 @@ def run_node_b(
             f"state_tensors={state_tensors} "
             f"send_reply_ms={send_reply_ms:.3f} "
             f"clone_grads_ms={clone_grads_ms:.3f} "
-            f"grads_mb={grad_bytes / 1024 / 1024:.3f} "
-            f"grad_tensors={grad_tensors} "
+            # f"grads_mb={grad_bytes / 1024 / 1024:.3f} "
+            # f"grad_tensors={grad_tensors} "
             f"total_step_ms={total_step_ms:.3f}",
             
             flush=True,
@@ -407,8 +411,8 @@ def run_node_b(
             state_load_ms,
             backward_jin_ms,
             clone_grads_ms,
-            grad_bytes / 1024 / 1024,
-            grad_tensors,
+            # grad_bytes / 1024 / 1024,
+            # grad_tensors,
             optimizer_step_ms,
             state_dump_ms,
             state_bytes / 1024 / 1024,
