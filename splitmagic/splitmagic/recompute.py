@@ -97,12 +97,14 @@ class FXRecomputeEngine:
         if lhs_name in self.node_values:
             lhs = self.node_values[lhs_name]
         else:
-            lhs = self._compute_node_from_start(lhs_name)
+            # lhs = self._compute_node_from_start(lhs_name)
+            lhs = self._compute_node_from_any_available(lhs_name)
 
         if rhs_name in self.node_values:
             rhs = self.node_values[rhs_name]
         else:
-            rhs = self._compute_node_from_start(rhs_name)
+            # rhs = self._compute_node_from_start(rhs_name)
+            rhs = self._compute_node_from_any_available(rhs_name)
 
         return lhs + rhs
     
@@ -172,6 +174,7 @@ class FXRecomputeEngine:
 
                     module = self.modules[module_key]
                     cur = module(cur)
+                    self.node_values[node_name] = cur
 
             op_t1 = time.perf_counter()
             op_profiles.append(
@@ -201,3 +204,48 @@ class FXRecomputeEngine:
                 flush=True,
             )
         return cur
+    def _compute_node_from_any_available(self, target_node_name):
+        if target_node_name in self.node_values:
+            return self.node_values[target_node_name]
+
+        best_start = None
+        best_path = None
+
+        for start_name in list(self.node_values.keys()):
+            path = self._find_path(start_name, target_node_name)
+
+            if path is None:
+                continue
+
+            if best_path is None or len(path) < len(best_path):
+                best_start = start_name
+                best_path = path
+
+        if best_path is None:
+            raise RuntimeError(
+                f"[RECOMPUTE] no available path to {target_node_name}; "
+                f"available={list(self.node_values.keys())[:30]}"
+            )
+
+        old_start = self.current_start
+
+        try:
+            self.current_start = best_start
+            out = self.recompute_path(
+                start_tensor=self.node_values[best_start],
+                path=best_path,
+            )
+        finally:
+            self.current_start = old_start
+
+        self.node_values[target_node_name] = out
+
+        print(
+            f"[RECOMPUTE][ANY_AVAILABLE] "
+            f"target={target_node_name} "
+            f"start={best_start} "
+            f"path_len={len(best_path)}",
+            flush=True,
+        )
+
+        return out

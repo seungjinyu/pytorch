@@ -163,7 +163,6 @@ def run_node_b(
     os.environ["JIN_ROLE"] = "B"
     os.environ["JIN_LOG_LEVEL"] = log_level
 
-
     # Build template plan 
     template_plan = build_template_plan_on_b(
         model=model,
@@ -239,9 +238,10 @@ def run_node_b(
 
         # Alias time 
         t_alias0 = time.perf_counter()
-
         aliases = req.get("aliases", {})
         alias_path = req["payload_path"] + ".alias"
+
+        # Key matching for duplicated values
         write_alias_tsv(aliases,alias_path)
 
         req["payload"].meta = getattr(req["payload"], "meta", {})
@@ -263,6 +263,7 @@ def run_node_b(
         t_state_load0 = time.perf_counter()
         
         if "state_dict" in req:
+            print("[Node B] state dict loaded\n")
             model.load_state_dict(req["state_dict"])
 
         t_state_load1 = time.perf_counter()
