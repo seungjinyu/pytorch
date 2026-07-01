@@ -316,15 +316,18 @@ def run_node_b(
         )
         t_backward1 = time.perf_counter()
 
+        clone_grads_ms = 0.0
+
         if send_grads:
             t_grads0 = time.perf_counter()
             grads, grad_bytes, grad_tensors = clone_grads(model)
             t_grads1 = time.perf_counter()
+            clone_grads_ms = (t_grads1 - t_grads0) * 1000
+
         else:
             grads = None 
             grad_bytes = 0 
             grad_tensors = 0
-        t_grads1 = time.perf_counter()
 
         t_opt0 = time.perf_counter()
         optimizer.step()
@@ -377,7 +380,6 @@ def run_node_b(
         alias_ms = (t_alias1 - t_alias0) * 1000
         state_load_ms = (t_state_load1 - t_state_load0) * 1000
         backward_jin_ms = (t_backward1 - t_backward0) * 1000
-        clone_grads_ms = (t_grads1 - t_grads0) * 1000
         optimizer_step_ms = (t_opt1 - t_opt0) * 1000
         state_dump_ms = (t_state_dump1 - t_state_dump0) * 1000
         send_reply_ms = (t_send1 - t_send0) * 1000

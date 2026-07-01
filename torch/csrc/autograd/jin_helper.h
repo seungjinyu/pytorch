@@ -63,7 +63,16 @@ void jin_record_exec(
 
 C10_EXPORT void jin_set_payload_bytes(const void* data, uint64_t nbytes, int64_t step);
 
+C10_EXPORT void jin_patch_payload_bytes(const void* data, uint64_t nbytes, int64_t step);
 
+C10_EXPORT void jin_patch_tensor(
+    const char* key,
+    const void* data,
+    uint64_t nbytes,
+    int32_t dtype_id,
+    const int64_t* shape,
+    uint64_t ndim,
+    int64_t step);
 } // extern "C"
 
 // std::vector<uint8_t> jin_pack_maxpool2x2_flat_indices_to_2bit(

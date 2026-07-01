@@ -1007,6 +1007,108 @@ void jin_overwrite_maxpool2d_indices(at::Tensor& t) {
   }
   // st.maxpool2d_i += 1;
 }
+void jin_patch_payload_bytes(const void* data, uint64_t nbytes, int64_t step) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto& st = S();
+
+  TORCH_CHECK(data != nullptr, "[JIN][PATCH] data is null");
+  TORCH_CHECK(nbytes > 0, "[JIN][PATCH] nbytes=0");
+  TORCH_CHECK(nbytes < (1ULL << 32), "[JIN][PATCH] payload too large");
+
+  st.role = env_cstr("JIN_ROLE");
+  st.payload_path = env_cstr("JIN_PAYLOAD_PATH");
+  if (st.payload_path.empty()) st.payload_path = "/tmp/jin_payload.bin";
+
+  JINState patch_st;
+  patch_st.mem_buf.resize((size_t)nbytes);
+  std::memcpy(patch_st.mem_buf.data(), data, (size_t)nbytes);
+  patch_st.mem_step = step;
+  patch_st.mem_has = true;
+  patch_st.step = step;
+
+  load_payload_from_mem_locked(patch_st);
+
+  for (auto& kv : patch_st.kv_cpu) {
+    st.kv_cpu[kv.first] = kv.second;
+  }
+
+  st.loaded = true;
+  st.step = step;
+
+  std::cerr
+      << "[JIN][PATCH_PAYLOAD] "
+      << "patch_keys=" << patch_st.kv_cpu.size()
+      << " total_keys=" << st.kv_cpu.size()
+      << " step=" << step
+      << "\n";
+}
+
+void jin_patch_tensor(
+    const char* key,
+    const void* data,
+    uint64_t nbytes,
+    int32_t dtype_id,
+    const int64_t* shape,
+    uint64_t ndim,
+    int64_t step) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto& st = S();
+
+  TORCH_CHECK(key != nullptr, "[JIN][PATCH_TENSOR] key is null");
+  TORCH_CHECK(data != nullptr, "[JIN][PATCH_TENSOR] data is null");
+  TORCH_CHECK(shape != nullptr, "[JIN][PATCH_TENSOR] shape is null");
+  TORCH_CHECK(nbytes > 0, "[JIN][PATCH_TENSOR] nbytes=0");
+
+  std::vector<int64_t> sizes;
+  sizes.reserve((size_t)ndim);
+
+  int64_t numel = 1;
+  for (uint64_t i = 0; i < ndim; ++i) {
+    sizes.push_back(shape[i]);
+    numel *= shape[i];
+  }
+
+  at::ScalarType dtype;
+
+  switch (dtype_id) {
+    case 0: dtype = at::kFloat; break;
+    case 1: dtype = at::kDouble; break;
+    case 2: dtype = at::kLong; break;
+    case 3: dtype = at::kInt; break;
+    case 4: dtype = at::kShort; break;
+    case 5: dtype = at::kChar; break;
+    case 6: dtype = at::kByte; break;
+    case 7: dtype = at::kBool; break;
+    default:
+      TORCH_CHECK(false, "[JIN][PATCH_TENSOR] unsupported dtype_id=", dtype_id);
+  }
+
+  auto options = at::TensorOptions()
+      .dtype(dtype)
+      .device(at::kCPU);
+
+  auto tensor = at::empty(sizes, options);
+
+  TORCH_CHECK(
+      (uint64_t)(tensor.nbytes()) == nbytes,
+      "[JIN][PATCH_TENSOR] nbytes mismatch key=", key,
+      " expected=", tensor.nbytes(),
+      " got=", nbytes);
+
+  std::memcpy(tensor.data_ptr(), data, (size_t)nbytes);
+
+  st.kv_cpu[std::string(key)] = tensor;
+  st.loaded = true;
+  st.step = step;
+
+  std::cerr
+      << "[JIN][PATCH_TENSOR] "
+      << "key=" << key
+      << " nbytes=" << nbytes
+      << " total_keys=" << st.kv_cpu.size()
+      << " step=" << step
+      << "\n";
+}
 
 void jin_set_payload_bytes(const void* data, uint64_t nbytes, int64_t step) {
 

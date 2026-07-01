@@ -123,9 +123,28 @@ class FXRecomputeEngine:
 
         for node_name in path[1:]:
 
+            # # if the value for this node is already cached, use it
+            # if node_name in self.node_values:
+
+            #     before_shape = tuple(cur.shape)
+
+            #     cur = self.node_values[node_name]
+
+            #     op_profiles.append(
+            #         (
+            #             node_name + "[cache]",
+            #             before_shape,
+            #             tuple(cur.shape),
+            #             0.0,
+            #         )
+            #     )
+
+            #     continue
+
             op_t0 = time.perf_counter()
 
             before_shape = tuple(cur.shape)
+
             if node_name == "flatten":
                 cur = cur.flatten(1)
 

@@ -6,7 +6,7 @@ from .payload import  payload_from_jin_items
 from .resolver import read_jin1_payload, SavedTensorResolver
 
 from .fx_trace import (
-    build_available_tensors_from_jin1,
+    build_available_tensors_from_payload,
     build_fx_maps,
     build_jin_key_to_fx_node,
     find_nearest_available_start,
@@ -16,6 +16,54 @@ from .recompute import FXRecomputeEngine
 
 ALWAYS_LOCAL_KEYS = set()
 
+def jin_patch_tensor_from_python(key, tensor, step):
+    import ctypes
+    import torch
+    import numpy as np
+
+    lib = ctypes.CDLL(torch._C.__file__)
+
+    fn = lib.jin_patch_tensor
+    fn.argtypes = [
+        ctypes.c_char_p,      # key
+        ctypes.c_void_p,      # raw data
+        ctypes.c_uint64,      # nbytes
+        ctypes.c_int32,       # dtype_id
+        ctypes.c_void_p,      # shape ptr
+        ctypes.c_uint64,      # ndim
+        ctypes.c_int64,       # step
+    ]
+    fn.restype = None
+
+    dtype_map = {
+        torch.float32: 0,
+        torch.float64: 1,
+        torch.int64: 2,
+        torch.int32: 3,
+        torch.int16: 4,
+        torch.int8: 5,
+        torch.uint8: 6,
+        torch.bool: 7,
+    }
+
+    t = tensor.detach().cpu().contiguous()
+
+    if t.dtype not in dtype_map:
+        raise TypeError(f"Unsupported dtype: {t.dtype}")
+
+    arr = t.numpy()
+    shape_arr = np.array(list(t.shape), dtype=np.int64)
+
+    fn(
+        key.encode("utf-8"),
+        ctypes.c_void_p(arr.ctypes.data),
+        ctypes.c_uint64(arr.nbytes),
+        ctypes.c_int32(dtype_map[t.dtype]),
+        ctypes.c_void_p(shape_arr.ctypes.data),
+        ctypes.c_uint64(t.dim()),
+        ctypes.c_int64(step),
+    )
+
 def jin_set_payload_bytes_from_python(payload_bytes, step):
     import ctypes
     import torch
@@ -23,6 +71,27 @@ def jin_set_payload_bytes_from_python(payload_bytes, step):
     lib = ctypes.CDLL(torch._C.__file__)
 
     fn = lib.jin_set_payload_bytes
+    fn.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        ctypes.c_int64,
+    ]
+    fn.restype = None
+
+    buf = ctypes.create_string_buffer(payload_bytes)
+    fn(
+        ctypes.cast(buf, ctypes.c_void_p),
+        ctypes.c_uint64(len(payload_bytes)),
+        ctypes.c_int64(step),
+    )
+
+def jin_patch_payload_bytes_from_python(payload_bytes, step):
+    import ctypes
+    import torch
+
+    lib = ctypes.CDLL(torch._C.__file__)
+
+    fn = lib.jin_patch_payload_bytes
     fn.argtypes = [
         ctypes.c_void_p,
         ctypes.c_uint64,
@@ -394,7 +463,10 @@ class SplitRuntime:
         out_dummy = self.model(x_dummy)
         t1 = time.perf_counter()
         dummy_forward_ms = (t1 - t0) * 1000
-        
+
+        from .fx_trace import debug_fx_shapes
+        debug_fx_shapes(self.model, x_dummy)
+
         t0 = time.perf_counter()
         if "model.output" not in payload.tensors:
             raise KeyError("payload does not contain 'model.output'")
@@ -462,15 +534,18 @@ class SplitRuntime:
                 payload_path=payload_path,
                 device=x_dummy.device,
             )
+            t1 = time.perf_counter()
+            recompute_ms = (t1 - t0 ) * 1000
 
+            t0 = time.perf_counter()
             inject_recomputed_tensors(
                 payload=payload,
                 payload_path=payload_path,
                 recomputed=recomputed,
             )
-
+            
             t1 = time.perf_counter()
-            recompute_ms = (t1 - t0 ) * 1000
+            injected_ms = (t1 - t0 ) * 1000
 
             missing_keys = sorted([
                 k for k in required_keys
@@ -521,6 +596,7 @@ class SplitRuntime:
             f"loss_build_ms={loss_build_ms:.3f} "
             f"required_check_ms={required_check_ms:.3f} "
             f"recompute_ms={recompute_ms:.3f} "
+            f"injected_ms={injected_ms:.3f} "
             f"torch_backward_ms={torch_backward_ms:.3f} "
             f"grad_dump_ms={grad_dump_ms:.3f} "
             f"total_backward_jin_ms={total_backward_jin_ms:.3f}",
@@ -558,15 +634,21 @@ class SplitRuntime:
 
         payload_keys = set(payload.tensors.keys())
 
-        available_tensors = build_available_tensors_from_jin1(
+        available_tensors = build_available_tensors_from_payload(
             model=self.model,
-            payload_keys=payload_keys,
-            payload_path=payload_path,
+            payload=payload,
             device=device,
         )
 
         node_map = build_fx_maps(self.model)
-        key_to_node = build_jin_key_to_fx_node(self.model)
+
+        reverse_order = True
+
+        key_to_node = build_jin_key_to_fx_node(
+            self.model,
+            reverse_order=reverse_order,
+        )
+
         available_tensor_nodes = set(available_tensors.keys())
 
         gm = getattr(self, "fx_gm",None)
@@ -579,6 +661,13 @@ class SplitRuntime:
 
         recomputed = {}
 
+        from collections import defaultdict
+
+        groups = defaultdict(list)
+
+        find_ms = 0.0
+        path_ms = 0.0
+
         for key in recomputable:
             if key not in key_to_node:
                 print(f"[B][RECOMPUTE_SKIP] no FX target for key={key}")
@@ -586,25 +675,32 @@ class SplitRuntime:
 
             target_node = key_to_node[key]
 
+            t0 = time.perf_counter()
             start = find_nearest_available_start(
                 node_map=node_map,
                 node_name=target_node,
                 available_nodes=available_tensor_nodes,
             )
+            t1 = time.perf_counter()
 
             if start is None:
                 print(f"[B][RECOMPUTE_SKIP] no start tensor for key={key}")
                 continue
-
+            
             path = build_path_from_start_to_node(
                 node_map=node_map,
                 start_node=start,
                 target_node=target_node,
             )
+            t2 = time.perf_counter()
+
+            find_ms += (t1 - t0) * 1000
+            path_ms += (t2 - t1) * 1000
 
             if not path:
                 print(f"[B][RECOMPUTE_SKIP] empty path for key={key}")
                 continue
+            groups[start].append((key, target_node, path))
 
             print(
                 f"[B][RECOMPUTE_PATH] key={key} "
@@ -613,26 +709,67 @@ class SplitRuntime:
                 flush=True,
             )
 
-            out = recompute_engine.recompute_path(
-                start_tensor=available_tensors[start],
-                path=path,
-            )
+        print(
+            f"[B][RECOMPUTE_GROUPS] "
+            f"num_groups={len(groups)} "
+            f"sizes={[(s, len(v)) for s, v in groups.items()]}",
+            flush=True,
+        )
+        print(
+            f"[RECOMPUTE_PLAN_PROFILE] "
+            f"find_start_ms={find_ms:.3f} "
+            f"build_path_ms={path_ms:.3f}"
+        )
 
-            if out is None:
+        for start, items in groups.items():
+
+            # start tensor도 recompute_engine cache에 등록
+            #
+            if start not in recompute_engine.node_values:
+                recompute_engine.node_values[start] = available_tensors[start]
+
+            items = sorted(items, key=lambda x: len(x[2]), reverse=True)
+
+            for key, target_node, path in items:
                 print(
-                    f"[B][RECOMPUTE_UNSAFE_SKIP] key={key} "
-                    f"start={start} path={' -> '.join(path)}",
+                    f"[B][RECOMPUTE_GROUP] key={key} "
+                    f"start={start} target={target_node} "
+                    f"path={'->'.join(path)}",
                     flush=True,
                 )
-                continue
 
-            recomputed[key] = out.detach().cpu().contiguous()
+                if target_node in recompute_engine.node_values:
+                    out = recompute_engine.node_values[target_node]
+                    print(
+                        f"[B][RECOMPUTE_CACHE_HIT] key={key} "
+                        f"target={target_node} shape={tuple(out.shape)}",
+                        flush=True,
+                    )
+                else:
+                    out = recompute_engine.recompute_path(
+                        start_tensor=recompute_engine.node_values[start],
+                        path=path,
+                    )
 
-            print(
-                f"[B][RECOMPUTE_OK] key={key} "
-                f"start={start} shape={tuple(out.shape)}",
-                flush=True,
-            )
+                if out is None:
+                    print(
+                        f"[B][RECOMPUTE_UNSAFE_SKIP] key={key} "
+                        f"start={start} path={' -> '.join(path)}",
+                        flush=True,
+                    )
+                    continue
+
+
+                recomputed[key] = out.detach().cpu().contiguous()
+
+                available_tensors[target_node] = out
+                available_tensor_nodes.add(target_node)
+
+                print(
+                    f"[B][RECOMPUTE_OK] key={key} "
+                    f"start={start} shape={tuple(out.shape)}",
+                    flush=True,
+                )
 
         return recomputed
 
@@ -659,19 +796,25 @@ def inject_recomputed_tensors(payload, payload_path, recomputed):
     )
 
     t0 = time.perf_counter()
-    payload_bytes = payload.to_jin1_bytes()
-    t1 = time.perf_counter()
-    to_jin1_bytes_ms = (t1 - t0) * 1000
 
     step = int(os.environ.get("JIN_STEP", "0"))
 
-    t0 = time.perf_counter()
-    jin_set_payload_bytes_from_python(
-        payload_bytes=payload_bytes,
-        step=step,
-    )
+    patch_tensor_ms = 0.0
+
+    for key, tensor in recomputed.items():
+        tt0 = time.perf_counter()
+        jin_patch_tensor_from_python(
+            key=key,
+            tensor=tensor,
+            step=step,
+        )
+        tt1 = time.perf_counter()
+        patch_tensor_ms += (tt1 - tt0) * 1000
+
     t1 = time.perf_counter()
-    set_payload_bytes_ms = (t1 - t0) * 1000
+
+    to_jin1_bytes_ms = 0.0
+    set_payload_bytes_ms = patch_tensor_ms
 
     profile_t1 = time.perf_counter()
     total_ms = (profile_t1 - profile_t0) * 1000

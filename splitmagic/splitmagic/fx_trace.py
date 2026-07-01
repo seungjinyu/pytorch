@@ -13,6 +13,83 @@ SUPPORTED_RECOMPUTE_TYPES = {
     "reshape",   
 }
 
+def build_fx_node_list_with_shapes(model, sample_input):
+    gm = fx.symbolic_trace(model)
+    module_map = dict(model.named_modules())
+
+    env = {}
+    nodes = []
+
+    with torch.no_grad():
+        for node in gm.graph.nodes:
+            info = {
+                "name": node.name,
+                "op": node.op,
+                "target": str(node.target),
+                "args": [a.name for a in node.args if hasattr(a, "name")],
+                "type": None,
+                "shape": None,
+            }
+
+            if node.op == "placeholder":
+                env[node.name] = sample_input
+
+            elif node.op == "call_module":
+                mod = module_map[str(node.target)]
+                args = [env[a.name] if hasattr(a, "name") else a for a in node.args]
+                out = mod(*args)
+                env[node.name] = out
+                info["type"] = mod.__class__.__name__
+                if torch.is_tensor(out):
+                    info["shape"] = tuple(out.shape)
+
+            elif node.op == "call_function":
+                args = [env[a.name] if hasattr(a, "name") else a for a in node.args]
+                out = node.target(*args)
+                env[node.name] = out
+                info["type"] = getattr(node.target, "__name__", str(node.target))
+                if torch.is_tensor(out):
+                    info["shape"] = tuple(out.shape)
+
+            elif node.op == "call_method":
+                args = [env[a.name] if hasattr(a, "name") else a for a in node.args]
+                out = getattr(args[0], node.target)(*args[1:])
+                env[node.name] = out
+                info["type"] = str(node.target)
+                if torch.is_tensor(out):
+                    info["shape"] = tuple(out.shape)
+
+            elif node.op == "output":
+                pass
+
+            nodes.append(info)
+
+    return nodes
+
+def debug_fx_shapes(model, sample_input):
+    nodes = build_fx_node_list_with_shapes(model, sample_input)
+
+    print("[FX-SHAPE][ReLU]")
+    for n in nodes:
+        if n["type"] in ("ReLU", "relu"):
+            print(
+                f"  node={n['name']} "
+                f"type={n['type']} "
+                f"shape={n['shape']} "
+                f"args={n['args']}",
+                flush=True,
+            )
+
+    print("[FX-SHAPE][BN]")
+    for n in nodes:
+        if n["type"] == "BatchNorm2d":
+            print(
+                f"  node={n['name']} "
+                f"shape={n['shape']} "
+                f"input={n['args'][0] if n['args'] else None}",
+                flush=True,
+            )
+
 def build_fx_node_list(model):
     gm = fx.symbolic_trace(model)
 
@@ -120,7 +197,8 @@ def trace_fx_node_recursive(node_map, node_name, depth=0, seen=None):
             seen,
         )
 
-def build_jin_key_to_fx_node(model):
+def build_jin_key_to_fx_node(model, reverse_order=True):
+
     nodes = build_fx_node_list(model)
 
     conv_nodes = []
@@ -141,15 +219,18 @@ def build_jin_key_to_fx_node(model):
         elif n["type"] == "BatchNorm2d":
             bn_nodes.append(n)
 
-    # IMPORTANT:
-    # Autograd saved tensors are collected in backward graph order.
-    # FX nodes are in forward order.
-    # So JIN indices must be matched to reversed FX op lists.
-    conv_nodes = list(reversed(conv_nodes))
-    relu_nodes = list(reversed(relu_nodes))
-    pool_nodes = list(reversed(pool_nodes))
-    linear_nodes = list(reversed(linear_nodes))
-    bn_nodes = list(reversed(bn_nodes))
+    print(
+        f"[FX-MAP-CONFIG] model={model.__class__.__name__} "
+        f"reverse_order={reverse_order}",
+        flush=True,
+    )
+
+    if reverse_order:
+        conv_nodes = list(reversed(conv_nodes))
+        relu_nodes = list(reversed(relu_nodes))
+        pool_nodes = list(reversed(pool_nodes))
+        linear_nodes = list(reversed(linear_nodes))
+        bn_nodes = list(reversed(bn_nodes))
 
     mapping = {}
 
@@ -168,6 +249,15 @@ def build_jin_key_to_fx_node(model):
     for i, n in enumerate(linear_nodes):
         if n["args"]:
             mapping[f"graph:addmm:{i}:mat1"] = n["args"][0]
+
+    for i, n in enumerate(bn_nodes):
+        print(
+            f"[FX-BN-MAP] i={i} "
+            f"key=graph:bn:{i}:input "
+            f"target={n['args'][0] if n['args'] else None} "
+            f"bn_node={n['name']}",
+            flush=True,
+        )
     for i, n in enumerate(bn_nodes):
         if n["args"]:
             mapping[f"graph:bn:{i}:input"] = n["args"][0]
@@ -176,7 +266,10 @@ def build_jin_key_to_fx_node(model):
 
 def explain_jin_key(model, key):
     node_map = build_fx_maps(model)
-    key_to_node = build_jin_key_to_fx_node(model)
+
+    reverse_order = not model.__class__.__name__.lower().startswith("vgg")
+
+    key_to_node = build_jin_key_to_fx_node(model,reverse_order=True)
 
     print(f"[FX-TRACE] {key}")
 
@@ -397,26 +490,32 @@ def analyze_recompute_for_missing_keys(model, missing_keys, available_nodes=None
 
     return results
 
-def build_available_tensors_from_jin1(model, payload_path, payload_keys, device=None):
-    from .resolver import read_jin1_tensor
+def build_available_tensors_from_payload(model, payload, device=None):
+    reverse_order = True
 
-    key_to_node = build_jin_key_to_fx_node(model)
+    print(
+        f"[FX-MAP-CONFIG] model={model.__class__.__name__} "
+        f"reverse_order={reverse_order}",
+        flush=True,
+    )
+
+    key_to_node = build_jin_key_to_fx_node(
+        model,
+        reverse_order=reverse_order,
+    )
+
     available_tensors = {}
 
-    for key in payload_keys:
+    for key, tensor in payload.tensors.items():
         if key.endswith(":indices"):
             continue
 
         if key not in key_to_node:
             continue
-        
+
         node_name = key_to_node[key]
 
-        try:
-            t = read_jin1_tensor(payload_path, key)
-        except KeyError:
-            continue
-
+        t = tensor.detach()
         if device is not None:
             t = t.to(device)
 
@@ -424,7 +523,8 @@ def build_available_tensors_from_jin1(model, payload_path, payload_keys, device=
 
         print(
             f"[FX-AVAILABLE] {key} -> {node_name} "
-            f"shape={tuple(t.shape)} dtype={t.dtype}"
+            f"shape={tuple(t.shape)} dtype={t.dtype}",
+            flush=True,
         )
 
     return available_tensors

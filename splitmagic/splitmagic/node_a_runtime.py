@@ -176,7 +176,6 @@ def drop_payload_keys(payload, drop_keys=None):
 def run_node_a(
     model,
     train_loader,
-    test_loader,
     endpoint="tcp://127.0.0.1:5555",
     csv_path="node_a_timing.csv",
     num_epochs=10,
@@ -190,7 +189,6 @@ def run_node_a(
     auto_drop_ratio=0.5,
     enable_alias=True,
     recompute_policy_name=None,
-    send_grads=False,
 ):
     # environment setting
     os.environ["JIN_ROLE"] = "A"
