@@ -1,4 +1,6 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import os 
 import time 
 
@@ -274,19 +276,26 @@ class SplitRuntime:
         if self.role not in ("A","B"):
             raise ValueError("Role must be either 'A' or 'B'")
 
-    def capture_jin_forward_plan(self, x, y, plan):
 
+    def capture_jin_forward_plan(self, x, y, plan):
+        #
+        # Step 1. Build lookup queues from backward execution plan
+        # Step 2. Define tensors saving and forward hooks
+        # Step 3. Register forward hooks to capture the saved tensors
+        # Step 4. Run the forward pass and capture
+        # Step 5. Verify no plan keys are left
+        # Step 6. Build payload from captured tensors
+        #
+
+        # Check that the role is 'A' since only Node A can capture tensors during the forward pass
         if self.role != "A":
             raise RuntimeError("Only role 'A' can capture tensors")
-
-        import torch
-        import torch.nn as nn
-        import torch.nn.functional as F
-
-        # self.model.train()
-        
+    
         tensors = {}
+
         handles = []
+
+        # Step 1: Build lookup queues from backward execution plan
         queues = {}
 
         for e in plan:
@@ -303,8 +312,10 @@ class SplitRuntime:
             key = f"graph:{op}:{idx}:{suffix}"
             queues.setdefault((op, suffix), []).append(key)
 
-        # plan은 backward order, forward hook은 forward order
-        # 그래서 각 op/suffix queue를 뒤집음
+        # Dry-run plan is generated in backward execution order,
+        # but forward hooks are called in forward execution order,
+        # Reverse each ( op, suffix ) queue so that pop_key() returns
+        # the key that corresponds to the current forward hook. 
         for k in queues:
             queues[k] = list(reversed(queues[k]))
 
@@ -314,10 +325,12 @@ class SplitRuntime:
                 raise RuntimeError(f"[A][PLAN_KEY_EMPTY] op={op} suffix={suffix}")
             return q.pop(0)
 
+        # Step 2: Define tensors saving and forward hooks
+        # save_tensor는 hook에서 호출되어 tensor를 저장
         def save_tensor(key, tensor):
             tensors[key] = tensor.detach().cpu().contiguous()
 
-        # make a hook to save the saved tensors
+        # make_hook는 각 모듈에 대한 forward hook을 생성
         def make_hook(module):
             def hook(mod, inputs, output):
                 if len(inputs) == 0:
@@ -326,11 +339,12 @@ class SplitRuntime:
                 inp = inputs[0]
 
                 if isinstance(mod, nn.Conv2d):
+                    # ConvBackward needs the forward input tensor.
                     key = pop_key("conv", "input")
                     save_tensor(key, inp)
 
                 elif isinstance(mod, nn.BatchNorm2d):
-                    # BN backward saved input
+                    # BatchNormBackward needs the forward input and normalization statistics.
                     save_tensor(pop_key("bn", "input"), inp)
 
                     # BN weight
@@ -350,15 +364,18 @@ class SplitRuntime:
                     save_tensor(pop_key("bn", "result2"), invstd)
 
                 elif isinstance(mod, nn.ReLU):
-                    # 
+                    # ReLUBackward needs the forward output/result tensor. 
                     key = pop_key("relu", "result")
                     save_tensor(key, output)
-                    
+                
                 elif isinstance(mod, nn.Linear):
+                    # Linear is represented as AddmmBackward in autograd.
+                    # AddmmBackward needs the mat1, which corresponds to the forward input.
                     key = pop_key("addmm", "mat1")
                     save_tensor(key, inp)
 
                 elif isinstance(mod, nn.MaxPool2d):
+                    # MaxPool2dBackward needs both the forward input and pooling indices.
                     save_tensor(pop_key("maxpool2d", "input"), inp)
 
                     _, indices = F.max_pool2d(
@@ -375,7 +392,7 @@ class SplitRuntime:
 
             return hook
 
-        # register the hooks
+        # Step 3: Register forward hooks to capture the saved tensors
         for _, m in self.model.named_modules():
             if isinstance(
                 m,
@@ -389,6 +406,7 @@ class SplitRuntime:
             ):
                 handles.append(m.register_forward_hook(make_hook(m)))
 
+        # Step 4: Run the forward pass and capture
         try:
             out = self.model(x)
         finally:
@@ -397,7 +415,11 @@ class SplitRuntime:
 
         tensors["model.output"] = out.detach().cpu().contiguous()
 
-        # 남은 queue가 있으면 A forward에서 못 채운 saved tensor가 있다는 뜻
+        # Step 5: Verify no plan keys are left
+        # If any queue still has keys, the plan expected a tensor
+        # that was not captured by the forward hooks.
+        # This usually means a mismatch between the dry-run plan
+        # and the actual model forward execution.
         leftovers = {
             f"{op}:{suffix}": len(q)
             for (op, suffix), q in queues.items()
@@ -407,6 +429,7 @@ class SplitRuntime:
         if leftovers:
             raise RuntimeError(f"[A][PLAN_KEYS_LEFTOVER] {leftovers}")
 
+        # Step 6: Build payload from captured tensors
         items = []
         for key, tensor in tensors.items():
             items.append({
@@ -421,6 +444,7 @@ class SplitRuntime:
                 "requires_grad": False,
             })
 
+        
         payload = payload_from_jin_items(items)
 
         payload.meta = getattr(payload, "meta", {})

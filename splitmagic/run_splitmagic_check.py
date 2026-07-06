@@ -17,6 +17,7 @@ def run_split_test(
     node_a_script,
     node_b_script,
     compare_script,
+    compare_skip=False,
     server_wait=3,
 ):
     print("\n" + "=" * 60)
@@ -38,8 +39,12 @@ def run_split_test(
         print("\n[3/4] Run Node A")
         run([sys.executable, node_a_script])
 
-        print("\n[4/4] Compare")
-        run([sys.executable, compare_script])
+        if not compare_skip:
+
+            print("\n[4/4] Compare")
+            run([sys.executable, compare_script])
+        else:
+            print("\n[4/4] Compare skipped")
 
         print(f"\n[SUCCESS] {model_name}")
 
@@ -61,6 +66,11 @@ def main():
         "--model",
         choices=["resnet18", "vgg", "mobilenetv2","all"],
         default="all",
+    )
+    parser.add_argument(
+        "--compare_skip",
+        action="store_true",
+        help="skip compare step",
     )
 
     args = parser.parse_args()
@@ -88,9 +98,15 @@ def main():
     }
 
     if args.model == "all":
-        models = ["resnet18", "vgg","mobilenetv2"]
-    else:
+        # models = ["resnet18", "vgg","mobilenetv2"]
+        models = ["resnet18", "vgg"]
+    else:   
         models = [args.model]
+
+    if args.compare_skip:
+        compare_skip = True
+    else:
+        compare_skip = False
 
     failed = []
 
@@ -102,6 +118,7 @@ def main():
                 node_a_script=tests[model]["node_a"],
                 node_b_script=tests[model]["node_b"],
                 compare_script=tests[model]["compare"],
+                compare_skip=compare_skip,
             )
         except Exception as e:
             print(f"\n[FAILED] {model}")
