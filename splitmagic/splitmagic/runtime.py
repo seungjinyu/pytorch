@@ -265,6 +265,11 @@ class SplitRuntime:
     def __init__(self, model, role: str):
         self.model = model 
         self.role = role.upper()
+
+        self.enable_recompute_profile = (
+            os.getenv("JIN_RECOMPUTE_PROFILE", "0") == "1"
+        )
+
         try:
             import torch.fx as fx
             self.fx_gm = fx.symbolic_trace(self.model)
@@ -684,6 +689,7 @@ class SplitRuntime:
         )
 
         recomputed = {}
+        recompute_records = []
 
         from collections import defaultdict
 
@@ -770,10 +776,45 @@ class SplitRuntime:
                         flush=True,
                     )
                 else:
+                    start_tensor = recompute_engine.node_values[start]
+
+                    if self.enable_recompute_profile:
+                        recompute_engine.profile_path(
+                            start_tensor=start_tensor,
+                            path=path,
+                            repeat=100,
+                            warmup=10,
+                        )
+
+                        cost_ms, missing = recompute_engine.estimate_recompute_cost(path)
+
+                        print(
+                            f"[RECOMPUTE_ESTIMATE] "
+                            f"path={' -> '.join(path)} "
+                            f"cost_ms={cost_ms:.6f} "
+                            f"missing={missing}",
+                            flush=True,
+                        )
+
                     out = recompute_engine.recompute_path(
-                        start_tensor=recompute_engine.node_values[start],
+                        start_tensor=start_tensor,
                         path=path,
                     )
+                    if self.enable_recompute_profile:
+                        out_bytes = out.numel() * out.element_size()
+                        out_mb = out_bytes / 1024 / 1024
+
+                        recompute_records.append({
+                            "key": key,
+                            "start": start,
+                            "target": target_node,
+                            "path_len": len(path),
+                            "cost_ms": cost_ms,
+                            "out_bytes": out_bytes,
+                            "out_mb": out_mb,
+                            "missing": ",".join(missing),
+                            "path": " -> ".join(path),
+                        })
 
                 if out is None:
                     print(
@@ -794,6 +835,35 @@ class SplitRuntime:
                     f"start={start} shape={tuple(out.shape)}",
                     flush=True,
                 )
+
+        if self.enable_recompute_profile:
+            import csv
+
+            path_csv = "./recompute_estimate.csv"
+
+            with open(path_csv, "w", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "key",
+                        "start",
+                        "target",
+                        "path_len",
+                        "cost_ms",
+                        "out_bytes",
+                        "out_mb",
+                        "missing",
+                        "path",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerows(recompute_records)
+
+            recompute_engine.save_profile_db_csv(
+                "./recompute_layer_profile.csv"
+            )
+
+            print(f"[PROFILE_SAVE] recompute_estimate_csv={path_csv}", flush=True)
 
         return recomputed
 

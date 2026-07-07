@@ -5,18 +5,35 @@ import torch
 class FXRecomputeEngine:
     def __init__(self, model, gm=None, node_values=None):
         self.model = model
-        self.modules = dict(model.named_modules())
+        self.modules = dict(model.named_modules())        
 
         self.gm = gm 
         self.node_values = node_values or {}
 
         self.fx_nodes = {}
 
+        self.current_start = None
+
+        self.profile_db ={} # node_name -> avg_ms
+
         if gm is not None :
             self.fx_nodes = {
                 n.name: n
                 for n in gm.graph.nodes
             }
+
+
+    def _get_module_for_node(self, node_name):
+        if node_name in self.modules:
+            return self.modules[node_name]
+
+        module_key = node_name.replace("_", ".")
+
+        if module_key in self.modules:
+            return self.modules[module_key]
+
+        return None
+    
     def _value_for_node(self, node_name):
         if node_name in self.node_values:
             return self.node_values[node_name]
@@ -118,35 +135,13 @@ class FXRecomputeEngine:
         self.current_start = path[0]
         self.node_values[path[0]] = start_tensor
 
-        # print(f"[RECOMPUTE] start path={' -> '.join(path)}")
-        op_profiles = []
-
         for node_name in path[1:]:
 
-            # # if the value for this node is already cached, use it
-            # if node_name in self.node_values:
 
-            #     before_shape = tuple(cur.shape)
-
-            #     cur = self.node_values[node_name]
-
-            #     op_profiles.append(
-            #         (
-            #             node_name + "[cache]",
-            #             before_shape,
-            #             tuple(cur.shape),
-            #             0.0,
-            #         )
-            #     )
-
-            #     continue
-
-            op_t0 = time.perf_counter()
-
-            before_shape = tuple(cur.shape)
 
             if node_name == "flatten":
                 cur = cur.flatten(1)
+                self.node_values[node_name] = cur
 
             elif node_name == "view":
                 raise NotImplementedError("view recompute needs shape info")
@@ -156,73 +151,29 @@ class FXRecomputeEngine:
             
             elif node_name.startswith("add"):
                 
-                before_shape = tuple(cur.shape)
-
                 cur = self._compute_add(node_name, cur)
-
                 self.node_values[node_name] = cur
 
-                print(
-                    f"[RECOMPUTE] {node_name} "
-                    f"{before_shape} -> {tuple(cur.shape)}",
-                    flush=True,
-                )
             elif "relu" in node_name and node_name not in self.modules:
-                before_shape = tuple(cur.shape)
+
                 cur = torch.relu(cur)
                 self.node_values[node_name] = cur
 
-                print(
-                    f"[RECOMPUTE] {node_name} "
-                    f"{before_shape} -> {tuple(cur.shape)}",
-                    flush=True,
-                )
             else:
 
-                module_key = node_name.replace("_", ".")
+                module = self._get_module_for_node(node_name)
 
-                if module_key not in self.modules:
+                if module is None:
                     print(
-                        f"[RECOMPUTE_SKIP_NODE] "
-                        f"node={node_name} "
-                        f"module_key={module_key}",
+                        f"[RECOMPUTE_SKIP_NODE] node={node_name}",
                         flush=True,
                     )
                     continue
-                else:
+                cur = module(cur)
+                self.node_values[node_name] = cur
 
-                    module = self.modules[module_key]
-                    cur = module(cur)
-                    self.node_values[node_name] = cur
-
-            op_t1 = time.perf_counter()
-            op_profiles.append(
-                (
-                    node_name,
-                    before_shape,
-                    tuple(cur.shape),
-                    (op_t1 - op_t0) * 1000,
-                )
-            )
-
-        total_ms = sum(x[3] for x in op_profiles)
-
-        print(
-            f"[RECOMPUTE][PATH_PROFILE] "
-            f"path_len={len(path)} "
-            f"total_ms={total_ms:.3f}",
-            flush=True,
-        )
-
-        for node_name, before_shape, after_shape, ms in op_profiles:
-            print(
-                f"[RECOMPUTE][OP_PROFILE] "
-                f"node={node_name} "
-                f"shape={before_shape}->{after_shape} "
-                f"ms={ms:.3f}",
-                flush=True,
-            )
         return cur
+    
     def _compute_node_from_any_available(self, target_node_name):
         if target_node_name in self.node_values:
             return self.node_values[target_node_name]
@@ -268,3 +219,128 @@ class FXRecomputeEngine:
         )
 
         return out
+    
+    def estimate_recompute_cost(self, path):
+        total_ms = 0.0
+        missing = []
+
+        for node_name in path[1:]:
+            if node_name in self.profile_db:
+                total_ms += self.profile_db[node_name]
+            else:
+                missing.append(node_name)
+
+        return total_ms, missing
+    
+    @torch.no_grad()
+    def profile_module(self, node_name, input_tensor, repeat = 100 , warmup = 10):
+
+        module = self._get_module_for_node(node_name)
+
+        if module is None:
+            raise RuntimeError(f"[PROFILE] no module for node={node_name}")
+        was_training = module.training
+        module.eval()
+
+        x = input_tensor.detach()
+
+        # warmup 
+        for _ in range(warmup):
+            _ = module(x)
+
+        if x.is_cuda:
+            torch.cuda.synchronize()
+
+        t0 = time.perf_counter()
+
+        for _ in range(repeat):
+            _ = module(x)
+        
+        if x.is_cuda:
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+
+        module.train(was_training)
+
+        avg_ms = (t1 - t0) * 1000 / repeat
+        self.profile_db[node_name] = avg_ms
+        return avg_ms
+    
+    @torch.no_grad()
+    def profile_path(self, start_tensor, path, repeat=100, warmup=10):
+        cur = start_tensor.detach()
+        self.current_start = path[0]
+        self.node_values[path[0]] = start_tensor
+
+        for node_name in path[1:]:
+
+            if node_name == "flatten":
+                self.profile_db[node_name] = 0.0
+                cur = cur.flatten(1)
+                continue
+
+            if node_name.startswith("add"):
+                self.profile_db[node_name] = 0.0
+                cur = self._compute_add(node_name, cur)
+                continue
+
+            if "relu" in node_name and self._get_module_for_node(node_name) is None:
+                # functional relu
+                for _ in range(warmup):
+                    _ = torch.relu(cur)
+
+                if cur.is_cuda:
+                    torch.cuda.synchronize()
+
+                t0 = time.perf_counter()
+
+                for _ in range(repeat):
+                    _ = torch.relu(cur)
+
+                if cur.is_cuda:
+                    torch.cuda.synchronize()
+
+                t1 = time.perf_counter()
+
+                avg_ms = (t1 - t0) * 1000.0 / repeat
+                self.profile_db[node_name] = avg_ms
+
+                print(f"[PROFILE] {node_name} avg_ms: {avg_ms:.6f}")
+
+                cur = torch.relu(cur)
+                continue
+
+            module = self._get_module_for_node(node_name)
+
+            if module is None:
+                print(f"[PROFILE_SKIP_NODE] node={node_name}", flush=True)
+                continue
+
+            if node_name in self.profile_db:
+                cur = module(cur)
+                continue
+
+            avg_ms = self.profile_module(
+                node_name=node_name,
+                input_tensor=cur,
+                repeat=repeat,
+                warmup=warmup,
+            )
+
+            print(f"[PROFILE] {node_name} avg_ms: {avg_ms:.6f}")
+
+            cur = module(cur)
+
+        return dict(self.profile_db)
+    
+    def save_profile_db_csv(self, path="./recompute_layer_profile.csv"):
+        import csv
+        with open(path, "w") as f:
+
+            writer = csv.writer(f)
+            writer.writerow(["node_name", "avg_ms"])
+
+            for node_name, avg_ms in self.profile_db.items():
+                writer.writerow([node_name, avg_ms])
+        
+        print(f"[PROFILE_SAVE] layer_profile_csv={path}", flush=True)

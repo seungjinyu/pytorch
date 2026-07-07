@@ -13,6 +13,9 @@ RECOMPUTE_POLICIES = {
             # bn input
             *{f"graph:bn:{i}:input" for i in range(20)},
             
+            "graph:relu:16:result",
+            "graph:relu:14:result",
+            "graph:relu:12:result",
             "graph:relu:10:result",
             "graph:relu:8:result",
             "graph:relu:6:result",
