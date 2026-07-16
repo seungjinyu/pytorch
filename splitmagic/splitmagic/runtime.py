@@ -529,9 +529,45 @@ class SplitRuntime:
             and (not has_relu_mask_for(k, payload))
         ])
 
+        build_menu = (
+            os.environ.get(
+                "JIN_BUILD_RECOMPUTE_MENU",
+                "0",
+            )
+            == "1"
+        )
+
+        step = int(
+            os.environ.get(
+                "JIN_STEP",
+                "0",
+            )
+        )
+
+        if build_menu and step == 0:
+            candidate_keys = sorted(
+                key
+                for key in required_keys
+                if is_recomputable_key(key)
+                and key in payload.tensors
+            )
+
+            self.build_recompute_menu(
+                candidate_keys=candidate_keys,
+                payload=payload,
+                device=x_dummy.device,
+                profile_csv=os.environ.get(
+                    "JIN_RECOMPUTE_PROFILE_PATH",
+                    "./recompute_layer_profile.csv",
+                ),
+                menu_csv=os.environ.get(
+                    "JIN_RECOMPUTE_MENU_PATH",
+                    "./recompute_menu.csv",
+                ),
+            )
+
         t1 = time.perf_counter()
         required_check_ms = (t1 - t0) * 1000
-
         print(
             f"[B][ALIAS_AWARE] aliases={len(aliases)}",
             flush=True,
@@ -546,6 +582,14 @@ class SplitRuntime:
         )
 
         recompute_ms = 0.0
+        injected_ms = 0.0
+
+        missing_count_before = len(missing_keys)
+
+        recompute_stats = {
+            "estimated_grouped_ms": 0.0,
+            "recompute_plan_ms": 0.0,
+        }
 
         if missing_keys:
 
@@ -557,12 +601,13 @@ class SplitRuntime:
 
             t0 = time.perf_counter()
             
-            recomputed = self.recompute_missing_keys(
+            recomputed, recompute_stats = self.recompute_missing_keys(
                 missing_keys=missing_keys,
                 payload=payload,
                 payload_path=payload_path,
                 device=x_dummy.device,
             )
+
             t1 = time.perf_counter()
             recompute_ms = (t1 - t0 ) * 1000
 
@@ -634,6 +679,20 @@ class SplitRuntime:
 
         print("[B][BACKWARD] done")
 
+        self.last_experiment_metrics = {
+            "missing_count": missing_count_before,
+            "estimated_grouped_ms": recompute_stats[
+                "estimated_grouped_ms"
+            ],
+            "recompute_plan_ms": recompute_stats[
+                "recompute_plan_ms"
+            ],
+            "recompute_wall_ms": recompute_ms,
+            "inject_ms": injected_ms,
+            "torch_backward_ms": torch_backward_ms,
+            "backward_jin_ms": total_backward_jin_ms,
+        }
+
         return loss
     def recompute_missing_keys(
         self,
@@ -643,6 +702,7 @@ class SplitRuntime:
         device,
     ):
         
+        estimated_grouped_ms = 0.0
         recomputable = [
             k for k in missing_keys
             if is_recomputable_key(k)
@@ -687,6 +747,12 @@ class SplitRuntime:
             gm=gm,
             node_values=dict(available_tensors)
         )
+        profile_csv = os.environ.get(
+            "JIN_RECOMPUTE_PROFILE_PATH",
+            "./recompute_layer_profile.csv",
+        )
+
+        recompute_engine.load_profile_db_csv(profile_csv)
 
         recomputed = {}
         recompute_records = []
@@ -697,6 +763,7 @@ class SplitRuntime:
 
         find_ms = 0.0
         path_ms = 0.0
+        estimated_grouped_ms = 0.0
 
         for key in recomputable:
             if key not in key_to_node:
@@ -730,11 +797,28 @@ class SplitRuntime:
             if not path:
                 print(f"[B][RECOMPUTE_SKIP] empty path for key={key}")
                 continue
-            groups[start].append((key, target_node, path))
+
+            cost_ms, missing_profile_nodes = (
+                recompute_engine.estimate_recompute_cost(path)
+            )
+
+            groups[start].append(
+                (
+                    key,
+                    target_node,
+                    path,
+                    cost_ms,
+                    missing_profile_nodes,
+                )
+            )
 
             print(
-                f"[B][RECOMPUTE_PATH] key={key} "
-                f"start={start} target={target_node} "
+                f"[B][RECOMPUTE_PATH] "
+                f"key={key} "
+                f"start={start} "
+                f"target={target_node} "
+                f"estimated_ms={cost_ms:.6f} "
+                f"missing_profile={missing_profile_nodes} "
                 f"path={' -> '.join(path)}",
                 flush=True,
             )
@@ -758,63 +842,49 @@ class SplitRuntime:
             if start not in recompute_engine.node_values:
                 recompute_engine.node_values[start] = available_tensors[start]
 
-            items = sorted(items, key=lambda x: len(x[2]), reverse=True)
+            items = sorted(
+                items,
+                key=lambda x: len(x[2]),
+                reverse=True,
+            )
 
-            for key, target_node, path in items:
+            for (
+                key,
+                target_node,
+                path,
+                estimated_ms,
+                missing_profile_nodes,
+            ) in items:
                 print(
-                    f"[B][RECOMPUTE_GROUP] key={key} "
-                    f"start={start} target={target_node} "
-                    f"path={'->'.join(path)}",
+                    f"[B][RECOMPUTE_GROUP] "
+                    f"key={key} "
+                    f"start={start} "
+                    f"target={target_node} "
+                    f"estimated_ms={estimated_ms:.6f} "
+                    f"missing_profile={missing_profile_nodes} "
+                    f"path={' -> '.join(path)}",
                     flush=True,
                 )
 
                 if target_node in recompute_engine.node_values:
                     out = recompute_engine.node_values[target_node]
+
                     print(
-                        f"[B][RECOMPUTE_CACHE_HIT] key={key} "
-                        f"target={target_node} shape={tuple(out.shape)}",
+                        f"[B][RECOMPUTE_CACHE_HIT] "
+                        f"key={key} target={target_node}",
                         flush=True,
                     )
+
                 else:
                     start_tensor = recompute_engine.node_values[start]
 
-                    if self.enable_recompute_profile:
-                        recompute_engine.profile_path(
-                            start_tensor=start_tensor,
-                            path=path,
-                            repeat=100,
-                            warmup=10,
-                        )
-
-                        cost_ms, missing = recompute_engine.estimate_recompute_cost(path)
-
-                        print(
-                            f"[RECOMPUTE_ESTIMATE] "
-                            f"path={' -> '.join(path)} "
-                            f"cost_ms={cost_ms:.6f} "
-                            f"missing={missing}",
-                            flush=True,
-                        )
+                    # 실제 실행되는 path만 grouped estimate에 포함
+                    estimated_grouped_ms += estimated_ms
 
                     out = recompute_engine.recompute_path(
                         start_tensor=start_tensor,
                         path=path,
                     )
-                    if self.enable_recompute_profile:
-                        out_bytes = out.numel() * out.element_size()
-                        out_mb = out_bytes / 1024 / 1024
-
-                        recompute_records.append({
-                            "key": key,
-                            "start": start,
-                            "target": target_node,
-                            "path_len": len(path),
-                            "cost_ms": cost_ms,
-                            "out_bytes": out_bytes,
-                            "out_mb": out_mb,
-                            "missing": ",".join(missing),
-                            "path": " -> ".join(path),
-                        })
 
                 if out is None:
                     print(
@@ -836,37 +906,141 @@ class SplitRuntime:
                     flush=True,
                 )
 
-        if self.enable_recompute_profile:
-            import csv
+        stats = {
+            "estimated_grouped_ms": estimated_grouped_ms,
+            "recompute_plan_ms": find_ms + path_ms,
+        }
 
-            path_csv = "./recompute_estimate.csv"
+        return recomputed, stats
+    
+    def build_recompute_menu(
+        self,
+        candidate_keys,
+        payload,
+        device,
+        profile_csv="./recompute_layer_profile.csv",
+        menu_csv="./recompute_menu.csv",
+    ):
+        import csv
 
-            with open(path_csv, "w", newline="") as f:
-                writer = csv.DictWriter(
-                    f,
-                    fieldnames=[
-                        "key",
-                        "start",
-                        "target",
-                        "path_len",
-                        "cost_ms",
-                        "out_bytes",
-                        "out_mb",
-                        "missing",
-                        "path",
-                    ],
-                )
-                writer.writeheader()
-                writer.writerows(recompute_records)
+        available_tensors_base = build_available_tensors_from_payload(
+            model=self.model,
+            payload=payload,
+            device=device,
+        )
 
-            recompute_engine.save_profile_db_csv(
-                "./recompute_layer_profile.csv"
+        node_map = build_fx_maps(self.model)
+
+        key_to_node = build_jin_key_to_fx_node(
+            self.model,
+            reverse_order=True,
+        )
+
+        engine = FXRecomputeEngine(
+            self.model,
+            gm=getattr(self, "fx_gm", None),
+            node_values=dict(available_tensors_base),
+        )
+
+        engine.load_profile_db_csv(profile_csv)
+
+        rows = []
+
+        for key in candidate_keys:
+            tensor = payload.tensors.get(key)
+
+            if tensor is None:
+                continue
+
+            target_node = key_to_node.get(key)
+
+            if target_node is None:
+                continue
+
+            available_tensors = dict(available_tensors_base)
+            available_tensors.pop(target_node, None)
+
+            start = find_nearest_available_start(
+                node_map=node_map,
+                node_name=target_node,
+                available_nodes=set(available_tensors.keys()),
             )
 
-            print(f"[PROFILE_SAVE] recompute_estimate_csv={path_csv}", flush=True)
+            tensor_mb = (
+                tensor.numel()
+                * tensor.element_size()
+                / 1024
+                / 1024
+            )
 
-        return recomputed
+            if start is None:
+                rows.append({
+                    "key": key,
+                    "tensor_mb": tensor_mb,
+                    "start": "",
+                    "target": target_node,
+                    "path_len": 0,
+                    "individual_cost_ms": "",
+                    "missing_profile": "",
+                    "path": "",
+                })
+                continue
 
+            path = build_path_from_start_to_node(
+                node_map=node_map,
+                start_node=start,
+                target_node=target_node,
+            )
+
+            if not path:
+                continue
+
+            cost_ms, missing_profile = (
+                engine.estimate_recompute_cost(path)
+            )
+
+            rows.append({
+                "key": key,
+                "tensor_mb": tensor_mb,
+                "start": start,
+                "target": target_node,
+                "path_len": len(path),
+                "individual_cost_ms": cost_ms,
+                "missing_profile": ",".join(missing_profile),
+                "path": " -> ".join(path),
+            })
+
+        rows.sort(
+            key=lambda row: row["tensor_mb"],
+            reverse=True,
+        )
+
+        with open(menu_csv, "w", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "key",
+                    "tensor_mb",
+                    "start",
+                    "target",
+                    "path_len",
+                    "individual_cost_ms",
+                    "missing_profile",
+                    "path",
+                ],
+            )
+
+            writer.writeheader()
+            writer.writerows(rows)
+
+        print(
+            f"[RECOMPUTE_MENU_SAVE] "
+            f"path={menu_csv} "
+            f"candidates={len(rows)}",
+            flush=True,
+        )
+
+        return rows
 def inject_recomputed_tensors(payload, payload_path, recomputed):
     profile_t0 = time.perf_counter()
 
@@ -944,4 +1118,5 @@ def is_recomputable_key(key):
     #     return True
 
     return False
+
 

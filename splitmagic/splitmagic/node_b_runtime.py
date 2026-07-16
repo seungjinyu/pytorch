@@ -314,6 +314,13 @@ def run_node_b(
             tensor_policy=req.get("tensor_policy", None),
             dryrun_backward_plan=plan
         )
+
+        experiment_metrics = getattr(
+            runtime_b,
+            "last_experiment_metrics",
+            {},
+        )
+
         t_backward1 = time.perf_counter()
 
         clone_grads_ms = 0.0
@@ -352,12 +359,39 @@ def run_node_b(
 
         t_send0 = time.perf_counter()
 
+        node_b_processing_ms = (
+            t_send0 - t_step0
+        ) * 1000
+
         reply = {
             "status": "ok",
             "step": step,
             "loss": float(loss.detach().cpu()),
             "bytes": req["num_bytes"],
             "updated_state_dict": updated_state,
+
+            "missing_count": experiment_metrics.get(
+                "missing_count", 0
+            ),
+            "estimated_grouped_ms": experiment_metrics.get(
+                "estimated_grouped_ms", 0.0
+            ),
+            "recompute_wall_ms": experiment_metrics.get(
+                "recompute_wall_ms", 0.0
+            ),
+            "recompute_plan_ms": experiment_metrics.get(
+                "recompute_plan_ms", 0.0
+            ),
+            "inject_ms": experiment_metrics.get(
+                "inject_ms", 0.0
+            ),
+            "torch_backward_ms": experiment_metrics.get(
+                "torch_backward_ms", 0.0
+            ),
+            "backward_jin_ms": experiment_metrics.get(
+                "backward_jin_ms", 0.0
+            ),
+            "node_b_processing_ms": node_b_processing_ms,
         }
 
         if send_grads:

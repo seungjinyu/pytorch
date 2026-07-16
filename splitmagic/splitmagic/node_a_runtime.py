@@ -131,9 +131,14 @@ def auto_drop_by_ratio(
         saved += nbytes
 
     payload.meta["auto_dropped_keys"] = dropped
+    payload.meta["drop_ratio"] = float(drop_ratio)
+    payload.meta["dropped_count"] = len(dropped)
+    payload.meta["saved_mb"] = saved / 1024 / 1024
 
     print(
-        f"[AUTO_DROP] ratio={drop_ratio} dropped={len(dropped)} saved_mb={saved / 1024 / 1024:.3f}",
+        f"[AUTO_DROP] ratio={drop_ratio} "
+        f"dropped={len(dropped)} "
+        f"saved_mb={saved / 1024 / 1024:.3f}",
         flush=True,
     )
 
@@ -176,8 +181,10 @@ def drop_payload_keys(payload, drop_keys=None):
 def run_node_a(
     model,
     train_loader,
+    # test_loader=None,
     endpoint="tcp://127.0.0.1:5555",
     csv_path="node_a_timing.csv",
+    experiment_csv_path="drop_ratio_experiment_100mb.csv",
     num_epochs=10,
     max_steps=60000,
     policy="full",
@@ -195,6 +202,10 @@ def run_node_a(
     os.environ.pop("JIN_DRYRUN", None)
     os.environ.pop("JIN_DRYRUN_PATH", None)
     os.environ.pop("JIN_DRYRUN_TENSOR_DIR", None)
+
+    run_id = int(
+        os.environ.get("JIN_EXPERIMENT_RUN_ID", "0")
+    )
 
     # we are assuming node a is running on cpu.
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -234,7 +245,30 @@ def run_node_a(
             "total_ms",
         ],
     )
-
+    experiment_logger = CSVLogger(
+        experiment_csv_path,
+        [
+            "run_id",
+            "drop_ratio",
+            "payload_mb",
+            "saved_mb",
+            "dropped_count",
+            "missing_count",
+            "estimated_grouped_ms",
+            "recompute_wall_ms",
+            "recompute_plan_ms",
+            "inject_ms",
+            "torch_backward_ms",
+            "backward_jin_ms",
+            "request_round_trip_ms",
+            "node_b_processing_ms",
+            "node_a_total_ms",
+            "loss",
+            # "test_loss",
+            # "test_accuracy",
+        ],
+        append=True,
+    )
     # initialize global_step and model train mode settings
     global_step = 0
     model.train()
@@ -337,6 +371,18 @@ def run_node_a(
 
             payload_mb = reply["bytes"] / 1024 / 1024
 
+            drop_ratio_value = float(
+                payload.meta.get("drop_ratio", 0.0)
+            )
+
+            saved_mb = float(
+                payload.meta.get("saved_mb", 0.0)
+            )
+
+            dropped_count = int(
+                payload.meta.get("dropped_count", 0)
+            )
+
             if grad_save_path is not None and "grads" in reply:
                 torch.save(reply["grads"], grad_save_path)
                 print(f"[Node A] saved grads to {grad_save_path}")
@@ -351,6 +397,25 @@ def run_node_a(
                 )
                 
             model.load_state_dict(reply["updated_state_dict"])
+
+            # test_loss = 0.0
+            # test_accuracy = 0.0
+
+            # if test_loader is not None:
+            #     test_loss, test_accuracy = evaluate(
+            #         model=model,
+            #         test_loader=test_loader,
+            #         device=device,
+            #     )
+
+            #     print(
+            #         f"[Node A][EVAL] "
+            #         f"run_id={run_id} "
+            #         f"drop_ratio={drop_ratio_value} "
+            #         f"test_loss={test_loss:.6f} "
+            #         f"test_accuracy={test_accuracy:.6f}",
+            #         flush=True,
+            #     )
 
             t_load1 = time.perf_counter()
             send_recv_ms = (t_send1 - t_send0) * 1000
@@ -391,6 +456,26 @@ def run_node_a(
                     total_ms,
                 ]
             )
+            experiment_logger.write([
+                run_id,
+                drop_ratio_value,
+                payload_mb,
+                saved_mb,
+                dropped_count,
+                reply.get("missing_count", 0),
+                reply.get("estimated_grouped_ms", 0.0),
+                reply.get("recompute_wall_ms", 0.0),
+                reply.get("recompute_plan_ms", 0.0),
+                reply.get("inject_ms", 0.0),
+                reply.get("torch_backward_ms", 0.0),
+                reply.get("backward_jin_ms", 0.0),
+                send_recv_ms,
+                reply.get("node_b_processing_ms", 0.0),
+                total_ms,
+                reply["loss"],
+                # test_loss,
+                # test_accuracy,
+            ])
 
             global_step += 1
 

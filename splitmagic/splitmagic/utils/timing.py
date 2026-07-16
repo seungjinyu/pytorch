@@ -1,21 +1,22 @@
 import csv
-import time
-
-
-class Timer:
-    def __init__(self):
-        self.t0 = time.perf_counter()
-
-    def ms(self):
-        return (time.perf_counter() - self.t0) * 1000
+import os
 
 
 class CSVLogger:
-    def __init__(self, path, header):
+    def __init__(self, path, columns, append=False):
         self.path = path
-        with open(self.path, "w", newline="") as f:
+        self.columns = columns
+
+        file_exists = os.path.exists(path)
+        file_has_content = file_exists and os.path.getsize(path) > 0
+
+        mode = "a" if append else "w"
+
+        with open(self.path, mode, newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(header)
+
+            if not append or not file_has_content:
+                writer.writerow(columns)
 
     def write(self, row):
         with open(self.path, "a", newline="") as f:

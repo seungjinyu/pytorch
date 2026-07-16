@@ -240,7 +240,7 @@ class FXRecomputeEngine:
         if module is None:
             raise RuntimeError(f"[PROFILE] no module for node={node_name}")
         was_training = module.training
-        module.eval()
+        # module.eval()
 
         x = input_tensor.detach()
 
@@ -280,8 +280,45 @@ class FXRecomputeEngine:
                 continue
 
             if node_name.startswith("add"):
-                self.profile_db[node_name] = 0.0
-                cur = self._compute_add(node_name, cur)
+                node = self.fx_nodes[node_name]
+                lhs_name = node.args[0].name
+                rhs_name = node.args[1].name
+
+                lhs = self.node_values.get(lhs_name)
+                rhs = self.node_values.get(rhs_name)
+
+                if lhs is None:
+                    lhs = self._compute_node_from_any_available(lhs_name)
+
+                if rhs is None:
+                    rhs = self._compute_node_from_any_available(rhs_name)
+
+                for _ in range(warmup):
+                    _ = lhs + rhs
+
+                if lhs.is_cuda:
+                    torch.cuda.synchronize()
+
+                t0 = time.perf_counter()
+
+                for _ in range(repeat):
+                    _ = lhs + rhs
+
+                if lhs.is_cuda:
+                    torch.cuda.synchronize()
+
+                t1 = time.perf_counter()
+
+                avg_ms = (t1 - t0) * 1000.0 / repeat
+                self.profile_db[node_name] = avg_ms
+
+                cur = lhs + rhs
+                self.node_values[node_name] = cur
+
+                print(
+                    f"[PROFILE] {node_name} avg_ms={avg_ms:.6f}",
+                    flush=True,
+                )
                 continue
 
             if "relu" in node_name and self._get_module_for_node(node_name) is None:
@@ -344,3 +381,30 @@ class FXRecomputeEngine:
                 writer.writerow([node_name, avg_ms])
         
         print(f"[PROFILE_SAVE] layer_profile_csv={path}", flush=True)
+
+    def load_profile_db_csv(
+        self,
+        path="./recompute_layer_profile.csv",
+    ):
+        import csv
+
+        profile_db = {}
+
+        with open(path, "r", newline="") as f:
+            reader = csv.DictReader(f)
+
+            for row in reader:
+                node_name = row["node_name"]
+                avg_ms = float(row["avg_ms"])
+                profile_db[node_name] = avg_ms
+
+        self.profile_db = profile_db
+
+        print(
+            f"[PROFILE_LOAD] "
+            f"path={path} "
+            f"nodes={len(profile_db)}",
+            flush=True,
+        )
+
+        return dict(self.profile_db)
