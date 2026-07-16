@@ -15,6 +15,9 @@ class FXRecomputeEngine:
         self.current_start = None
 
         self.profile_db ={} # node_name -> avg_ms
+        
+        # 실제 recompute 과정에서 실행된 node 를 순서대로 기록
+        self.executed_recompute_nodes = []
 
         if gm is not None :
             self.fx_nodes = {
@@ -137,30 +140,38 @@ class FXRecomputeEngine:
 
         for node_name in path[1:]:
 
-
-
             if node_name == "flatten":
+                self.executed_recompute_nodes.append(node_name)
+
                 cur = cur.flatten(1)
                 self.node_values[node_name] = cur
 
             elif node_name == "view":
-                raise NotImplementedError("view recompute needs shape info")
+                raise NotImplementedError(
+                    "view recompute needs shape info"
+                )
 
             elif node_name == "reshape":
-                raise NotImplementedError("reshape recompute needs shape info")
-            
+                raise NotImplementedError(
+                    "reshape recompute needs shape info"
+                )
+
             elif node_name.startswith("add"):
-                
+                self.executed_recompute_nodes.append(node_name)
+
                 cur = self._compute_add(node_name, cur)
                 self.node_values[node_name] = cur
 
-            elif "relu" in node_name and node_name not in self.modules:
+            elif (
+                "relu" in node_name
+                and node_name not in self.modules
+            ):
+                self.executed_recompute_nodes.append(node_name)
 
                 cur = torch.relu(cur)
                 self.node_values[node_name] = cur
 
             else:
-
                 module = self._get_module_for_node(node_name)
 
                 if module is None:
@@ -169,6 +180,9 @@ class FXRecomputeEngine:
                         flush=True,
                     )
                     continue
+
+                self.executed_recompute_nodes.append(node_name)
+
                 cur = module(cur)
                 self.node_values[node_name] = cur
 

@@ -6,6 +6,11 @@ import torch
 import torch.nn.functional as F
 from splitmagic import SplitRuntime, ZMQClient
 from splitmagic.recompute_policy import RECOMPUTE_POLICIES
+from splitmagic.cost_policy import (
+    auto_drop_by_cost,
+    load_recompute_cost_table, 
+    load_recompute_calibration,
+)
 from splitmagic.utils.timing import CSVLogger
 
 
@@ -196,6 +201,13 @@ def run_node_a(
     auto_drop_ratio=0.5,
     enable_alias=True,
     recompute_policy_name=None,
+    recompute_calibration_json=None,
+
+    selection_policy="ratio",
+    recompute_cost_csv=None,
+    network_mbps=None,
+    min_benefit_ms=0.0,
+    max_cost_drop_ratio=None,
 ):
     # environment setting
     os.environ["JIN_ROLE"] = "A"
@@ -254,24 +266,94 @@ def run_node_a(
             "saved_mb",
             "dropped_count",
             "missing_count",
+
             "estimated_grouped_ms",
+            "predicted_operator_ms",
+
             "recompute_wall_ms",
-            "recompute_plan_ms",
+            "recompute_overhead_ms",
+            "recompute_prediction_ratio",
+            "recomputed_mb",
             "inject_ms",
+            "total_recompute_cost_ms",
+
+            "recompute_executed_node_count",
+            "recompute_profiled_node_count",
+            "recompute_missing_profile_count",
+
+            "recompute_plan_ms",
             "torch_backward_ms",
             "backward_jin_ms",
+
             "request_round_trip_ms",
             "node_b_processing_ms",
             "node_a_total_ms",
             "loss",
-            # "test_loss",
-            # "test_accuracy",
         ],
         append=True,
     )
     # initialize global_step and model train mode settings
     global_step = 0
     model.train()
+
+    if selection_policy not in {"ratio","cost","none"}:
+        raise ValueError(
+            f"Unsupported selection_policy={selection_policy!r}."
+            "Expected one of: ratio, cost, none"
+        )
+    
+    recompute_cost_table = None
+    recompute_calibration = None
+
+    if selection_policy == "cost":
+        if recompute_cost_csv is None:
+            raise ValueError(
+                "recompute_cost_csv is required "
+                "when selection_policy='cost'"
+            )
+
+        if network_mbps is None or network_mbps <= 0:
+            raise ValueError(
+                "A positive network_mbps is required "
+                "when selection_policy='cost'"
+            )
+
+        recompute_cost_table = load_recompute_cost_table(
+            recompute_cost_csv
+        )
+
+        print(
+            f"[Node A][COST_POLICY_LOAD] "
+            f"path={recompute_cost_csv} "
+            f"entries={len(recompute_cost_table)} "
+            f"network_mbps={network_mbps}",
+            flush=True,
+        )
+
+        if recompute_calibration_json:
+            recompute_calibration = (
+                load_recompute_calibration(
+                    recompute_calibration_json
+                )
+            )
+
+            print(
+                f"[Node A][CALIBRATION_LOAD] "
+                f"path={recompute_calibration_json} "
+                f"operator_scale="
+                f"{recompute_calibration.operator_scale:.6f} "
+                f"recompute_fixed_ms="
+                f"{recompute_calibration.recompute_fixed_ms:.6f} "
+                f"inject_ms_per_mb="
+                f"{recompute_calibration.inject_ms_per_mb:.6f}",
+                flush=True,
+            )
+        else:
+            print(
+                "[Node A][CALIBRATION_LOAD] "
+                "path=None; using uncalibrated costs",
+                flush=True,
+            )
 
     #  raise error if dryrun_plan is False
     if not dryrun_plan:
@@ -332,14 +414,57 @@ def run_node_a(
             t0 = time.perf_counter()
 
             if recompute_policy_name is not None:
-                policy_conf = RECOMPUTE_POLICIES[recompute_policy_name]
-            
-                payload = auto_drop_by_ratio(
-                    payload,
-                    candidate_keys=policy_conf["drop"],
-                    # protected_keys=policy_conf["keep"],
-                    drop_ratio=auto_drop_ratio,
+                policy_conf = RECOMPUTE_POLICIES[
+                    recompute_policy_name
+                ]
+                candidate_keys = policy_conf["drop"]
+
+                print(
+                    f"[Node A][SELECTION_STAGE] "
+                    f"policy={selection_policy}",
+                    flush=True,
                 )
+
+                if selection_policy == "ratio":
+                    payload = auto_drop_by_ratio(
+                        payload,
+                        candidate_keys=candidate_keys,
+                        drop_ratio=auto_drop_ratio,
+                    )
+
+                    payload.meta["selection_policy"] = "ratio"
+
+                elif selection_policy == "cost":
+                    print("[Node A][ENTER_COST]", flush=True)
+
+                    cost0 = time.perf_counter()
+
+                    payload = auto_drop_by_cost(
+                        payload=payload,
+                        candidate_keys=candidate_keys,
+                        cost_table=recompute_cost_table,
+                        network_mbps=network_mbps,
+                        calibration=recompute_calibration,
+                        min_benefit_ms=min_benefit_ms,
+                        max_drop_ratio=max_cost_drop_ratio,
+                    )
+
+                    cost1 = time.perf_counter()
+
+                    print(
+                        "[AUTO_DROP_COST_TABLE_TIME] "
+                        f"{(cost1 - cost0) * 1000:.3f} ms",
+                        flush=True,
+                    )
+
+                elif selection_policy == "none":
+                    payload.meta["selection_policy"] = "none"
+                    payload.meta["auto_dropped_keys"] = []
+                    payload.meta["drop_ratio"] = 0.0
+                    payload.meta["dropped_count"] = 0
+                    payload.meta["saved_mb"] = 0.0
+
+                print("[Node A][SELECTION_END]", flush=True)
             t1 = time.perf_counter()
             auto_drop_ms = (t1 - t0) * 1000
 
@@ -456,6 +581,18 @@ def run_node_a(
                     total_ms,
                 ]
             )
+            recompute_wall_ms_value = float(
+                reply.get("recompute_wall_ms", 0.0)
+            )
+
+            inject_ms_value = float(
+                reply.get("inject_ms", 0.0)
+            )
+
+            total_recompute_cost_ms = (
+                recompute_wall_ms_value
+                + inject_ms_value
+            )
             experiment_logger.write([
                 run_id,
                 drop_ratio_value,
@@ -463,18 +600,38 @@ def run_node_a(
                 saved_mb,
                 dropped_count,
                 reply.get("missing_count", 0),
+
                 reply.get("estimated_grouped_ms", 0.0),
-                reply.get("recompute_wall_ms", 0.0),
+                reply.get("predicted_operator_ms", 0.0),
+
+                recompute_wall_ms_value,
+                reply.get("recompute_overhead_ms", 0.0),
+                reply.get("recompute_prediction_ratio", 0.0),
+                reply.get("recomputed_mb", 0.0),
+                inject_ms_value,
+                total_recompute_cost_ms,
+
+                reply.get(
+                    "recompute_executed_node_count",
+                    0,
+                ),
+                reply.get(
+                    "recompute_profiled_node_count",
+                    0,
+                ),
+                reply.get(
+                    "recompute_missing_profile_count",
+                    0,
+                ),
+
                 reply.get("recompute_plan_ms", 0.0),
-                reply.get("inject_ms", 0.0),
                 reply.get("torch_backward_ms", 0.0),
                 reply.get("backward_jin_ms", 0.0),
+
                 send_recv_ms,
                 reply.get("node_b_processing_ms", 0.0),
                 total_ms,
                 reply["loss"],
-                # test_loss,
-                # test_accuracy,
             ])
 
             global_step += 1

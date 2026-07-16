@@ -583,6 +583,7 @@ class SplitRuntime:
 
         recompute_ms = 0.0
         injected_ms = 0.0
+        recomputed_mb = 0.0
 
         missing_count_before = len(missing_keys)
 
@@ -606,6 +607,14 @@ class SplitRuntime:
                 payload=payload,
                 payload_path=payload_path,
                 device=x_dummy.device,
+            )
+            recomputed_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in recomputed.values()
+            )
+
+            recomputed_mb = (
+                recomputed_bytes / 1024 / 1024
             )
 
             t1 = time.perf_counter()
@@ -639,7 +648,35 @@ class SplitRuntime:
                     f"[B][RECOMPUTE_FAIL] still missing keys: {missing_keys[:20]}"
                 )                            
             # missing_keys = []
-        #
+        predicted_operator_ms = float(
+            recompute_stats.get(
+                "predicted_operator_ms",
+                0.0,
+            )
+        )
+
+        recompute_overhead_ms = max(
+            0.0,
+            recompute_ms - predicted_operator_ms,
+        )
+
+        recompute_prediction_ratio = (
+            recompute_ms / predicted_operator_ms
+            if predicted_operator_ms > 0.0
+            else 0.0
+        )
+
+        print(
+            f"[B][RECOMPUTE_COST_VALIDATION] "
+            f"predicted_operator_ms="
+            f"{predicted_operator_ms:.3f} "
+            f"actual_recompute_ms={recompute_ms:.3f} "
+            f"recompute_overhead_ms="
+            f"{recompute_overhead_ms:.3f} "
+            f"prediction_ratio="
+            f"{recompute_prediction_ratio:.3f}",
+            flush=True,
+        )
         t0 = time.perf_counter()
         loss.backward()
         t1 = time.perf_counter()
@@ -681,13 +718,44 @@ class SplitRuntime:
 
         self.last_experiment_metrics = {
             "missing_count": missing_count_before,
-            "estimated_grouped_ms": recompute_stats[
-                "estimated_grouped_ms"
-            ],
-            "recompute_plan_ms": recompute_stats[
-                "recompute_plan_ms"
-            ],
+            "estimated_grouped_ms": recompute_stats.get(
+                "estimated_grouped_ms",
+                0.0,
+            ),
+            "predicted_operator_ms": (
+                predicted_operator_ms
+            ),
+
             "recompute_wall_ms": recompute_ms,
+            "recompute_overhead_ms": (
+                recompute_overhead_ms
+            ),
+            "recompute_prediction_ratio": (
+                recompute_prediction_ratio
+            ),
+            "recomputed_mb": recomputed_mb,
+            "recompute_executed_node_count": (
+                recompute_stats.get(
+                    "recompute_executed_node_count",
+                    0,
+                )
+            ),
+            "recompute_profiled_node_count": (
+                recompute_stats.get(
+                    "recompute_profiled_node_count",
+                    0,
+                )
+            ),
+            "recompute_missing_profile_count": (
+                recompute_stats.get(
+                    "recompute_missing_profile_count",
+                    0,
+                )
+            ),
+            "recompute_plan_ms": recompute_stats.get(
+                "recompute_plan_ms",
+                0.0,
+            ),
             "inject_ms": injected_ms,
             "torch_backward_ms": torch_backward_ms,
             "backward_jin_ms": total_backward_jin_ms,
@@ -906,9 +974,55 @@ class SplitRuntime:
                     flush=True,
                 )
 
+        executed_nodes = list(
+            recompute_engine.executed_recompute_nodes
+        )
+
+        predicted_operator_ms = 0.0
+        profiled_node_count = 0
+        missing_profile_nodes = []
+
+        for node_name in executed_nodes:
+            node_cost = recompute_engine.profile_db.get(
+                node_name
+            )
+
+            if node_cost is None:
+                missing_profile_nodes.append(node_name)
+                continue
+
+            predicted_operator_ms += node_cost
+            profiled_node_count += 1
+
+
+        print(
+            f"[B][RECOMPUTE_OPERATOR_ESTIMATE] "
+            f"executed_node_count={len(executed_nodes)} "
+            f"profiled_node_count={profiled_node_count} "
+            f"missing_profile_count="
+            f"{len(missing_profile_nodes)} "
+            f"predicted_operator_ms="
+            f"{predicted_operator_ms:.3f} "
+            f"missing_profile_nodes="
+            f"{missing_profile_nodes[:10]}",
+            flush=True,
+        )
+
+
         stats = {
             "estimated_grouped_ms": estimated_grouped_ms,
             "recompute_plan_ms": find_ms + path_ms,
+
+            "predicted_operator_ms": predicted_operator_ms,
+            "recompute_executed_node_count": len(
+                executed_nodes
+            ),
+            "recompute_profiled_node_count": (
+                profiled_node_count
+            ),
+            "recompute_missing_profile_count": len(
+                missing_profile_nodes
+            ),
         }
 
         return recomputed, stats
@@ -980,7 +1094,7 @@ class SplitRuntime:
                     "start": "",
                     "target": target_node,
                     "path_len": 0,
-                    "individual_cost_ms": "",
+                    "recompute_ms": "",
                     "missing_profile": "",
                     "path": "",
                 })
@@ -1005,7 +1119,7 @@ class SplitRuntime:
                 "start": start,
                 "target": target_node,
                 "path_len": len(path),
-                "individual_cost_ms": cost_ms,
+                "recompute_ms": cost_ms,
                 "missing_profile": ",".join(missing_profile),
                 "path": " -> ".join(path),
             })
@@ -1024,7 +1138,7 @@ class SplitRuntime:
                     "start",
                     "target",
                     "path_len",
-                    "individual_cost_ms",
+                    "recompute_ms",
                     "missing_profile",
                     "path",
                 ],

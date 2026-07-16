@@ -362,7 +362,6 @@ def run_node_b(
         node_b_processing_ms = (
             t_send0 - t_step0
         ) * 1000
-
         reply = {
             "status": "ok",
             "step": step,
@@ -371,29 +370,77 @@ def run_node_b(
             "updated_state_dict": updated_state,
 
             "missing_count": experiment_metrics.get(
-                "missing_count", 0
+                "missing_count",
+                0,
             ),
+
             "estimated_grouped_ms": experiment_metrics.get(
-                "estimated_grouped_ms", 0.0
+                "estimated_grouped_ms",
+                0.0,
             ),
+
+            "predicted_operator_ms": experiment_metrics.get(
+                "predicted_operator_ms",
+                0.0,
+            ),
+
             "recompute_wall_ms": experiment_metrics.get(
-                "recompute_wall_ms", 0.0
+                "recompute_wall_ms",
+                0.0,
             ),
+
+            "recompute_overhead_ms": experiment_metrics.get(
+                "recompute_overhead_ms",
+                0.0,
+            ),
+
+            "recompute_prediction_ratio": experiment_metrics.get(
+                "recompute_prediction_ratio",
+                0.0,
+            ),
+
+            "recomputed_mb": experiment_metrics.get(
+                "recomputed_mb",
+                0.0,
+            ),
+
+            "recompute_executed_node_count": experiment_metrics.get(
+                "recompute_executed_node_count",
+                0,
+            ),
+
+            "recompute_profiled_node_count": experiment_metrics.get(
+                "recompute_profiled_node_count",
+                0,
+            ),
+
+            "recompute_missing_profile_count": experiment_metrics.get(
+                "recompute_missing_profile_count",
+                0,
+            ),
+
             "recompute_plan_ms": experiment_metrics.get(
-                "recompute_plan_ms", 0.0
+                "recompute_plan_ms",
+                0.0,
             ),
+
             "inject_ms": experiment_metrics.get(
-                "inject_ms", 0.0
+                "inject_ms",
+                0.0,
             ),
+
             "torch_backward_ms": experiment_metrics.get(
-                "torch_backward_ms", 0.0
+                "torch_backward_ms",
+                0.0,
             ),
+
             "backward_jin_ms": experiment_metrics.get(
-                "backward_jin_ms", 0.0
+                "backward_jin_ms",
+                0.0,
             ),
+
             "node_b_processing_ms": node_b_processing_ms,
         }
-
         if send_grads:
             reply["grads"] = grads
 
