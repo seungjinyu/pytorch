@@ -1,0 +1,1 @@
+rsync -avh   --exclude='.git/'   --exclude='__pycache__/'   --exclude='*.pyc'   --exclude='*.pt'   --exclude='*.log'   --exclude='experiment_logs/'   --exclude='build/'   --exclude='dist/'   --exclude='*.egg-info/'   --exclude='experiments/'   /home/syu23/seungjin/pytorch/splitmagic/   ubuntu@10.32.126.244:/home/ubuntu/splitmagic_project/

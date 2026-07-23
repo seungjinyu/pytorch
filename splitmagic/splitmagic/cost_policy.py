@@ -205,10 +205,12 @@ def auto_drop_by_cost(
             tensor_mb * inject_ms_per_mb
         )
 
-        adjusted_recompute_ms = (
-            adjusted_operator_ms
-            + predicted_inject_ms
-        )
+        # adjusted_recompute_ms = (
+        #     adjusted_operator_ms
+        #     + predicted_inject_ms
+        # )
+
+        adjusted_recompute_ms = profile.recompute_ms
 
         benefit_ms = (
             send_ms

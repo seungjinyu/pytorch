@@ -394,7 +394,6 @@ def run_node_a(
             # 중요: A는 forward only. backward 호출 없음.
             payload = runtime_a.capture_jin_forward_plan(
                 x=x,
-                y=y,
                 plan=plan,
             )
             payload.print_add_tensor_profile(

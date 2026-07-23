@@ -95,7 +95,7 @@ echo "[MENU] Node B ready"
 JIN_SELECTION_POLICY=none \
 JIN_AUTO_DROP_RATIO=0.0 \
 JIN_MAX_STEPS=1 \
-JIN_ENDPOINT="tcp://127.0.0.1:5555" \
+JIN_ENDPOINT="tcp://127.0.0.1:5556" \
 "${PYTHON_BIN}" -u \
 tests/test_node_a_cost_resnet18.py
 

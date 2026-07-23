@@ -7,3 +7,5 @@ tests/
 *.png
 profiles/*
 *.json
+*.deb
+*.deb.1

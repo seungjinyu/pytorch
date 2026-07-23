@@ -1,5 +1,6 @@
 from torchvision.models import vgg11_bn
 from torchvision.models import resnet18
+from torchvision.models import resnet50
 import torch.nn as nn
 
 class LeNet(nn.Module):
@@ -142,6 +143,21 @@ def make_resnet18_cifar10():
 
     return model
 
+def make_resnet18_imagenet(num_classes=1000):
+    model = resnet18(weights=None)
+
+    if num_classes != 1000:
+        model.fc = nn.Linear(
+            model.fc.in_features,
+            num_classes,
+        )
+
+    for module in model.modules():
+        if isinstance(module, nn.ReLU):
+            module.inplace = False
+
+    return model
+
 class VGGLikeCIFAR(nn.Module):
     def __init__(self, num_classes=10):
         super().__init__()
@@ -225,3 +241,29 @@ def make_vgg11_bn_cifar10():
             m.inplace = False
 
     return model
+
+def _prepare_resnet_cifar10(model):
+    model.conv1 = nn.Conv2d(
+        3,
+        64,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        bias=False,
+    )
+
+    model.maxpool = nn.Identity()
+    model.fc = nn.Linear(
+        model.fc.in_features,
+        10,
+    )
+
+    for module in model.modules():
+        if isinstance(module, nn.ReLU):
+            module.inplace = False
+
+    return model
+
+def make_resnet50_cifar10():
+    model = resnet50(weights=None)
+    return _prepare_resnet_cifar10(model)

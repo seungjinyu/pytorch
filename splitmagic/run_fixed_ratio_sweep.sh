@@ -9,31 +9,31 @@ set -euo pipefail
 NODE_B_HOST="syu23@oryx"
 NODE_B_IP="10.32.137.57"
 
-NETWORKS=(1000 500 200 100 50)
-GPU_PERCENTAGES=(100 50 25)
+# NETWORKS=(1000 500 200 100 50 )
+NETWORKS=( 100 )
+RATIOS=(
+    0.00
+    0.10
+    0.20
+    0.30
+    0.40
+    0.50
+    0.60
+    0.70
+    0.80
+    0.90
+    0.95
+    0.97
+    0.99
+)
 
 REPEATS=1
 
-RESULT_CSV="./cost_policy_experiment_mps_all.csv"
-NETWORK_CSV="./cost_policy_network_stats_mps.csv"
+RESULT_CSV="./fixed_ratio_sweep_all_networks.csv"
+NETWORK_CSV="./fixed_ratio_sweep_all_networks_tc.csv"
 
-SELECTION_POLICY="cost"
-
-# Node A에서 사용하는 recompute menu 경로
-declare -A RECOMPUTE_COST_CSVS=(
-    [100]="$PWD/recompute_menu_resnet18_bs32_mps100.csv"
-    [50]="$PWD/recompute_menu_resnet18_bs32_mps50.csv"
-    [25]="$PWD/recompute_menu_resnet18_bs32_mps25.csv"
-    [10]="$PWD/recompute_menu_resnet18_bs32_mps10.csv"
-)
-
-# Node B에서 사용하는 operator profile 경로
-declare -A NODE_B_PROFILE_PATHS=(
-    [100]="/home/syu23/seungjin/pytorch/splitmagic/recompute_node_profile_mps100.csv"
-    [50]="/home/syu23/seungjin/pytorch/splitmagic/recompute_node_profile_mps50.csv"
-    [25]="/home/syu23/seungjin/pytorch/splitmagic/recompute_node_profile_mps25.csv"
-    [10]="/home/syu23/seungjin/pytorch/splitmagic/recompute_node_profile_mps10.csv"
-)
+SELECTION_POLICY="ratio"
+RECOMPUTE_COST_CSV="$PWD/recompute_menu_resnet18_bs32_c128.csv"
 
 MIN_BENEFIT_MS="0.0"
 
@@ -54,7 +54,7 @@ rm -f "${RESULT_CSV}"
 rm -f "${NETWORK_CSV}"
 
 echo \
-"run_id,repeat,hostname,selection_policy,gpu_percentage,network_interface,tc_enabled,network_limit_mbps,tc_bytes_before,tc_bytes_after,tc_bytes_delta" \
+"run_id,repeat,hostname,selection_policy,configured_drop_ratio,network_interface,tc_enabled,network_limit_mbps,tc_bytes_before,tc_bytes_after,tc_bytes_delta" \
 > "${NETWORK_CSV}"
 
 ############################
@@ -179,75 +179,39 @@ stop_node_b() {
         echo "[NODE B] forced cleanup completed"
     '
 }
-
 start_node_b() {
-    local gpu_percentage="$1"
-    local profile_path="$2"
-
     stop_node_b
 
-    echo "[NODE B] checking startup conditions..."
+    echo "[NODE B] checking port before startup..."
 
-    ssh "${NODE_B_HOST}" bash -s -- \
-        "${profile_path}" <<'REMOTE_CHECK'
-set -euo pipefail
+    ssh "${NODE_B_HOST}" '
+        if ss -ltnH 2>/dev/null |
+           awk "{print \$4}" |
+           grep -Eq "(^|:|\])5556$"; then
+            echo "[ERROR] port 5556 occupied before Node B startup"
+            ss -ltnp | grep ":5556" || true
+            exit 1
+        fi
 
-profile_path="$1"
-
-if [[ ! -f "${profile_path}" ]]; then
-    echo "[ERROR] Node B profile not found: ${profile_path}"
-    exit 1
-fi
-
-if ss -ltnH 2>/dev/null |
-   awk '{print $4}' |
-   grep -Eq '(^|:|\])5556$'; then
-    echo "[ERROR] port 5556 occupied before Node B startup"
-    ss -ltnp | grep ':5556' || true
-    exit 1
-fi
-
-if ! pgrep -f 'nvidia-cuda-mps-control -d' >/dev/null; then
-    echo "[ERROR] NVIDIA MPS control daemon is not running"
-    exit 1
-fi
-
-echo "[NODE B] profile exists: ${profile_path}"
-echo "[NODE B] port 5556 is free"
-echo "[NODE B] MPS daemon is running"
-REMOTE_CHECK
+        echo "[NODE B] port 5556 is free before startup"
+    '
 
     echo "[NODE B] starting..."
-    echo "[NODE B] gpu_percentage=${gpu_percentage}"
-    echo "[NODE B] profile_path=${profile_path}"
 
-    ssh "${NODE_B_HOST}" bash -s -- \
-        "${gpu_percentage}" "${profile_path}" <<'REMOTE_START'
-set -euo pipefail
+    ssh "${NODE_B_HOST}" '
+        cd /home/syu23/seungjin/pytorch/splitmagic || exit 1
 
-gpu_percentage="$1"
-profile_path="$2"
+        rm -f /tmp/node_b_resnet18.log
 
-cd /home/syu23/seungjin/pytorch/splitmagic
-
-rm -f /tmp/node_b_resnet18.log
-
-nohup env \
-    CUDA_MPS_ACTIVE_THREAD_PERCENTAGE="${gpu_percentage}" \
-    PYTHONPATH="/home/syu23/seungjin/pytorch:/home/syu23/seungjin/pytorch/splitmagic:/home/syu23/torchvision-0.17:${PYTHONPATH:-}" \
-    JIN_RECOMPUTE_PROFILE_PATH="${profile_path}" \
-    JIN_RECOMPUTE_PROFILE_CONCURRENCY="1" \
-    JIN_GPU_PERCENTAGE="${gpu_percentage}" \
-    /home/syu23/miniconda3/envs/torch-build/bin/python3 -u \
-    tests/test_node_b_resnet18.py \
-    > /tmp/node_b_resnet18.log 2>&1 \
-    < /dev/null &
-
-echo "[NODE B START REQUESTED]"
-echo "pid=$!"
-echo "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=${gpu_percentage}"
-echo "JIN_RECOMPUTE_PROFILE_PATH=${profile_path}"
-REMOTE_START
+        nohup env \
+            PYTHONPATH="/home/syu23/seungjin/pytorch:/home/syu23/seungjin/pytorch/splitmagic:/home/syu23/torchvision-0.17:${PYTHONPATH:-}" \
+            JIN_RECOMPUTE_PROFILE_PATH="/home/syu23/seungjin/pytorch/splitmagic/recompute_node_concurrent_profile_c128.csv" \
+            JIN_RECOMPUTE_PROFILE_CONCURRENCY="128" \
+            /home/syu23/miniconda3/envs/torch-build/bin/python3 -u \
+            tests/test_node_b_resnet18.py \
+            > /tmp/node_b_resnet18.log 2>&1 \
+            < /dev/null &
+    '
 
     echo "[NODE B] waiting for listening..."
 
@@ -285,10 +249,6 @@ REMOTE_START
     fi
 
     echo "[NODE B] ready"
-
-    ssh "${NODE_B_HOST}" \
-        "grep -E '\[Node B\]\[GPU_CONFIG\]|MPS|PROFILE' \
-         /tmp/node_b_resnet18.log | head -20" || true
 }
 
 ############################
@@ -305,57 +265,40 @@ trap cleanup EXIT
 ############################
 # experiment loop
 ############################
-for gpu_percentage in "${GPU_PERCENTAGES[@]}"; do
-    recompute_cost_csv="${RECOMPUTE_COST_CSVS[$gpu_percentage]}"
-    node_b_profile_path="${NODE_B_PROFILE_PATHS[$gpu_percentage]}"
+for network in "${NETWORKS[@]}"; do
+    set_tc_limit "${network}"
 
-    if [[ ! -f "${recompute_cost_csv}" ]]; then
-        echo "[ERROR] recompute cost CSV not found: ${recompute_cost_csv}"
-        exit 1
-    fi
+    echo "[TC CONFIG]"
+    sudo tc -s class show dev "${INTERFACE}" |
+        grep -A2 "class htb 1:10"
 
-    echo
-    echo "####################################"
-    echo "GPU percentage=${gpu_percentage}"
-    echo "cost CSV=${recompute_cost_csv}"
-    echo "Node B profile=${node_b_profile_path}"
-    echo "####################################"
-
-    for network in "${NETWORKS[@]}"; do
-        set_tc_limit "${network}"
-
-        echo "[TC CONFIG]"
-        sudo tc -s class show dev "${INTERFACE}" |
-            grep -A2 "class htb 1:10" || true
-
+    for ratio in "${RATIOS[@]}"; do
         for repeat in $(seq 1 "${REPEATS}"); do
             echo
             echo "===================================="
             echo "policy=${SELECTION_POLICY}"
-            echo "gpu_percentage=${gpu_percentage}"
             echo "network=${network}"
+            echo "ratio=${ratio}"
             echo "repeat=${repeat}/${REPEATS}"
             echo "run_id=${RUN_ID}"
             echo "===================================="
 
-            start_node_b \
-                "${gpu_percentage}" \
-                "${node_b_profile_path}"
+            start_node_b
 
             TC_BYTES_BEFORE="$(get_tc_bytes)"
             TC_BYTES_BEFORE="${TC_BYTES_BEFORE:-0}"
 
+            ratio_tag="${ratio/./p}"
+
+            echo "[RUN] policy=${SELECTION_POLICY} ratio=${ratio}"
+
             JIN_SELECTION_POLICY="${SELECTION_POLICY}" \
-            JIN_RECOMPUTE_COST_CSV="${recompute_cost_csv}" \
             JIN_NETWORK_MBPS="${network}" \
-            JIN_GPU_PERCENTAGE="${gpu_percentage}" \
-            JIN_MIN_BENEFIT_MS="${MIN_BENEFIT_MS}" \
-            JIN_MAX_COST_DROP_RATIO="${MAX_COST_DROP_RATIO}" \
-            JIN_AUTO_DROP_RATIO="0.0" \
+            JIN_AUTO_DROP_RATIO="${ratio}" \
             JIN_EXPERIMENT_RUN_ID="${RUN_ID}" \
             JIN_MAX_STEPS="1" \
             JIN_EXPERIMENT_CSV="${RESULT_CSV}" \
-            JIN_NODE_A_CSV="./node_a_cost_mps${gpu_percentage}_${network}mbps_run${RUN_ID}.csv" \
+            JIN_NODE_A_CSV="./node_a_ratio_${network}mbps_ratio_${ratio_tag}_repeat_${repeat}_run_${RUN_ID}.csv" \
             python3 -u tests/test_node_a_cost_resnet18.py
 
             TC_BYTES_AFTER="$(get_tc_bytes)"
@@ -364,14 +307,14 @@ for gpu_percentage in "${GPU_PERCENTAGES[@]}"; do
             TC_BYTES_DELTA=$((TC_BYTES_AFTER - TC_BYTES_BEFORE))
 
             echo \
-            "${RUN_ID},${repeat},${NODE_A_HOSTNAME},${SELECTION_POLICY},${gpu_percentage},${INTERFACE},1,${network},${TC_BYTES_BEFORE},${TC_BYTES_AFTER},${TC_BYTES_DELTA}" \
+            "${RUN_ID},${repeat},${NODE_A_HOSTNAME},${SELECTION_POLICY},${ratio},${INTERFACE},1,${network},${TC_BYTES_BEFORE},${TC_BYTES_AFTER},${TC_BYTES_DELTA}" \
             >> "${NETWORK_CSV}"
 
             echo \
                 "[NETWORK_STATS] " \
                 "run_id=${RUN_ID} " \
-                "gpu_percentage=${gpu_percentage} " \
                 "network=${network} " \
+                "ratio=${ratio} " \
                 "before=${TC_BYTES_BEFORE} " \
                 "after=${TC_BYTES_AFTER} " \
                 "delta=${TC_BYTES_DELTA}"

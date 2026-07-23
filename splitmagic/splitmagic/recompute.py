@@ -133,10 +133,48 @@ class FXRecomputeEngine:
         start_tensor,
         path,
     ):
+        path = list(path)
 
         cur = start_tensor
         self.current_start = path[0]
         self.node_values[path[0]] = start_tensor
+
+        # 이번 recompute 호출에서 실제 실행된 node만 기록
+        executed_before = len(self.executed_recompute_nodes)
+
+        # CSV profile이 로드되어 있으면 예상 비용 계산
+        estimated_ms = None
+        missing_profile_nodes = []
+
+        if self.profile_db:
+            estimated_ms, missing_profile_nodes = (
+                self.estimate_recompute_cost(path)
+            )
+
+            print(
+                f"[RECOMPUTE_ESTIMATE] "
+                f"start={path[0]} "
+                f"target={path[-1]} "
+                f"path_len={len(path) - 1} "
+                f"estimated_ms={estimated_ms:.6f} "
+                f"missing={missing_profile_nodes} "
+                f"path={' -> '.join(path)}",
+                flush=True,
+            )
+
+        # 실제 recompute 시간 측정
+        use_cuda_timer = (
+            torch.cuda.is_available()
+            and isinstance(start_tensor, torch.Tensor)
+            and start_tensor.is_cuda
+        )
+
+        if use_cuda_timer:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+        else:
+            t0 = time.perf_counter()
 
         for node_name in path[1:]:
 
@@ -185,6 +223,54 @@ class FXRecomputeEngine:
 
                 cur = module(cur)
                 self.node_values[node_name] = cur
+
+        if use_cuda_timer:
+            end_event.record()
+            end_event.synchronize()
+            actual_ms = start_event.elapsed_time(end_event)
+        else:
+            actual_ms = (
+                time.perf_counter() - t0
+            ) * 1000.0
+
+        executed_now = self.executed_recompute_nodes[executed_before:]
+
+        print(
+            f"[RECOMPUTE_ACTUAL] "
+            f"start={path[0]} "
+            f"target={path[-1]} "
+            f"actual_ms={actual_ms:.6f} "
+            f"executed={executed_now}",
+            flush=True,
+        )
+
+        if estimated_ms is not None:
+            signed_error_ms = actual_ms - estimated_ms
+            abs_error_ms = abs(signed_error_ms)
+
+            if actual_ms > 0:
+                abs_error_percent = (
+                    abs_error_ms / actual_ms
+                ) * 100.0
+            else:
+                abs_error_percent = 0.0
+
+            print(
+                f"[RECOMPUTE_COST_COMPARE] "
+                f"start={path[0]} "
+                f"target={path[-1]} "
+                f"estimated_ms={estimated_ms:.6f} "
+                f"actual_ms={actual_ms:.6f} "
+                f"error_ms={signed_error_ms:.6f} "
+                f"abs_error_percent={abs_error_percent:.2f} "
+                f"profile_missing={missing_profile_nodes}",
+                flush=True,
+            )
+
+        print(
+            f"[RECOMPUTE] device={cur.device}",
+            flush=True,
+        )
 
         return cur
     
@@ -399,24 +485,70 @@ class FXRecomputeEngine:
     def load_profile_db_csv(
         self,
         path="./recompute_layer_profile.csv",
+        concurrency=1,
+        metric="avg_ms",
     ):
         import csv
 
         profile_db = {}
 
-        with open(path, "r", newline="") as f:
+        with open(path, "r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
 
+            if reader.fieldnames is None:
+                raise RuntimeError(
+                    f"[PROFILE_LOAD] CSV has no header: {path}"
+                )
+
+            required = {"node_name", metric}
+
+            missing_columns = required - set(reader.fieldnames)
+
+            if missing_columns:
+                raise RuntimeError(
+                    f"[PROFILE_LOAD] missing columns="
+                    f"{sorted(missing_columns)}"
+                )
+
+            has_concurrency = "concurrency" in reader.fieldnames
+
             for row in reader:
-                node_name = row["node_name"]
-                avg_ms = float(row["avg_ms"])
-                profile_db[node_name] = avg_ms
+                if has_concurrency:
+                    try:
+                        row_concurrency = int(row["concurrency"])
+                    except (TypeError, ValueError):
+                        continue
+
+                    if row_concurrency != concurrency:
+                        continue
+
+                node_name = row["node_name"].strip()
+
+                if not node_name:
+                    continue
+
+                try:
+                    cost_ms = float(row[metric])
+                except (TypeError, ValueError):
+                    continue
+
+                profile_db[node_name] = cost_ms
+
+        if not profile_db:
+            raise RuntimeError(
+                f"[PROFILE_LOAD] no rows loaded "
+                f"path={path} "
+                f"concurrency={concurrency} "
+                f"metric={metric}"
+            )
 
         self.profile_db = profile_db
 
         print(
             f"[PROFILE_LOAD] "
             f"path={path} "
+            f"concurrency={concurrency} "
+            f"metric={metric} "
             f"nodes={len(profile_db)}",
             flush=True,
         )

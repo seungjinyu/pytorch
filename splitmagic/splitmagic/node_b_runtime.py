@@ -6,7 +6,6 @@ import time
 from splitmagic import SplitRuntime, ZMQServer
 from splitmagic.utils.timing import CSVLogger
 from splitmagic.runtime import read_dryrun_plan
-# from splitmagic.resolver import read_jin1_payload
 from splitmagic.runtime import jin_set_payload_bytes_from_python
 
 def tensor_nbytes(t):
@@ -156,8 +155,8 @@ def run_node_b(
     printed_payload_summary = False
 
     # We are assuming the node B has a better computation power
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # device = "cpu"
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cpu"
     model = model.to(device)
 
     os.environ["JIN_ROLE"] = "B"
@@ -300,6 +299,7 @@ def run_node_b(
         t_backward0 = time.perf_counter()
 
         payload_bytes = req["payload"].to_jin1_bytes()
+        
         jin_set_payload_bytes_from_python(
             payload_bytes=payload_bytes,
             step=step,

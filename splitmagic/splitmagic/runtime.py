@@ -5,7 +5,8 @@ import os
 import time 
 
 from .payload import  payload_from_jin_items
-from .resolver import read_jin1_payload, SavedTensorResolver
+from .resolver import SavedTensorResolver
+from splitmagic.recompute_cost import RecomputeCostDB
 
 from .fx_trace import (
     build_available_tensors_from_payload,
@@ -266,6 +267,25 @@ class SplitRuntime:
         self.model = model 
         self.role = role.upper()
 
+        profile_csv_path = os.environ.get(
+            "SPLITMAGIC_RECOMPUTE_PROFILE_CSV"
+        )
+        self.recompute_cost_db = None
+
+        if profile_csv_path:
+            try:
+                self.recompute_cost_db = RecomputeCostDB(
+                    csv_path=profile_csv_path,
+                    concurrency=1,
+                    metric="avg_ms",
+                )
+            except Exception as exc:
+                print(
+                    "[SplitRuntime][RECOMPUTE_COST_DB_ERROR] "
+                    f"type={type(exc).__name__} "
+                    f"error={exc}"
+                )
+
         self.enable_recompute_profile = (
             os.getenv("JIN_RECOMPUTE_PROFILE", "0") == "1"
         )
@@ -282,7 +302,7 @@ class SplitRuntime:
             raise ValueError("Role must be either 'A' or 'B'")
 
 
-    def capture_jin_forward_plan(self, x, y, plan):
+    def capture_jin_forward_plan(self, x, plan):
         #
         # Step 1. Build lookup queues from backward execution plan
         # Step 2. Define tensors saving and forward hooks
@@ -655,26 +675,31 @@ class SplitRuntime:
             )
         )
 
+        actual_operator_ms = float(
+            recompute_stats.get(
+                "actual_recompute_ms",
+                0.0,
+            )
+        )
+
         recompute_overhead_ms = max(
             0.0,
-            recompute_ms - predicted_operator_ms,
+            recompute_ms - actual_operator_ms,
         )
 
         recompute_prediction_ratio = (
-            recompute_ms / predicted_operator_ms
+            actual_operator_ms / predicted_operator_ms
             if predicted_operator_ms > 0.0
             else 0.0
         )
 
         print(
             f"[B][RECOMPUTE_COST_VALIDATION] "
-            f"predicted_operator_ms="
-            f"{predicted_operator_ms:.3f} "
-            f"actual_recompute_ms={recompute_ms:.3f} "
-            f"recompute_overhead_ms="
-            f"{recompute_overhead_ms:.3f} "
-            f"prediction_ratio="
-            f"{recompute_prediction_ratio:.3f}",
+            f"predicted_operator_ms={predicted_operator_ms:.3f} "
+            f"actual_operator_ms={actual_operator_ms:.3f} "
+            f"recompute_wall_ms={recompute_ms:.3f} "
+            f"recompute_overhead_ms={recompute_overhead_ms:.3f} "
+            f"prediction_ratio={recompute_prediction_ratio:.3f}",
             flush=True,
         )
         t0 = time.perf_counter()
@@ -725,6 +750,7 @@ class SplitRuntime:
             "predicted_operator_ms": (
                 predicted_operator_ms
             ),
+            "actual_operator_ms": actual_operator_ms,
 
             "recompute_wall_ms": recompute_ms,
             "recompute_overhead_ms": (
@@ -815,12 +841,24 @@ class SplitRuntime:
             gm=gm,
             node_values=dict(available_tensors)
         )
+
         profile_csv = os.environ.get(
             "JIN_RECOMPUTE_PROFILE_PATH",
             "./recompute_layer_profile.csv",
         )
 
-        recompute_engine.load_profile_db_csv(profile_csv)
+        profile_concurrency = int(
+            os.environ.get(
+                "JIN_RECOMPUTE_PROFILE_CONCURRENCY",
+                "1",
+            )
+        )
+        # recompute_engine.load_profile_db_csv(profile_csv)
+        recompute_engine.load_profile_db_csv(
+            profile_csv,
+            concurrency=profile_concurrency,
+            metric="avg_ms",
+        )
 
         recomputed = {}
         recompute_records = []
@@ -903,6 +941,11 @@ class SplitRuntime:
             f"build_path_ms={path_ms:.3f}"
         )
 
+        if torch.cuda.is_available() and torch.device(device).type == "cuda":
+            torch.cuda.synchronize(device)
+
+        recompute_exec_t0 = time.perf_counter()
+
         for start, items in groups.items():
 
             # start tensor도 recompute_engine cache에 등록
@@ -978,6 +1021,14 @@ class SplitRuntime:
             recompute_engine.executed_recompute_nodes
         )
 
+        if torch.cuda.is_available() and torch.device(device).type == "cuda":
+            torch.cuda.synchronize(device)
+
+        actual_recompute_ms = (
+            time.perf_counter() - recompute_exec_t0
+        ) * 1000.0
+
+
         predicted_operator_ms = 0.0
         profiled_node_count = 0
         missing_profile_nodes = []
@@ -1008,12 +1059,29 @@ class SplitRuntime:
             flush=True,
         )
 
+        prediction_ratio = (
+            actual_recompute_ms / predicted_operator_ms
+            if predicted_operator_ms > 0
+            else float("nan")
+        )
+
+        print(
+            f"[B][RECOMPUTE_COST_VALIDATION] "
+            f"predicted_operator_ms={predicted_operator_ms:.3f} "
+            f"estimated_grouped_ms={estimated_grouped_ms:.3f} "
+            f"actual_recompute_ms={actual_recompute_ms:.3f} "
+            f"actual_over_predicted={prediction_ratio:.3f}",
+            flush=True,
+        )
+
 
         stats = {
             "estimated_grouped_ms": estimated_grouped_ms,
             "recompute_plan_ms": find_ms + path_ms,
 
             "predicted_operator_ms": predicted_operator_ms,
+            "actual_recompute_ms": actual_recompute_ms,
+
             "recompute_executed_node_count": len(
                 executed_nodes
             ),
@@ -1024,7 +1092,6 @@ class SplitRuntime:
                 missing_profile_nodes
             ),
         }
-
         return recomputed, stats
     
     def build_recompute_menu(
@@ -1056,7 +1123,19 @@ class SplitRuntime:
             node_values=dict(available_tensors_base),
         )
 
-        engine.load_profile_db_csv(profile_csv)
+        profile_concurrency = int(
+            os.environ.get(
+                "JIN_RECOMPUTE_PROFILE_CONCURRENCY",
+                "1",
+            )
+        )
+
+        engine.load_profile_db_csv(
+            profile_csv,
+            concurrency=profile_concurrency,
+            # metric="avg_ms",
+            metric="avg_ms",
+        )
 
         rows = []
 
