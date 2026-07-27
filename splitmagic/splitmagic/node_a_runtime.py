@@ -9,7 +9,6 @@ from splitmagic.recompute_policy import RECOMPUTE_POLICIES
 from splitmagic.cost_policy import (
     auto_drop_by_cost,
     load_recompute_cost_table, 
-    load_recompute_calibration,
 )
 from splitmagic.utils.timing import CSVLogger
 
@@ -201,11 +200,11 @@ def run_node_a(
     auto_drop_ratio=0.5,
     enable_alias=True,
     recompute_policy_name=None,
-    recompute_calibration_json=None,
 
     selection_policy="ratio",
     recompute_cost_csv=None,
     network_mbps=None,
+    inject_ms_per_mb=0.0,
     min_benefit_ms=0.0,
     max_cost_drop_ratio=None,
 ):
@@ -303,7 +302,6 @@ def run_node_a(
         )
     
     recompute_cost_table = None
-    recompute_calibration = None
 
     if selection_policy == "cost":
         if recompute_cost_csv is None:
@@ -330,30 +328,13 @@ def run_node_a(
             flush=True,
         )
 
-        if recompute_calibration_json:
-            recompute_calibration = (
-                load_recompute_calibration(
-                    recompute_calibration_json
-                )
-            )
+        print(
+            f"[Node A][COST_MODEL] "
+            f"inject_ms_per_mb={inject_ms_per_mb:.6f}",
+            flush=True,
+        )
 
-            print(
-                f"[Node A][CALIBRATION_LOAD] "
-                f"path={recompute_calibration_json} "
-                f"operator_scale="
-                f"{recompute_calibration.operator_scale:.6f} "
-                f"recompute_fixed_ms="
-                f"{recompute_calibration.recompute_fixed_ms:.6f} "
-                f"inject_ms_per_mb="
-                f"{recompute_calibration.inject_ms_per_mb:.6f}",
-                flush=True,
-            )
-        else:
-            print(
-                "[Node A][CALIBRATION_LOAD] "
-                "path=None; using uncalibrated costs",
-                flush=True,
-            )
+
 
     #  raise error if dryrun_plan is False
     if not dryrun_plan:
@@ -443,7 +424,7 @@ def run_node_a(
                         candidate_keys=candidate_keys,
                         cost_table=recompute_cost_table,
                         network_mbps=network_mbps,
-                        calibration=recompute_calibration,
+                        inject_ms_per_mb=inject_ms_per_mb,
                         min_benefit_ms=min_benefit_ms,
                         max_drop_ratio=max_cost_drop_ratio,
                     )
@@ -471,8 +452,41 @@ def run_node_a(
 
             extra = {
                 "tensor_policy": policy_meta,
-                "dryrun_backward_plan": payload.meta.get("dryrun_backward_plan", []),
+                "dryrun_backward_plan": payload.meta.get(
+                    "dryrun_backward_plan", []
+                ),
                 "aliases": payload.meta.get("aliases", {}),
+
+                # Cost-policy metadata
+                "selection_meta": {
+                    "selection_policy": payload.meta.get(
+                        "selection_policy", "none"
+                    ),
+                    "drop_ratio": payload.meta.get(
+                        "drop_ratio", 0.0
+                    ),
+                    "saved_mb": payload.meta.get(
+                        "saved_mb", 0.0
+                    ),
+                    "dropped_count": payload.meta.get(
+                        "dropped_count", 0
+                    ),
+                    "predicted_operator_ms": payload.meta.get(
+                        "predicted_operator_ms", 0.0
+                    ),
+                    "predicted_recompute_ms": payload.meta.get(
+                        "predicted_recompute_ms", 0.0
+                    ),
+                    "predicted_inject_ms": payload.meta.get(
+                        "predicted_inject_ms", 0.0
+                    ),
+                    "predicted_send_saved_ms": payload.meta.get(
+                        "predicted_send_saved_ms", 0.0
+                    ),
+                    "predicted_benefit_ms": payload.meta.get(
+                        "predicted_benefit_ms", 0.0
+                    ),
+                },
             }
 
             if global_step == 0:
@@ -515,31 +529,12 @@ def run_node_a(
 
             if global_step == 0 and "grads" in reply:
                 grad_keys = sorted(reply["grads"].keys())
-                print(
-                    f"[Node A][GRADS] num={len(grad_keys)} grads={grad_keys}",
-                    flush=True,
-                )
+                # print(
+                #     f"[Node A][GRADS] num={len(grad_keys)} grads={grad_keys}",
+                #     flush=True,
+                # )
                 
             model.load_state_dict(reply["updated_state_dict"])
-
-            # test_loss = 0.0
-            # test_accuracy = 0.0
-
-            # if test_loader is not None:
-            #     test_loss, test_accuracy = evaluate(
-            #         model=model,
-            #         test_loader=test_loader,
-            #         device=device,
-            #     )
-
-            #     print(
-            #         f"[Node A][EVAL] "
-            #         f"run_id={run_id} "
-            #         f"drop_ratio={drop_ratio_value} "
-            #         f"test_loss={test_loss:.6f} "
-            #         f"test_accuracy={test_accuracy:.6f}",
-            #         flush=True,
-            #     )
 
             t_load1 = time.perf_counter()
             send_recv_ms = (t_send1 - t_send0) * 1000

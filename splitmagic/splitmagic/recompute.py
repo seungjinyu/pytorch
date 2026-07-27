@@ -19,6 +19,9 @@ class FXRecomputeEngine:
         # 실제 recompute 과정에서 실행된 node 를 순서대로 기록
         self.executed_recompute_nodes = []
 
+        self.actual_operator_ms_total = 0.0
+        self.recompute_call_depth = 0
+
         if gm is not None :
             self.fx_nodes = {
                 n.name: n
@@ -133,6 +136,9 @@ class FXRecomputeEngine:
         start_tensor,
         path,
     ):
+        is_top_level_call = self.recompute_call_depth == 0
+        self.recompute_call_depth += 1
+
         path = list(path)
 
         cur = start_tensor
@@ -151,16 +157,16 @@ class FXRecomputeEngine:
                 self.estimate_recompute_cost(path)
             )
 
-            print(
-                f"[RECOMPUTE_ESTIMATE] "
-                f"start={path[0]} "
-                f"target={path[-1]} "
-                f"path_len={len(path) - 1} "
-                f"estimated_ms={estimated_ms:.6f} "
-                f"missing={missing_profile_nodes} "
-                f"path={' -> '.join(path)}",
-                flush=True,
-            )
+            # print(
+            #     f"[RECOMPUTE_ESTIMATE] "
+            #     f"start={path[0]} "
+            #     f"target={path[-1]} "
+            #     f"path_len={len(path) - 1} "
+            #     f"estimated_ms={estimated_ms:.6f} "
+            #     f"missing={missing_profile_nodes} "
+            #     f"path={' -> '.join(path)}",
+            #     flush=True,
+            # )
 
         # 실제 recompute 시간 측정
         use_cuda_timer = (
@@ -232,6 +238,12 @@ class FXRecomputeEngine:
             actual_ms = (
                 time.perf_counter() - t0
             ) * 1000.0
+
+        self.recompute_call_depth -= 1
+
+        # 중첩 recompute를 중복 합산하지 않는다.
+        if is_top_level_call:
+            self.actual_operator_ms_total += float(actual_ms)
 
         executed_now = self.executed_recompute_nodes[executed_before:]
 

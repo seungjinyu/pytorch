@@ -119,7 +119,7 @@ def auto_drop_by_cost(
     candidate_keys,
     cost_table: dict[str, RecomputeCost],
     network_mbps: float,
-    calibration: RecomputeCalibration | None = None,
+    inject_ms_per_mb: float =0.0,
     min_benefit_ms: float = 0.0,
     max_drop_ratio: float | None = None,
 ):
@@ -183,38 +183,21 @@ def auto_drop_by_cost(
             / network_mbps
         )
 
-        operator_scale = (
-            calibration.operator_scale
-            if calibration is not None
-            else 1.0
-        )
-
-        inject_ms_per_mb = (
-            calibration.inject_ms_per_mb
-            if calibration is not None
-            else 0.0
-        )
-
         operator_ms = profile.recompute_ms
-
-        adjusted_operator_ms = (
-            operator_ms * operator_scale
-        )
 
         predicted_inject_ms = (
             tensor_mb * inject_ms_per_mb
         )
 
-        # adjusted_recompute_ms = (
-        #     adjusted_operator_ms
-        #     + predicted_inject_ms
-        # )
+        marginal_recompute_ms = (
+            operator_ms
+            + predicted_inject_ms
+        )
 
-        adjusted_recompute_ms = profile.recompute_ms
 
-        benefit_ms = (
+        marginal_benefit_ms = (
             send_ms
-            - adjusted_recompute_ms
+            - marginal_recompute_ms
         )
 
         rows.append({
@@ -224,13 +207,10 @@ def auto_drop_by_cost(
             "send_ms": send_ms,
 
             "operator_ms": operator_ms,
-            "operator_scale": operator_scale,
-            "adjusted_operator_ms": adjusted_operator_ms,
-
             "predicted_inject_ms": predicted_inject_ms,
-            "adjusted_recompute_ms": adjusted_recompute_ms,
+            "marginal_recompute_ms": marginal_recompute_ms,
 
-            "benefit_ms": benefit_ms,
+            "benefit_ms": marginal_benefit_ms,
         })
 
     rows.sort(
@@ -238,44 +218,104 @@ def auto_drop_by_cost(
         reverse=True,
     )
 
-    dropped = []
-    decisions = []
+    ####
 
-    saved_bytes = 0
-    predicted_benefit_ms = 0.0
-    predicted_recompute_ms = 0.0
-    predicted_send_saved_ms = 0.0
+    selected_rows = []
+    selected_bytes = 0
 
+    # 우선 fixed cost를 제외한 marginal benefit 기준으로 후보를 선택한다.
     for row in rows:
-        decision = "send"
+        if row["benefit_ms"] <= 0.0:
+            continue
 
-        if row["benefit_ms"] > min_benefit_ms:
-            would_exceed_limit = (
-                max_drop_bytes is not None
-                and saved_bytes + row["nbytes"] > max_drop_bytes
+        would_exceed_limit = (
+            max_drop_bytes is not None
+            and selected_bytes + row["nbytes"] > max_drop_bytes
+        )
+
+        if would_exceed_limit:
+            continue
+
+        selected_rows.append(row)
+        selected_bytes += row["nbytes"]
+
+
+    predicted_send_saved_ms = sum(
+        row["send_ms"]
+        for row in selected_rows
+    )
+
+    #
+    predicted_operator_ms = sum(
+        row["operator_ms"]
+        for row in selected_rows
+    )
+
+    predicted_inject_ms = sum(
+        row["predicted_inject_ms"]
+        for row in selected_rows
+    )
+
+    predicted_recompute_ms = (
+        predicted_operator_ms
+        + predicted_inject_ms
+    )
+    #
+
+    predicted_benefit_ms = (
+        predicted_send_saved_ms
+        - predicted_recompute_ms
+    )
+
+    # 전체 선택 결과가 fixed cost까지 포함해서 유리하지 않으면
+    # 아무것도 드롭하지 않는다.
+    if predicted_benefit_ms <= min_benefit_ms:
+        selected_rows = []
+        selected_bytes = 0
+
+        predicted_send_saved_ms = 0.0
+        predicted_operator_ms = 0.0
+        predicted_inject_ms = 0.0
+        predicted_recompute_ms = 0.0
+        predicted_benefit_ms = 0.0
+
+
+    selected_keys = {
+        row["key"]
+        for row in selected_rows
+    }
+
+    dropped = []
+    saved_bytes = 0
+
+    for row in selected_rows:
+        removed = payload.tensors.pop(
+            row["key"],
+            None,
+        )
+
+        if removed is None:
+            raise RuntimeError(
+                f"Selected tensor disappeared before drop: "
+                f"{row['key']}"
             )
 
-            if not would_exceed_limit:
-                removed = payload.tensors.pop(
-                    row["key"],
-                    None,
-                )
+        dropped.append(row["key"])
+        saved_bytes += row["nbytes"]
 
-                if removed is not None:
-                    decision = "recompute"
-                    dropped.append(row["key"])
-
-                    saved_bytes += row["nbytes"]
-                    predicted_benefit_ms += row["benefit_ms"]
-                    predicted_recompute_ms += (
-                        row["adjusted_recompute_ms"]
-                    )
-                    predicted_send_saved_ms += row["send_ms"]
-
-        decisions.append({
+    decisions = [
+        {
             **row,
-            "decision": decision,
-        })
+            "decision": (
+                "recompute"
+                if row["key"] in selected_keys
+                else "send"
+            ),
+        }
+        for row in rows
+    ]
+
+    ####
 
     dropped_ratio = (
         saved_bytes / total_payload_bytes
@@ -293,6 +333,14 @@ def auto_drop_by_cost(
     payload.meta["predicted_send_saved_ms"] = (
         predicted_send_saved_ms
     )
+    payload.meta["predicted_operator_ms"] = (
+        predicted_operator_ms
+    )
+
+    payload.meta["predicted_inject_ms"] = (
+        predicted_inject_ms
+    )
+
     payload.meta["predicted_recompute_ms"] = (
         predicted_recompute_ms
     )

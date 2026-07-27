@@ -2,11 +2,189 @@ import os
 import torch
 import torch.nn.functional as F
 import time
+import csv
 
 from splitmagic import SplitRuntime, ZMQServer
 from splitmagic.utils.timing import CSVLogger
 from splitmagic.runtime import read_dryrun_plan
 from splitmagic.runtime import jin_set_payload_bytes_from_python
+
+def append_recompute_experiment_csv(
+    runtime,
+    csv_path="./recompute_cost_experiments.csv",
+):
+    metrics = getattr(
+        runtime,
+        "last_experiment_metrics",
+        None,
+    )
+
+    if not metrics:
+        print(
+            "[Node B][EXPERIMENT_CSV_SKIP] "
+            "last_experiment_metrics is empty",
+            flush=True,
+        )
+        return
+
+    row = {
+        "timestamp": time.time(),
+        "model": "resnet18",
+        "batch_size": int(
+            os.environ.get("JIN_BATCH_SIZE", "32")
+        ),
+
+        "selection_policy": metrics.get(
+            "node_a_selection_policy",
+            "unknown",
+        ),
+
+        "drop_ratio": metrics.get(
+            "node_a_drop_ratio",
+            0.0,
+        ),
+
+        "saved_mb": metrics.get(
+            "node_a_saved_mb",
+            0.0,
+        ),
+
+        "dropped_count": metrics.get(
+            "node_a_dropped_count",
+            0,
+        ),
+
+        "network_mbps": float(
+            os.environ.get(
+                "JIN_NETWORK_MBPS",
+                "500.0",
+            )
+        ),
+
+        "run_id": int(
+            os.environ.get("JIN_RUN_ID", "0")
+        ),
+
+        "missing_count": metrics.get(
+            "missing_count",
+            0,
+        ),
+
+        "recomputed_mb": metrics.get(
+            "recomputed_mb",
+            0.0,
+        ),
+
+        "node_a_predicted_operator_ms": metrics.get(
+            "node_a_predicted_operator_ms",
+            0.0,
+        ),
+
+        "node_a_predicted_recompute_ms": metrics.get(
+            "node_a_predicted_recompute_ms",
+            0.0,
+        ),
+
+        "node_a_predicted_inject_ms": metrics.get(
+            "node_a_predicted_inject_ms",
+            0.0,
+        ),
+        "executed_node_count": metrics.get(
+            "recompute_executed_node_count",
+            0,
+        ),
+        "profiled_node_count": metrics.get(
+            "recompute_profiled_node_count",
+            0,
+        ),
+        "missing_profile_count": metrics.get(
+            "recompute_missing_profile_count",
+            0,
+        ),
+
+        "estimated_grouped_ms": metrics.get(
+            "estimated_grouped_ms",
+            0.0,
+        ),
+        "predicted_operator_ms": metrics.get(
+            "predicted_operator_ms",
+            0.0,
+        ),
+        "actual_operator_ms": metrics.get(
+            "actual_operator_ms",
+            0.0,
+        ),
+        "actual_recompute_ms": metrics.get(
+            "actual_recompute_ms",
+            0.0,
+        ),
+        "recompute_wall_ms": metrics.get(
+            "recompute_wall_ms",
+            0.0,
+        ),
+        "recompute_overhead_ms": metrics.get(
+            "recompute_overhead_ms",
+            0.0,
+        ),
+        "inject_ms": metrics.get(
+            "inject_ms",
+            0.0,
+        ),
+        "torch_backward_ms": metrics.get(
+            "torch_backward_ms",
+            0.0,
+        ),
+        "backward_jin_ms": metrics.get(
+            "backward_jin_ms",
+            0.0,
+        ),
+    }
+
+    # 실제 cost-model target
+    row["actual_runtime_overhead_ms"] = max(
+        0.0,
+        row["recompute_wall_ms"]
+        - row["actual_operator_ms"],
+    )
+
+    row["actual_total_recompute_cost_ms"] = (
+        row["recompute_wall_ms"]
+        + row["inject_ms"]
+    )
+
+    file_exists = os.path.exists(csv_path)
+    file_empty = (
+        not file_exists
+        or os.path.getsize(csv_path) == 0
+    )
+
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=list(row.keys()),
+        )
+
+        if file_empty:
+            writer.writeheader()
+
+        writer.writerow(row)
+
+    print(
+        f"[Node B][EXPERIMENT_CSV_SAVE] "
+        f"path={csv_path} "
+        f"drop_ratio={row['drop_ratio']:.3f} "
+        f"missing={row['missing_count']} "
+        f"recomputed_mb={row['recomputed_mb']:.3f} "
+        f"node_a_predicted_operator_ms="
+        f"{row['node_a_predicted_operator_ms']:.3f} "
+        f"predicted_operator_ms="
+        f"{row['predicted_operator_ms']:.3f} "
+        f"actual_operator_ms="
+        f"{row['actual_operator_ms']:.3f} "
+        f"actual_total_cost_ms="
+        f"{row['actual_total_recompute_cost_ms']:.3f}",
+        flush=True,
+    )
 
 def tensor_nbytes(t):
     return t.numel() * t.element_size()
@@ -155,8 +333,8 @@ def run_node_b(
     printed_payload_summary = False
 
     # We are assuming the node B has a better computation power
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = "cpu"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = "cpu"
     model = model.to(device)
 
     os.environ["JIN_ROLE"] = "B"
@@ -245,6 +423,16 @@ def run_node_b(
 
         req["payload"].meta = getattr(req["payload"], "meta", {})
         req["payload"].meta["aliases"] = aliases
+        selection_meta = req.get("selection_meta", {})
+
+        req["payload"].meta.update(selection_meta)
+
+        print(
+            "[Node B][SELECTION_META] "
+            f"{selection_meta}",
+            flush=True,
+        )
+
         t_alias1 = time.perf_counter()
 
         print(
@@ -313,6 +501,13 @@ def run_node_b(
             payload_path=req["payload_path"],
             tensor_policy=req.get("tensor_policy", None),
             dryrun_backward_plan=plan
+        )
+        append_recompute_experiment_csv(
+            runtime=runtime_b,
+            csv_path=os.environ.get(
+                "JIN_RECOMPUTE_EXPERIMENT_CSV",
+                "./recompute_cost_experiments.csv",
+            ),
         )
 
         experiment_metrics = getattr(

@@ -61,9 +61,13 @@ def main():
             "No valid rows with predicted_operator_ms > 0"
         )
 
-    operator_scale_values = (
-        valid_operator["recompute_wall_ms"]
-        / valid_operator["predicted_operator_ms"]
+    x = valid_operator["predicted_operator_ms"].to_numpy()
+    y = valid_operator["recompute_wall_ms"].to_numpy()
+
+    operator_scale, recompute_fixed_ms = np.polyfit(
+        x,
+        y,
+        1,
     )
 
     valid_inject = df[
@@ -85,11 +89,8 @@ def main():
         "device": args.device,
         "batch_size": args.batch_size,
 
-        "operator_scale": float(
-            operator_scale_values.median()
-        ),
-
-        "recompute_fixed_ms": 0.0,
+        "operator_scale": float(operator_scale),
+        "recompute_fixed_ms": float(recompute_fixed_ms),
 
         "inject_ms_per_mb": inject_ms_per_mb,
 

@@ -668,6 +668,30 @@ class SplitRuntime:
                     f"[B][RECOMPUTE_FAIL] still missing keys: {missing_keys[:20]}"
                 )                            
             # missing_keys = []
+        # Node A cost-policy prediction from the recompute menu.
+        node_a_predicted_operator_ms = float(
+            payload.meta.get(
+                "predicted_operator_ms",
+                0.0,
+            )
+        )
+
+        node_a_predicted_recompute_ms = float(
+            payload.meta.get(
+                "predicted_recompute_ms",
+                0.0,
+            )
+        )
+
+        node_a_predicted_inject_ms = float(
+            payload.meta.get(
+                "predicted_inject_ms",
+                0.0,
+            )
+        )
+
+        # Node B validation prediction:
+        # sum of profiled costs for actually executed operators.
         predicted_operator_ms = float(
             recompute_stats.get(
                 "predicted_operator_ms",
@@ -677,6 +701,13 @@ class SplitRuntime:
 
         actual_operator_ms = float(
             recompute_stats.get(
+                "actual_operator_ms",
+                0.0,
+            )
+        )
+
+        actual_recompute_ms = float(
+            recompute_stats.get(
                 "actual_recompute_ms",
                 0.0,
             )
@@ -684,7 +715,7 @@ class SplitRuntime:
 
         recompute_overhead_ms = max(
             0.0,
-            recompute_ms - actual_operator_ms,
+            recompute_ms - actual_recompute_ms,
         )
 
         recompute_prediction_ratio = (
@@ -695,13 +726,19 @@ class SplitRuntime:
 
         print(
             f"[B][RECOMPUTE_COST_VALIDATION] "
+            f"node_a_predicted_operator_ms="
+            f"{node_a_predicted_operator_ms:.3f} "
+            f"node_a_predicted_recompute_ms="
+            f"{node_a_predicted_recompute_ms:.3f} "
             f"predicted_operator_ms={predicted_operator_ms:.3f} "
             f"actual_operator_ms={actual_operator_ms:.3f} "
+            f"actual_recompute_ms={actual_recompute_ms:.3f} "
             f"recompute_wall_ms={recompute_ms:.3f} "
             f"recompute_overhead_ms={recompute_overhead_ms:.3f} "
             f"prediction_ratio={recompute_prediction_ratio:.3f}",
             flush=True,
         )
+
         t0 = time.perf_counter()
         loss.backward()
         t1 = time.perf_counter()
@@ -743,6 +780,43 @@ class SplitRuntime:
 
         self.last_experiment_metrics = {
             "missing_count": missing_count_before,
+
+            # Node A selection result.
+            "node_a_selection_policy": payload.meta.get(
+                "selection_policy",
+                "unknown",
+            ),
+            "node_a_drop_ratio": float(
+                payload.meta.get(
+                    "drop_ratio",
+                    0.0,
+                )
+            ),
+            "node_a_saved_mb": float(
+                payload.meta.get(
+                    "saved_mb",
+                    0.0,
+                )
+            ),
+            "node_a_dropped_count": int(
+                payload.meta.get(
+                    "dropped_count",
+                    0,
+                )
+            ),
+
+            # Node A cost-policy estimates.
+            "node_a_predicted_operator_ms": (
+                node_a_predicted_operator_ms
+            ),
+            "node_a_predicted_recompute_ms": (
+                node_a_predicted_recompute_ms
+            ),
+            "node_a_predicted_inject_ms": (
+                node_a_predicted_inject_ms
+            ),
+
+            # Node B recomputation validation.
             "estimated_grouped_ms": recompute_stats.get(
                 "estimated_grouped_ms",
                 0.0,
@@ -750,8 +824,8 @@ class SplitRuntime:
             "predicted_operator_ms": (
                 predicted_operator_ms
             ),
+            "actual_recompute_ms": actual_recompute_ms,
             "actual_operator_ms": actual_operator_ms,
-
             "recompute_wall_ms": recompute_ms,
             "recompute_overhead_ms": (
                 recompute_overhead_ms
@@ -929,12 +1003,12 @@ class SplitRuntime:
                 flush=True,
             )
 
-        print(
-            f"[B][RECOMPUTE_GROUPS] "
-            f"num_groups={len(groups)} "
-            f"sizes={[(s, len(v)) for s, v in groups.items()]}",
-            flush=True,
-        )
+        # print(
+        #     f"[B][RECOMPUTE_GROUPS] "
+        #     f"num_groups={len(groups)} "
+        #     f"sizes={[(s, len(v)) for s, v in groups.items()]}",
+        #     flush=True,
+        # )
         print(
             f"[RECOMPUTE_PLAN_PROFILE] "
             f"find_start_ms={find_ms:.3f} "
@@ -966,25 +1040,25 @@ class SplitRuntime:
                 estimated_ms,
                 missing_profile_nodes,
             ) in items:
-                print(
-                    f"[B][RECOMPUTE_GROUP] "
-                    f"key={key} "
-                    f"start={start} "
-                    f"target={target_node} "
-                    f"estimated_ms={estimated_ms:.6f} "
-                    f"missing_profile={missing_profile_nodes} "
-                    f"path={' -> '.join(path)}",
-                    flush=True,
-                )
+                # print(
+                #     f"[B][RECOMPUTE_GROUP] "
+                #     f"key={key} "
+                #     f"start={start} "
+                #     f"target={target_node} "
+                #     f"estimated_ms={estimated_ms:.6f} "
+                #     f"missing_profile={missing_profile_nodes} "
+                #     f"path={' -> '.join(path)}",
+                #     flush=True,
+                # )
 
                 if target_node in recompute_engine.node_values:
                     out = recompute_engine.node_values[target_node]
 
-                    print(
-                        f"[B][RECOMPUTE_CACHE_HIT] "
-                        f"key={key} target={target_node}",
-                        flush=True,
-                    )
+                    # print(
+                    #     f"[B][RECOMPUTE_CACHE_HIT] "
+                    #     f"key={key} target={target_node}",
+                    #     flush=True,
+                    # )
 
                 else:
                     start_tensor = recompute_engine.node_values[start]
@@ -1019,6 +1093,9 @@ class SplitRuntime:
 
         executed_nodes = list(
             recompute_engine.executed_recompute_nodes
+        )
+        actual_operator_ms = (
+            recompute_engine.actual_operator_ms_total
         )
 
         if torch.cuda.is_available() and torch.device(device).type == "cuda":
@@ -1059,6 +1136,17 @@ class SplitRuntime:
             flush=True,
         )
 
+        recompute_overhead_ms = max(
+            0.0,
+            actual_recompute_ms - actual_operator_ms,
+        )
+
+        operator_prediction_ratio = (
+            actual_operator_ms / predicted_operator_ms
+            if predicted_operator_ms > 0
+            else float("nan")
+        )
+
         prediction_ratio = (
             actual_recompute_ms / predicted_operator_ms
             if predicted_operator_ms > 0
@@ -1069,8 +1157,10 @@ class SplitRuntime:
             f"[B][RECOMPUTE_COST_VALIDATION] "
             f"predicted_operator_ms={predicted_operator_ms:.3f} "
             f"estimated_grouped_ms={estimated_grouped_ms:.3f} "
+            f"actual_operator_ms={actual_operator_ms:.3f} "
             f"actual_recompute_ms={actual_recompute_ms:.3f} "
-            f"actual_over_predicted={prediction_ratio:.3f}",
+            f"recompute_overhead_ms={recompute_overhead_ms:.3f} "
+            f"operator_over_predicted={operator_prediction_ratio:.3f}",
             flush=True,
         )
 
@@ -1080,7 +1170,9 @@ class SplitRuntime:
             "recompute_plan_ms": find_ms + path_ms,
 
             "predicted_operator_ms": predicted_operator_ms,
+            "actual_operator_ms": actual_operator_ms,
             "actual_recompute_ms": actual_recompute_ms,
+            "recompute_overhead_ms": recompute_overhead_ms,
 
             "recompute_executed_node_count": len(
                 executed_nodes
