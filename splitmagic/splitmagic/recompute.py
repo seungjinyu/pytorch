@@ -1,6 +1,13 @@
 import time 
 import torch
 
+from contextlib import nullcontext
+
+def nvtx_range(name):
+    if torch.cuda.is_available():
+        return torch.cuda.nvtx.range(name)
+    return nullcontext()
+
 
 class FXRecomputeEngine:
     def __init__(self, model, gm=None, node_values=None):
@@ -39,7 +46,47 @@ class FXRecomputeEngine:
             return self.modules[module_key]
 
         return None
-    
+    def _get_nvtx_range_name(self, node_name):
+        if node_name == "flatten":
+            op_type = "Flatten"
+
+        elif node_name == "view":
+            op_type = "View"
+
+        elif node_name == "reshape":
+            op_type = "Reshape"
+
+        elif node_name.startswith("add"):
+            op_type = "Add"
+
+        else:
+            module = self._get_module_for_node(node_name)
+
+            if module is not None:
+                class_name = module.__class__.__name__
+
+                op_name_map = {
+                    "Conv2d": "Conv",
+                    "BatchNorm2d": "BN",
+                    "ReLU": "ReLU",
+                    "Linear": "Linear",
+                    "MaxPool2d": "MaxPool",
+                    "AdaptiveAvgPool2d": "AdaptiveAvgPool",
+                }
+
+                op_type = op_name_map.get(
+                    class_name,
+                    class_name,
+                )
+
+            elif "relu" in node_name:
+                # torch.relu 같은 functional ReLU
+                op_type = "ReLU"
+
+            else:
+                op_type = "Unknown"
+
+        return f"RECOMP/{op_type}/{node_name}"
     def _value_for_node(self, node_name):
         if node_name in self.node_values:
             return self.node_values[node_name]
@@ -129,7 +176,10 @@ class FXRecomputeEngine:
             # rhs = self._compute_node_from_start(rhs_name)
             rhs = self._compute_node_from_any_available(rhs_name)
 
-        return lhs + rhs
+        with nvtx_range(f"RECOMP_OP/Add/{add_node_name}"):
+            out = lhs + rhs
+
+        return out
     
     def recompute_path(
         self,
@@ -183,52 +233,55 @@ class FXRecomputeEngine:
             t0 = time.perf_counter()
 
         for node_name in path[1:]:
-
-            if node_name == "flatten":
-                self.executed_recompute_nodes.append(node_name)
-
-                cur = cur.flatten(1)
-                self.node_values[node_name] = cur
-
-            elif node_name == "view":
-                raise NotImplementedError(
-                    "view recompute needs shape info"
-                )
-
-            elif node_name == "reshape":
-                raise NotImplementedError(
-                    "reshape recompute needs shape info"
-                )
-
-            elif node_name.startswith("add"):
-                self.executed_recompute_nodes.append(node_name)
-
-                cur = self._compute_add(node_name, cur)
-                self.node_values[node_name] = cur
-
-            elif (
-                "relu" in node_name
-                and node_name not in self.modules
+                
+            with nvtx_range(
+                self._get_nvtx_range_name(node_name)
             ):
-                self.executed_recompute_nodes.append(node_name)
+                if node_name == "flatten":
+                    self.executed_recompute_nodes.append(node_name)
 
-                cur = torch.relu(cur)
-                self.node_values[node_name] = cur
+                    cur = cur.flatten(1)
+                    self.node_values[node_name] = cur
 
-            else:
-                module = self._get_module_for_node(node_name)
-
-                if module is None:
-                    print(
-                        f"[RECOMPUTE_SKIP_NODE] node={node_name}",
-                        flush=True,
+                elif node_name == "view":
+                    raise NotImplementedError(
+                        "view recompute needs shape info"
                     )
-                    continue
 
-                self.executed_recompute_nodes.append(node_name)
+                elif node_name == "reshape":
+                    raise NotImplementedError(
+                        "reshape recompute needs shape info"
+                    )
 
-                cur = module(cur)
-                self.node_values[node_name] = cur
+                elif node_name.startswith("add"):
+                    self.executed_recompute_nodes.append(node_name)
+
+                    cur = self._compute_add(node_name, cur)
+                    self.node_values[node_name] = cur
+
+                elif (
+                    "relu" in node_name
+                    and node_name not in self.modules
+                ):
+                    self.executed_recompute_nodes.append(node_name)
+
+                    cur = torch.relu(cur)
+                    self.node_values[node_name] = cur
+
+                else:
+                    module = self._get_module_for_node(node_name)
+
+                    if module is None:
+                        print(
+                            f"[RECOMPUTE_SKIP_NODE] node={node_name}",
+                            flush=True,
+                        )
+                        continue
+
+                    self.executed_recompute_nodes.append(node_name)
+
+                    cur = module(cur)
+                    self.node_values[node_name] = cur
 
         if use_cuda_timer:
             end_event.record()

@@ -209,8 +209,8 @@ run_one_experiment() {
 
     set +e
 
-    DROP_RATIO="$drop_ratio" \
-    NETWORK_MBPS="$network_mbps" \
+    JIN_AUTO_DROP_RATIO="$drop_ratio" \
+    JIN_NETWORK_MBPS="$network_mbps" \
     NETWORK_INTERFACE="$DEV" \
     RUN_ID="$run_id" \
     RESULT_CSV="$CURRENT_RUN_DIR/result.csv" \

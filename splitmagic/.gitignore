@@ -9,3 +9,8 @@ profiles/*
 *.json
 *.deb
 *.deb.1
+*.sqlite
+*.qdstrm
+*.nsys-rep
+nsys_results/*
+*.log

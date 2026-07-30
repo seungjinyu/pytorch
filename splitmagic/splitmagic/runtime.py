@@ -8,6 +8,8 @@ from .payload import  payload_from_jin_items
 from .resolver import SavedTensorResolver
 from splitmagic.recompute_cost import RecomputeCostDB
 
+from contextlib import nullcontext
+
 from .fx_trace import (
     build_available_tensors_from_payload,
     build_fx_maps,
@@ -18,6 +20,11 @@ from .fx_trace import (
 from .recompute import FXRecomputeEngine
 
 ALWAYS_LOCAL_KEYS = set()
+
+def nvtx_range(name:str):
+    if torch.cuda.is_available():
+        return torch.cuda.nvtx.range(name)
+    return nullcontext()
 
 def jin_patch_tensor_from_python(key, tensor, step):
     import ctypes
@@ -502,32 +509,42 @@ class SplitRuntime:
         profile_t0 = time.perf_counter()
         t0 = time.perf_counter()
 
-        self.model.train()
-        self.model.zero_grad(set_to_none=True)
+        with nvtx_range("B_zero_grad"):
+            self.model.train()
+            self.model.zero_grad(set_to_none=True)
 
         t1 = time.perf_counter()
         zero_grad_ms = (t1 - t0) * 1000
 
         t0 = time.perf_counter()
-        out_dummy = self.model(x_dummy)
+
+        # dummy forward profiling 
+        with nvtx_range("B_dummy_forward"):
+            out_dummy = self.model(x_dummy)
+
+        # out_dummy = self.model(x_dummy)
         t1 = time.perf_counter()
         dummy_forward_ms = (t1 - t0) * 1000
 
         from .fx_trace import debug_fx_shapes
-        debug_fx_shapes(self.model, x_dummy)
+        with nvtx_range("B_debug_fx_shapes"):
+            debug_fx_shapes(self.model, x_dummy)
 
         t0 = time.perf_counter()
-        if "model.output" not in payload.tensors:
-            raise KeyError("payload does not contain 'model.output'")
 
-        out_real = payload.tensors["model.output"].detach().to(out_dummy.device)
-        out = out_dummy + (out_real - out_dummy).detach()
-        loss = loss_fn(out, y)
+        # loss_build
+        with nvtx_range("B_loss_build"):
+            if "model.output" not in payload.tensors:
+                raise KeyError("payload does not contain 'model.output'")
+
+            out_real = payload.tensors["model.output"].detach().to(out_dummy.device)
+            out = out_dummy + (out_real - out_dummy).detach()
+            loss = loss_fn(out, y)
+
         t1 = time.perf_counter()
         loss_build_ms= ( t1 - t0 ) * 1000
-        print("[B][BACKWARD] start")
 
-        #
+        print("[B][BACKWARD] start")
         plan = dryrun_backward_plan or []
 
         if not plan:
@@ -535,19 +552,21 @@ class SplitRuntime:
         
         t0 = time.perf_counter()
 
-        required_keys = get_required_keys_from_plan(plan)
+        with nvtx_range("B_find_missing_keys"):
 
-        aliases = getattr(payload, "meta", {}).get("aliases", {})
-        payload.meta = getattr(payload, "meta",{})
-        payload.meta["aliases"] = aliases
+            required_keys = get_required_keys_from_plan(plan)
 
-        missing_keys = sorted([
-            k for k in required_keys
-            if (not is_always_local_key(k))
-            and (k not in payload.tensors)
-            and (k not in aliases)
-            and (not has_relu_mask_for(k, payload))
-        ])
+            aliases = getattr(payload, "meta", {}).get("aliases", {})
+            payload.meta = getattr(payload, "meta",{})
+            payload.meta["aliases"] = aliases
+
+            missing_keys = sorted([
+                k for k in required_keys
+                if (not is_always_local_key(k))
+                and (k not in payload.tensors)
+                and (k not in aliases)
+                and (not has_relu_mask_for(k, payload))
+            ])
 
         build_menu = (
             os.environ.get(
@@ -621,13 +640,19 @@ class SplitRuntime:
             )
 
             t0 = time.perf_counter()
-            
-            recomputed, recompute_stats = self.recompute_missing_keys(
-                missing_keys=missing_keys,
-                payload=payload,
-                payload_path=payload_path,
-                device=x_dummy.device,
-            )
+
+            # recompute profile
+            with nvtx_range("B_recompute_total"):
+
+                with nvtx_range("B_recompute_missing_tensors"):
+
+                    recomputed, recompute_stats = self.recompute_missing_keys(
+                        missing_keys=missing_keys,
+                        payload=payload,
+                        payload_path=payload_path,
+                        device=x_dummy.device,
+                    )
+
             recomputed_bytes = sum(
                 tensor.numel() * tensor.element_size()
                 for tensor in recomputed.values()
@@ -641,20 +666,22 @@ class SplitRuntime:
             recompute_ms = (t1 - t0 ) * 1000
 
             t0 = time.perf_counter()
-            inject_recomputed_tensors(
-                payload=payload,
-                payload_path=payload_path,
-                recomputed=recomputed,
-            )
+            with nvtx_range("B_injected_recompute_tensors"):
+                inject_recomputed_tensors(
+                    payload=payload,
+                    payload_path=payload_path,
+                    recomputed=recomputed,
+                )
             
             t1 = time.perf_counter()
             injected_ms = (t1 - t0 ) * 1000
 
             missing_keys = sorted([
                 k for k in required_keys
-                if (not is_always_local_key(k))    
+                if (not is_always_local_key(k))
                 and (k not in payload.tensors)
                 and (k not in aliases)
+                and (not has_relu_mask_for(k, payload))
             ])
 
             print(
@@ -740,26 +767,14 @@ class SplitRuntime:
         )
 
         t0 = time.perf_counter()
-        loss.backward()
+
+        with nvtx_range("B_torch_backward"):
+            loss.backward()
+
         t1 = time.perf_counter()
 
         torch_backward_ms = (t1 - t0) * 1000
 
-        t0 = time.perf_counter()
-
-        grad_dump = {}
-
-        for name, p in self.model.named_parameters():
-            if p.grad is None:
-                continue
-
-            grad_dump[name] = p.grad.detach().cpu().clone()
-
-        torch.save(grad_dump, "/tmp/node_b_grads.pt")
-        t1 = time.perf_counter()
-        grad_dump_ms = (t1 -t0) * 1000
-
-        grad_dump_ms = 0.0
         profile_t1 = time.perf_counter()
         total_backward_jin_ms = (profile_t1 - profile_t0) * 1000
         print(
@@ -771,7 +786,7 @@ class SplitRuntime:
             f"recompute_ms={recompute_ms:.3f} "
             f"injected_ms={injected_ms:.3f} "
             f"torch_backward_ms={torch_backward_ms:.3f} "
-            f"grad_dump_ms={grad_dump_ms:.3f} "
+            # f"grad_dump_ms={grad_dump_ms:.3f} "
             f"total_backward_jin_ms={total_backward_jin_ms:.3f}",
             flush=True,
         )
@@ -945,63 +960,65 @@ class SplitRuntime:
         path_ms = 0.0
         estimated_grouped_ms = 0.0
 
-        for key in recomputable:
-            if key not in key_to_node:
-                print(f"[B][RECOMPUTE_SKIP] no FX target for key={key}")
-                continue
+        with nvtx_range("B_recompute_plan"):
 
-            target_node = key_to_node[key]
+            for key in recomputable:
+                if key not in key_to_node:
+                    print(f"[B][RECOMPUTE_SKIP] no FX target for key={key}")
+                    continue
 
-            t0 = time.perf_counter()
-            start = find_nearest_available_start(
-                node_map=node_map,
-                node_name=target_node,
-                available_nodes=available_tensor_nodes,
-            )
-            t1 = time.perf_counter()
+                target_node = key_to_node[key]
 
-            if start is None:
-                print(f"[B][RECOMPUTE_SKIP] no start tensor for key={key}")
-                continue
-            
-            path = build_path_from_start_to_node(
-                node_map=node_map,
-                start_node=start,
-                target_node=target_node,
-            )
-            t2 = time.perf_counter()
-
-            find_ms += (t1 - t0) * 1000
-            path_ms += (t2 - t1) * 1000
-
-            if not path:
-                print(f"[B][RECOMPUTE_SKIP] empty path for key={key}")
-                continue
-
-            cost_ms, missing_profile_nodes = (
-                recompute_engine.estimate_recompute_cost(path)
-            )
-
-            groups[start].append(
-                (
-                    key,
-                    target_node,
-                    path,
-                    cost_ms,
-                    missing_profile_nodes,
+                t0 = time.perf_counter()
+                start = find_nearest_available_start(
+                    node_map=node_map,
+                    node_name=target_node,
+                    available_nodes=available_tensor_nodes,
                 )
-            )
+                t1 = time.perf_counter()
 
-            print(
-                f"[B][RECOMPUTE_PATH] "
-                f"key={key} "
-                f"start={start} "
-                f"target={target_node} "
-                f"estimated_ms={cost_ms:.6f} "
-                f"missing_profile={missing_profile_nodes} "
-                f"path={' -> '.join(path)}",
-                flush=True,
-            )
+                if start is None:
+                    print(f"[B][RECOMPUTE_SKIP] no start tensor for key={key}")
+                    continue
+                
+                path = build_path_from_start_to_node(
+                    node_map=node_map,
+                    start_node=start,
+                    target_node=target_node,
+                )
+                t2 = time.perf_counter()
+
+                find_ms += (t1 - t0) * 1000
+                path_ms += (t2 - t1) * 1000
+
+                if not path:
+                    print(f"[B][RECOMPUTE_SKIP] empty path for key={key}")
+                    continue
+
+                cost_ms, missing_profile_nodes = (
+                    recompute_engine.estimate_recompute_cost(path)
+                )
+
+                groups[start].append(
+                    (
+                        key,
+                        target_node,
+                        path,
+                        cost_ms,
+                        missing_profile_nodes,
+                    )
+                )
+
+                # print(
+                #     f"[B][RECOMPUTE_PATH] "
+                #     f"key={key} "
+                #     f"start={start} "
+                #     f"target={target_node} "
+                #     f"estimated_ms={cost_ms:.6f} "
+                #     f"missing_profile={missing_profile_nodes} "
+                #     f"path={' -> '.join(path)}",
+                #     flush=True,
+                # )
 
         # print(
         #     f"[B][RECOMPUTE_GROUPS] "
@@ -1020,76 +1037,88 @@ class SplitRuntime:
 
         recompute_exec_t0 = time.perf_counter()
 
-        for start, items in groups.items():
+        gpu_outputs = {}
 
-            # start tensor도 recompute_engine cache에 등록
-            #
-            if start not in recompute_engine.node_values:
-                recompute_engine.node_values[start] = available_tensors[start]
+        with nvtx_range("B_recompute_execute"):
 
-            items = sorted(
-                items,
-                key=lambda x: len(x[2]),
-                reverse=True,
-            )
+            for start, items in groups.items():
 
-            for (
-                key,
-                target_node,
-                path,
-                estimated_ms,
-                missing_profile_nodes,
-            ) in items:
-                # print(
-                #     f"[B][RECOMPUTE_GROUP] "
-                #     f"key={key} "
-                #     f"start={start} "
-                #     f"target={target_node} "
-                #     f"estimated_ms={estimated_ms:.6f} "
-                #     f"missing_profile={missing_profile_nodes} "
-                #     f"path={' -> '.join(path)}",
-                #     flush=True,
-                # )
+                # start tensor도 recompute_engine cache에 등록
+                #
+                if start not in recompute_engine.node_values:
+                    recompute_engine.node_values[start] = available_tensors[start]
 
-                if target_node in recompute_engine.node_values:
-                    out = recompute_engine.node_values[target_node]
+                items = sorted(
+                    items,
+                    key=lambda x: len(x[2]),
+                    reverse=True,
+                )
 
-                    # print(
-                    #     f"[B][RECOMPUTE_CACHE_HIT] "
-                    #     f"key={key} target={target_node}",
-                    #     flush=True,
-                    # )
+                for (
+                    key,
+                    target_node,
+                    path,
+                    estimated_ms,
+                    missing_profile_nodes,
+                ) in items:
 
-                else:
-                    start_tensor = recompute_engine.node_values[start]
+                    if target_node in recompute_engine.node_values:
+                        out = recompute_engine.node_values[target_node]
 
-                    # 실제 실행되는 path만 grouped estimate에 포함
-                    estimated_grouped_ms += estimated_ms
+                    else:
+                        start_tensor = recompute_engine.node_values[start]
 
-                    out = recompute_engine.recompute_path(
-                        start_tensor=start_tensor,
-                        path=path,
-                    )
+                        # 실제 실행되는 path만 grouped estimate에 포함
+                        estimated_grouped_ms += estimated_ms
 
-                if out is None:
+                        out = recompute_engine.recompute_path(
+                            start_tensor=start_tensor,
+                            path=path,
+                        )
+
+                    if out is None:
+                        print(
+                            f"[B][RECOMPUTE_UNSAFE_SKIP] key={key} "
+                            f"start={start} path={' -> '.join(path)}",
+                            flush=True,
+                        )
+                        continue
+
+                    gpu_outputs[key] = out
+
+
+                    available_tensors[target_node] = out
+                    available_tensor_nodes.add(target_node)
+
                     print(
-                        f"[B][RECOMPUTE_UNSAFE_SKIP] key={key} "
-                        f"start={start} path={' -> '.join(path)}",
+                        f"[B][RECOMPUTE_OK] key={key} "
+                        f"start={start} shape={tuple(out.shape)}",
                         flush=True,
                     )
-                    continue
+        # GPU recompute가 끝날 때까지 기다린 후 측정 종료
+        if (
+            torch.cuda.is_available()
+            and torch.device(device).type == "cuda"
+        ):
+            torch.cuda.synchronize(device)
 
+        actual_recompute_ms = (
+            time.perf_counter() - recompute_exec_t0
+        ) * 1000.0
 
-                recomputed[key] = out.detach().cpu().contiguous()
+        # CPU 복사는 별도 측정
+        output_copy_t0 = time.perf_counter()
 
-                available_tensors[target_node] = out
-                available_tensor_nodes.add(target_node)
-
-                print(
-                    f"[B][RECOMPUTE_OK] key={key} "
-                    f"start={start} shape={tuple(out.shape)}",
-                    flush=True,
+        with nvtx_range("B_recompute_output_to_cpu"):
+            for key, out in gpu_outputs.items():
+                recomputed[key] = (
+                    out.detach()
+                    .cpu()
+                    .contiguous()
                 )
+        output_copy_ms = (
+            time.perf_counter() - output_copy_t0
+        ) * 1000.0
 
         executed_nodes = list(
             recompute_engine.executed_recompute_nodes
@@ -1097,14 +1126,6 @@ class SplitRuntime:
         actual_operator_ms = (
             recompute_engine.actual_operator_ms_total
         )
-
-        if torch.cuda.is_available() and torch.device(device).type == "cuda":
-            torch.cuda.synchronize(device)
-
-        actual_recompute_ms = (
-            time.perf_counter() - recompute_exec_t0
-        ) * 1000.0
-
 
         predicted_operator_ms = 0.0
         profiled_node_count = 0
@@ -1172,6 +1193,8 @@ class SplitRuntime:
             "predicted_operator_ms": predicted_operator_ms,
             "actual_operator_ms": actual_operator_ms,
             "actual_recompute_ms": actual_recompute_ms,
+            "recompute_output_to_cpu_ms": output_copy_ms,
+
             "recompute_overhead_ms": recompute_overhead_ms,
 
             "recompute_executed_node_count": len(

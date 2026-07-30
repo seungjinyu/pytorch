@@ -11,6 +11,31 @@ from splitmagic.cost_policy import (
     load_recompute_cost_table, 
 )
 from splitmagic.utils.timing import CSVLogger
+import nvtx
+from contextlib import nullcontext, contextmanager
+import torch
+
+@contextmanager
+def nvtx_range_cpu(name: str):
+    print(f"[NVTX-CPU][ENTER] {name}", flush=True)
+
+    pushed = False
+
+    try:
+        torch.cuda.nvtx.range_push(name)
+        pushed = True
+        yield
+    finally:
+        if pushed:
+            torch.cuda.nvtx.range_pop()
+
+        print(f"[NVTX-CPU][EXIT] {name}", flush=True)
+
+
+def nvtx_range(name: str):
+    if torch.cuda.is_available():
+        return torch.cuda.nvtx.range(name)
+    return nullcontext()
 
 
 def clone_state_dict(model):
@@ -182,6 +207,7 @@ def drop_payload_keys(payload, drop_keys=None):
     return payload
 
 
+
 def run_node_a(
     model,
     train_loader,
@@ -260,6 +286,7 @@ def run_node_a(
         experiment_csv_path,
         [
             "run_id",
+            "network_mbps",
             "drop_ratio",
             "payload_mb",
             "saved_mb",
@@ -285,6 +312,9 @@ def run_node_a(
             "backward_jin_ms",
 
             "request_round_trip_ms",
+            "application_communication_ms",
+            "client_send_pyobj_ms",
+            "client_recv_pyobj_ms",
             "node_b_processing_ms",
             "node_a_total_ms",
             "loss",
@@ -355,6 +385,8 @@ def run_node_a(
         f"[Node A][TEMPLATE_PLAN_LOAD] path={template_plan_path} len={len(plan)}",
         flush=True,
     )
+    max_steps = int(os.environ.get("JIN_MAX_STEPS", "1"))
+    completed_steps = 0
 
     # Actual Training 
     for epoch in range(num_epochs):
@@ -368,267 +400,290 @@ def run_node_a(
             x = x.to(device)
             y = y.to(device)
 
-            iter_t0 = time.perf_counter()
+            with nvtx_range_cpu(f"A_step_{global_step}"):
 
-            t0 = time.perf_counter()
+                iter_t0 = time.perf_counter()
 
-            # 중요: A는 forward only. backward 호출 없음.
-            payload = runtime_a.capture_jin_forward_plan(
-                x=x,
-                plan=plan,
-            )
-            payload.print_add_tensor_profile(
-                prefix="[Payload][CAPTURE_ADD_TENSOR_PROFILE]"
-            )
+                t0 = time.perf_counter()
 
-            t1 = time.perf_counter()
-            capture_forward_ms = (t1 - t0) * 1000
+                with nvtx_range_cpu("A_capture_forward"):
 
-            t0 = time.perf_counter()
-            if enable_alias:
-                payload = alias_duplicate_tensors(payload)
+                    # 중요: A는 forward only. backward 호출 없음.
+                    payload = runtime_a.capture_jin_forward_plan(
+                        x=x,
+                        plan=plan,
+                    )
+                with nvtx_range_cpu("A_payload_profile_print"):
 
-            t1 = time.perf_counter()
-            alias_ms = (t1 - t0) * 1000
-            
-            t0 = time.perf_counter()
+                    payload.print_add_tensor_profile(
+                        prefix="[Payload][CAPTURE_ADD_TENSOR_PROFILE]"
+                    )
 
-            if recompute_policy_name is not None:
-                policy_conf = RECOMPUTE_POLICIES[
-                    recompute_policy_name
-                ]
-                candidate_keys = policy_conf["drop"]
+                t1 = time.perf_counter()
+                capture_forward_ms = (t1 - t0) * 1000
+
+                t0 = time.perf_counter()
+                with nvtx_range_cpu("A_alias_duplicate"):
+                    if enable_alias:
+                        payload = alias_duplicate_tensors(payload)
+
+                t1 = time.perf_counter()
+                alias_ms = (t1 - t0) * 1000
+                
+                t0 = time.perf_counter()
+
+                with nvtx_range_cpu(f"A_selection_{selection_policy}"):
+
+                    if recompute_policy_name is not None:
+                        policy_conf = RECOMPUTE_POLICIES[
+                            recompute_policy_name
+                        ]
+                        candidate_keys = policy_conf["drop"]
+
+                        print(
+                            f"[Node A][SELECTION_STAGE] "
+                            f"policy={selection_policy}",
+                            flush=True,
+                        )
+
+                        if selection_policy == "ratio":
+                            payload = auto_drop_by_ratio(
+                                payload,
+                                candidate_keys=candidate_keys,
+                                drop_ratio=auto_drop_ratio,
+                            )
+
+                            payload.meta["selection_policy"] = "ratio"
+
+                        elif selection_policy == "cost":
+                            print("[Node A][ENTER_COST]", flush=True)
+
+                            cost0 = time.perf_counter()
+
+                            payload = auto_drop_by_cost(
+                                payload=payload,
+                                candidate_keys=candidate_keys,
+                                cost_table=recompute_cost_table,
+                                network_mbps=network_mbps,
+                                inject_ms_per_mb=inject_ms_per_mb,
+                                min_benefit_ms=min_benefit_ms,
+                                max_drop_ratio=max_cost_drop_ratio,
+                            )
+
+                            cost1 = time.perf_counter()
+
+                            print(
+                                "[AUTO_DROP_COST_TABLE_TIME] "
+                                f"{(cost1 - cost0) * 1000:.3f} ms",
+                                flush=True,
+                            )
+
+                        elif selection_policy == "none":
+                            payload.meta["selection_policy"] = "none"
+                            payload.meta["auto_dropped_keys"] = []
+                            payload.meta["drop_ratio"] = 0.0
+                            payload.meta["dropped_count"] = 0
+                            payload.meta["saved_mb"] = 0.0
+
+                        print("[Node A][SELECTION_END]", flush=True)
+
+                t1 = time.perf_counter()
+                auto_drop_ms = (t1 - t0) * 1000
+
+                policy_meta = payload.meta.get("tensor_policy", {})
+
+                extra = {
+                    "tensor_policy": policy_meta,
+                    "dryrun_backward_plan": payload.meta.get(
+                        "dryrun_backward_plan", []
+                    ),
+                    "aliases": payload.meta.get("aliases", {}),
+
+                    # Cost-policy metadata
+                    "selection_meta": {
+                        "selection_policy": payload.meta.get(
+                            "selection_policy", "none"
+                        ),
+                        "drop_ratio": payload.meta.get(
+                            "drop_ratio", 0.0
+                        ),
+                        "saved_mb": payload.meta.get(
+                            "saved_mb", 0.0
+                        ),
+                        "dropped_count": payload.meta.get(
+                            "dropped_count", 0
+                        ),
+                        "predicted_operator_ms": payload.meta.get(
+                            "predicted_operator_ms", 0.0
+                        ),
+                        "predicted_recompute_ms": payload.meta.get(
+                            "predicted_recompute_ms", 0.0
+                        ),
+                        "predicted_inject_ms": payload.meta.get(
+                            "predicted_inject_ms", 0.0
+                        ),
+                        "predicted_send_saved_ms": payload.meta.get(
+                            "predicted_send_saved_ms", 0.0
+                        ),
+                        "predicted_benefit_ms": payload.meta.get(
+                            "predicted_benefit_ms", 0.0
+                        ),
+                    },
+                }
+
+                if global_step == 0:
+                    extra["state_dict"] = clone_state_dict(model)
+
+                t_send0 = time.perf_counter()
+
+                with nvtx_range_cpu("A_request_reply_total"):
+
+                    reply = client.send_payload(
+                        payload=payload,
+                        y=y,
+                        batch_size=x.size(0),
+                        extra=extra,
+                    )
+
+                t_send1 = time.perf_counter()
+
+                if reply["status"] != "ok":
+                    print("[Node A] bad reply:", reply)
+                    break
+
+                payload_mb = reply["bytes"] / 1024 / 1024
+
+                drop_ratio_value = float(
+                    payload.meta.get("drop_ratio", 0.0)
+                )
+
+                saved_mb = float(
+                    payload.meta.get("saved_mb", 0.0)
+                )
+
+                dropped_count = int(
+                    payload.meta.get("dropped_count", 0)
+                )
+
+                if grad_save_path is not None and "grads" in reply:
+                    torch.save(reply["grads"], grad_save_path)
+                    print(f"[Node A] saved grads to {grad_save_path}")
+
+                t_load0 = time.perf_counter()
+
+                if global_step == 0 and "grads" in reply:
+                    grad_keys = sorted(reply["grads"].keys())
+
+                with nvtx_range_cpu("A_load_updated_state"):
+                    model.load_state_dict(reply["updated_state_dict"])
+
+                t_load1 = time.perf_counter()
+                send_recv_ms = (t_send1 - t_send0) * 1000
+                state_load_ms = (t_load1 - t_load0) * 1000
+
+                total_ms = (
+                    capture_forward_ms
+                    + alias_ms
+                    + auto_drop_ms
+                    + send_recv_ms
+                    + state_load_ms
+                )
+                iteration_wall_ms = (time.perf_counter() - iter_t0) * 1000
 
                 print(
-                    f"[Node A][SELECTION_STAGE] "
-                    f"policy={selection_policy}",
+                    f"[Node A] epoch={epoch} step={global_step} "
+                    f"loss={reply['loss']:.6f} "
+                    f"payload_mb={payload_mb:.3f} "
+                    f"capture_forward_ms={capture_forward_ms:.3f} "
+                    f"alias_ms={alias_ms:.3f} "
+                    f"auto_drop_ms={auto_drop_ms:.3f} "
+                    f"send_recv_ms={send_recv_ms:.3f} "
+                    f"application_communication_ms="
+                    f"{reply.get('application_communication_ms', 0.0):.3f} "
+                    f"state_load_ms={state_load_ms:.3f} "
+                    f"total_ms={total_ms:.3f}",
                     flush=True,
                 )
 
-                if selection_policy == "ratio":
-                    payload = auto_drop_by_ratio(
-                        payload,
-                        candidate_keys=candidate_keys,
-                        drop_ratio=auto_drop_ratio,
-                    )
+                logger.write(
+                    [
+                        global_step,
+                        reply["loss"],
+                        payload_mb,
+                        capture_forward_ms,
+                        alias_ms,
+                        auto_drop_ms,
+                        send_recv_ms,
+                        state_load_ms,
+                        total_ms,
+                    ]
+                )
+                recompute_wall_ms_value = float(
+                    reply.get("recompute_wall_ms", 0.0)
+                )
 
-                    payload.meta["selection_policy"] = "ratio"
+                inject_ms_value = float(
+                    reply.get("inject_ms", 0.0)
+                )
 
-                elif selection_policy == "cost":
-                    print("[Node A][ENTER_COST]", flush=True)
+                total_recompute_cost_ms = (
+                    recompute_wall_ms_value
+                    + inject_ms_value
+                )
+                experiment_logger.write([
+                    run_id,
+                    network_mbps,
+                    drop_ratio_value,
+                    payload_mb,
+                    saved_mb,
+                    dropped_count,
+                    reply.get("missing_count", 0),
 
-                    cost0 = time.perf_counter()
+                    reply.get("estimated_grouped_ms", 0.0),
+                    reply.get("predicted_operator_ms", 0.0),
 
-                    payload = auto_drop_by_cost(
-                        payload=payload,
-                        candidate_keys=candidate_keys,
-                        cost_table=recompute_cost_table,
-                        network_mbps=network_mbps,
-                        inject_ms_per_mb=inject_ms_per_mb,
-                        min_benefit_ms=min_benefit_ms,
-                        max_drop_ratio=max_cost_drop_ratio,
-                    )
+                    recompute_wall_ms_value,
+                    reply.get("recompute_overhead_ms", 0.0),
+                    reply.get("recompute_prediction_ratio", 0.0),
+                    reply.get("recomputed_mb", 0.0),
+                    inject_ms_value,
+                    total_recompute_cost_ms,
 
-                    cost1 = time.perf_counter()
+                    reply.get(
+                        "recompute_executed_node_count",
+                        0,
+                    ),
+                    reply.get(
+                        "recompute_profiled_node_count",
+                        0,
+                    ),
+                    reply.get(
+                        "recompute_missing_profile_count",
+                        0,
+                    ),
 
+                    reply.get("recompute_plan_ms", 0.0),
+                    reply.get("torch_backward_ms", 0.0),
+                    reply.get("backward_jin_ms", 0.0),
+
+                    reply.get("request_round_trip_ms", send_recv_ms),
+                    reply.get("application_communication_ms", 0.0),
+                    reply.get("client_send_pyobj_ms", 0.0),
+                    reply.get("client_recv_pyobj_ms", 0.0),
+                    reply.get("node_b_processing_ms", 0.0),
+                    total_ms,
+                    reply["loss"],
+                ])
+
+                global_step += 1
+                completed_steps += 1
+
+                if completed_steps >= max_steps:
                     print(
-                        "[AUTO_DROP_COST_TABLE_TIME] "
-                        f"{(cost1 - cost0) * 1000:.3f} ms",
+                        f"[Node A][DONE] completed_steps={completed_steps}",
                         flush=True,
                     )
-
-                elif selection_policy == "none":
-                    payload.meta["selection_policy"] = "none"
-                    payload.meta["auto_dropped_keys"] = []
-                    payload.meta["drop_ratio"] = 0.0
-                    payload.meta["dropped_count"] = 0
-                    payload.meta["saved_mb"] = 0.0
-
-                print("[Node A][SELECTION_END]", flush=True)
-            t1 = time.perf_counter()
-            auto_drop_ms = (t1 - t0) * 1000
-
-            policy_meta = payload.meta.get("tensor_policy", {})
-
-            extra = {
-                "tensor_policy": policy_meta,
-                "dryrun_backward_plan": payload.meta.get(
-                    "dryrun_backward_plan", []
-                ),
-                "aliases": payload.meta.get("aliases", {}),
-
-                # Cost-policy metadata
-                "selection_meta": {
-                    "selection_policy": payload.meta.get(
-                        "selection_policy", "none"
-                    ),
-                    "drop_ratio": payload.meta.get(
-                        "drop_ratio", 0.0
-                    ),
-                    "saved_mb": payload.meta.get(
-                        "saved_mb", 0.0
-                    ),
-                    "dropped_count": payload.meta.get(
-                        "dropped_count", 0
-                    ),
-                    "predicted_operator_ms": payload.meta.get(
-                        "predicted_operator_ms", 0.0
-                    ),
-                    "predicted_recompute_ms": payload.meta.get(
-                        "predicted_recompute_ms", 0.0
-                    ),
-                    "predicted_inject_ms": payload.meta.get(
-                        "predicted_inject_ms", 0.0
-                    ),
-                    "predicted_send_saved_ms": payload.meta.get(
-                        "predicted_send_saved_ms", 0.0
-                    ),
-                    "predicted_benefit_ms": payload.meta.get(
-                        "predicted_benefit_ms", 0.0
-                    ),
-                },
-            }
-
-            if global_step == 0:
-                extra["state_dict"] = clone_state_dict(model)
-
-            t_send0 = time.perf_counter()
-
-            reply = client.send_payload(
-                payload=payload,
-                y=y,
-                batch_size=x.size(0),
-                extra=extra,
-            )
-
-            t_send1 = time.perf_counter()
-
-            if reply["status"] != "ok":
-                print("[Node A] bad reply:", reply)
-                break
-
-            payload_mb = reply["bytes"] / 1024 / 1024
-
-            drop_ratio_value = float(
-                payload.meta.get("drop_ratio", 0.0)
-            )
-
-            saved_mb = float(
-                payload.meta.get("saved_mb", 0.0)
-            )
-
-            dropped_count = int(
-                payload.meta.get("dropped_count", 0)
-            )
-
-            if grad_save_path is not None and "grads" in reply:
-                torch.save(reply["grads"], grad_save_path)
-                print(f"[Node A] saved grads to {grad_save_path}")
-
-            t_load0 = time.perf_counter()
-
-            if global_step == 0 and "grads" in reply:
-                grad_keys = sorted(reply["grads"].keys())
-                # print(
-                #     f"[Node A][GRADS] num={len(grad_keys)} grads={grad_keys}",
-                #     flush=True,
-                # )
-                
-            model.load_state_dict(reply["updated_state_dict"])
-
-            t_load1 = time.perf_counter()
-            send_recv_ms = (t_send1 - t_send0) * 1000
-            state_load_ms = (t_load1 - t_load0) * 1000
-
-            total_ms = (
-                capture_forward_ms
-                + alias_ms
-                + auto_drop_ms
-                + send_recv_ms
-                + state_load_ms
-            )
-            iteration_wall_ms = (time.perf_counter() - iter_t0) * 1000
-
-            print(
-                f"[Node A] epoch={epoch} step={global_step} "
-                f"loss={reply['loss']:.6f} "
-                f"payload_mb={payload_mb:.3f} "
-                f"capture_forward_ms={capture_forward_ms:.3f} "
-                f"alias_ms={alias_ms:.3f} "
-                f"auto_drop_ms={auto_drop_ms:.3f} "
-                f"send_recv_ms={send_recv_ms:.3f} "
-                f"state_load_ms={state_load_ms:.3f} "
-                f"total_ms={total_ms:.3f}",
-                flush=True,
-            )
-
-            logger.write(
-                [
-                    global_step,
-                    reply["loss"],
-                    payload_mb,
-                    capture_forward_ms,
-                    alias_ms,
-                    auto_drop_ms,
-                    send_recv_ms,
-                    state_load_ms,
-                    total_ms,
-                ]
-            )
-            recompute_wall_ms_value = float(
-                reply.get("recompute_wall_ms", 0.0)
-            )
-
-            inject_ms_value = float(
-                reply.get("inject_ms", 0.0)
-            )
-
-            total_recompute_cost_ms = (
-                recompute_wall_ms_value
-                + inject_ms_value
-            )
-            experiment_logger.write([
-                run_id,
-                drop_ratio_value,
-                payload_mb,
-                saved_mb,
-                dropped_count,
-                reply.get("missing_count", 0),
-
-                reply.get("estimated_grouped_ms", 0.0),
-                reply.get("predicted_operator_ms", 0.0),
-
-                recompute_wall_ms_value,
-                reply.get("recompute_overhead_ms", 0.0),
-                reply.get("recompute_prediction_ratio", 0.0),
-                reply.get("recomputed_mb", 0.0),
-                inject_ms_value,
-                total_recompute_cost_ms,
-
-                reply.get(
-                    "recompute_executed_node_count",
-                    0,
-                ),
-                reply.get(
-                    "recompute_profiled_node_count",
-                    0,
-                ),
-                reply.get(
-                    "recompute_missing_profile_count",
-                    0,
-                ),
-
-                reply.get("recompute_plan_ms", 0.0),
-                reply.get("torch_backward_ms", 0.0),
-                reply.get("backward_jin_ms", 0.0),
-
-                send_recv_ms,
-                reply.get("node_b_processing_ms", 0.0),
-                total_ms,
-                reply["loss"],
-            ])
-
-            global_step += 1
+                    return
 
     print("[Node A] done")
 

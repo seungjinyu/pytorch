@@ -8,6 +8,33 @@ from splitmagic import SplitRuntime, ZMQServer
 from splitmagic.utils.timing import CSVLogger
 from splitmagic.runtime import read_dryrun_plan
 from splitmagic.runtime import jin_set_payload_bytes_from_python
+from contextlib import nullcontext
+
+from contextlib import contextmanager
+
+print(
+    f"[Node B][SCRIPT_CHECK] "
+    f"file={os.path.abspath(__file__)} "
+    f"pid={os.getpid()} "
+    f"torch={torch.__file__} "
+    f"cuda={torch.cuda.is_available()}",
+    flush=True,
+)
+
+@contextmanager
+def nvtx_range(name: str):
+    print(f"[NVTX][ENTER] {name}", flush=True)
+
+    if torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(name)
+
+    try:
+        yield
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.nvtx.range_pop()
+
+        print(f"[NVTX][EXIT] {name}", flush=True)
 
 def append_recompute_experiment_csv(
     runtime,
@@ -250,43 +277,56 @@ def clone_grads(model):
 
 
 def build_template_plan_on_b(model, batch_size, device):
-    plan_path = "/tmp/jin_template_plan.tsv"
 
-    if os.path.exists(plan_path):
-        os.remove(plan_path)
+    template_plan_path = os.environ.get(
+        "JIN_TEMPLATE_PLAN_PATH",
+        "/tmp/jin_template_plan.tsv",
+    )
+
+    if os.path.exists(template_plan_path):
+        os.remove(template_plan_path)
 
     os.environ["JIN_ROLE"] = "B"
     os.environ["JIN_DRYRUN"] = "1"
-    os.environ["JIN_DRYRUN_PATH"] = plan_path
+    os.environ["JIN_DRYRUN_PATH"] = template_plan_path
 
     model.zero_grad(set_to_none=True)
 
     x_dummy = torch.randn(batch_size, 3, 32, 32, device=device)
     y_dummy = torch.zeros(batch_size, dtype=torch.long, device=device)
 
-    out = model(x_dummy)
-    loss = F.cross_entropy(out, y_dummy)
-    loss.backward()
+    with nvtx_range("B_template_dryrun"):
+        out = model(x_dummy)
+        loss = F.cross_entropy(out, y_dummy)
+        loss.backward()
 
     model.zero_grad(set_to_none=True)
 
     os.environ.pop("JIN_DRYRUN", None)
     os.environ.pop("JIN_DRYRUN_PATH", None)
 
-    plan = read_dryrun_plan(plan_path)
+    plan = read_dryrun_plan(template_plan_path)
 
     if not plan:
-        raise RuntimeError(f"[Node B] template plan empty: {plan_path}")
+        raise RuntimeError(f"[Node B] template plan empty: {template_plan_path}")
 
-    print(f"[Node B][TEMPLATE_PLAN] path={plan_path} len={len(plan)}")
+    print(f"[Node B][TEMPLATE_PLAN] path={template_plan_path} len={len(plan)}")
 
     return plan
 
 
-def write_execution_plan(plan, path = "/tmp/jin_execution_plan.tsv"):
-    plan_path = path
+def write_execution_plan(plan, path=None):
+    if path is None:
+        path = os.environ.get(
+            "JIN_EXECUTION_PLAN_PATH",
+            "/tmp/jin_execution_plan.tsv",
+        )
 
-    with open(plan_path, "w") as f:
+    parent_dir = os.path.dirname(path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+
+    with open(path, "w") as f:
         for e in plan:
             f.write(
                 f"{e['row_id']}\t"
@@ -296,19 +336,30 @@ def write_execution_plan(plan, path = "/tmp/jin_execution_plan.tsv"):
                 f"{e['shape']}\n"
             )
 
-    os.environ["JIN_EXECUTION_PLAN_PATH"] = plan_path
+    os.environ["JIN_EXECUTION_PLAN_PATH"] = path
 
     print(
-        f"[Node B][EXEC_PLAN_SAVE]"
-        f"path={plan_path}"
+        f"[Node B][EXEC_PLAN_SAVE] "
+        f"path={path} "
         f"len={len(plan)}",
         flush=True,
     )
 
-    return plan_path
+    return path
 
 
-def write_alias_tsv(aliases, path="/tmp/jin_payload_alias.tsv"):
+def write_alias_tsv(aliases, path=None):
+
+    if path is None:
+        path = os.environ.get(
+            "JIN_ALIAS_PATH",
+            "/tmp/jin_payload_recv.bin.alias",
+        )
+
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
     with open(path, "w") as f:
         for alias_key, canonical_key in aliases.items():
             f.write(f"{alias_key}\t{canonical_key}\n")
@@ -329,6 +380,14 @@ def run_node_b(
     log_level="2",
     send_grads=False,
 ):
+    max_steps = int(
+        os.environ.get("JIN_MAX_STEPS", "1")
+    )
+
+    print(
+        f"[Node B][CONFIG] max_steps={max_steps}",
+        flush=True,
+    )
     
     printed_payload_summary = False
 
@@ -386,318 +445,363 @@ def run_node_b(
         # receive timer
         t_recv0 = time.perf_counter()
 
-        req = server.recv_payload()
+        with nvtx_range("B_wait_request"):
+            req = server.recv_payload()
 
         t_recv1 = time.perf_counter()
 
         if req is None:
             break
         if isinstance(req, dict) and req.get("kind") == "get_template_plan":
-            server.send_reply({
-                "status": "ok",
-                "kind": "template_plan",
-                "template_plan": template_plan,
-            })
+            with nvtx_range("B_handle_template_plan_request"):
+                server.send_reply({
+                    "status": "ok",
+                    "kind": "template_plan",
+                    "template_plan": template_plan,
+                })
+                print(
+                    f"[Node B][TEMPLATE_PLAN_SEND] len={len(template_plan)}",
+                    flush=True,
+                )
+            continue
+        with nvtx_range("B_handle_training_request"):
+            t_step0 = time.perf_counter()
+
+            # Read saved tensor from payload from Node A
+            t_read0 = time.perf_counter()
+
+            jin_payload = req["payload"]
+            req["payload"] = jin_payload
+            t_read1 = time.perf_counter()
+
+            # Alias time 
+            t_alias0 = time.perf_counter()
+            with nvtx_range("B_alias_setup"):
+                aliases = req.get("aliases", {})
+                alias_path = os.environ.get(
+                    "JIN_ALIAS_PATH",
+                    req["payload_path"] + ".alias",
+                )
+
+                write_alias_tsv(
+                    aliases,
+                    alias_path,
+                )
+
+                req["payload"].meta = getattr(req["payload"], "meta", {})
+                req["payload"].meta["aliases"] = aliases
+
+                selection_meta = req.get("selection_meta", {})
+                req["payload"].meta.update(selection_meta)
+
             print(
-                f"[Node B][TEMPLATE_PLAN_SEND] len={len(template_plan)}",
+                "[Node B][SELECTION_META] "
+                f"{selection_meta}",
                 flush=True,
             )
-            continue
 
-        t_step0 = time.perf_counter()
+            t_alias1 = time.perf_counter()
 
-        # Read saved tensor from payload from Node A
-        t_read0 = time.perf_counter()
+            print(
+                f"[Node B][ALIAS] n={len(aliases)} "
+                f"path={alias_path}",
+                flush=True,
+            )
 
-        jin_payload = req["payload"]
-        req["payload"] = jin_payload
-        t_read1 = time.perf_counter()
+            payload_keys = sorted(req["payload"].tensors.keys())
 
-        # Alias time 
-        t_alias0 = time.perf_counter()
-        aliases = req.get("aliases", {})
-        alias_path = req["payload_path"] + ".alias"
+            if not printed_payload_summary:
+                print_payload_size_summary(req["payload"], topk=30)
+                printed_payload_summary = True
 
-        # Key matching for duplicated values
-        write_alias_tsv(aliases,alias_path)
+            t_state_load0 = time.perf_counter()
 
-        req["payload"].meta = getattr(req["payload"], "meta", {})
-        req["payload"].meta["aliases"] = aliases
-        selection_meta = req.get("selection_meta", {})
+            with nvtx_range("B_load_state_dict"):
+                
+                if "state_dict" in req:
+                    print("[Node B] state dict loaded\n")
+                    model.load_state_dict(req["state_dict"])
 
-        req["payload"].meta.update(selection_meta)
+            t_state_load1 = time.perf_counter()
 
-        print(
-            "[Node B][SELECTION_META] "
-            f"{selection_meta}",
-            flush=True,
-        )
+            plan = req.get("dryrun_backward_plan", None)
+            if not plan:
+                plan = template_plan
 
-        t_alias1 = time.perf_counter()
+            os.environ["JIN_ROLE"] = "B"
+            os.environ["JIN_PAYLOAD_PATH"] = req["payload_path"]
+            os.environ["JIN_STEP"] = str(step)
 
-        print(
-            f"[Node B][ALIAS] n={len(aliases)} "
-            f"path={alias_path}",
-            flush=True,
-        )
+            with nvtx_range("B_prepare_inputs"):
 
-        payload_keys = sorted(req["payload"].tensors.keys())
+                y = req["y"].to(device)
 
-        if not printed_payload_summary:
-            print_payload_size_summary(req["payload"], topk=30)
-            printed_payload_summary = True
+                x_dummy = torch.randn(
+                    req["batch_size"],
+                    3,
+                    32,
+                    32,
+                    device=device,
+                )
 
-        t_state_load0 = time.perf_counter()
-        
-        if "state_dict" in req:
-            print("[Node B] state dict loaded\n")
-            model.load_state_dict(req["state_dict"])
+            # Setting up to zero   
+            optimizer.zero_grad(set_to_none=True)
 
-        t_state_load1 = time.perf_counter()
+            payload_keys = sorted(req["payload"].tensors.keys())
+            print(
+                f"[Node B][PAYLOAD] "
+                f"num_keys={len(payload_keys)} "
+                f"first={payload_keys[:10]}",
+                flush=True,
+            )
 
-        plan = req.get("dryrun_backward_plan", None)
-        if not plan:
-            plan = template_plan
+            t_backward0 = time.perf_counter()
 
-        os.environ["JIN_ROLE"] = "B"
-        os.environ["JIN_PAYLOAD_PATH"] = req["payload_path"]
-        os.environ["JIN_STEP"] = str(step)
+            with nvtx_range("B_reserialize_payload_jin1"):
+                payload_bytes = (
+                    req["payload"].to_jin1_bytes()
+                )
 
-        y = req["y"].to(device)
+            with nvtx_range("B_set_jin_payload_bytes"):
+                jin_set_payload_bytes_from_python(
+                    payload_bytes=payload_bytes,
+                    step=step,
+                )
 
-        x_dummy = torch.randn(
-            req["batch_size"],
-            3,
-            32,
-            32,
-            device=device,
-        )
+            with nvtx_range("B_backward_jin_total"):
+                loss = runtime_b.backward_jin(
+                    x_dummy,
+                    y=y,
+                    payload=req["payload"],
+                    loss_fn=F.cross_entropy,
+                    payload_path=req["payload_path"],
+                    tensor_policy=req.get(
+                        "tensor_policy",
+                        None,
+                    ),
+                    dryrun_backward_plan=plan,
+                )
+            append_recompute_experiment_csv(
+                runtime=runtime_b,
+                csv_path=os.environ.get(
+                    "JIN_RECOMPUTE_EXPERIMENT_CSV",
+                    "./recompute_cost_experiments.csv",
+                ),
+            )
 
-        # Setting up to zero
-        optimizer.zero_grad(set_to_none=True)
+            experiment_metrics = getattr(
+                runtime_b,
+                "last_experiment_metrics",
+                {},
+            )
 
-        payload_keys = sorted(req["payload"].tensors.keys())
-        print(
-            f"[Node B][PAYLOAD] "
-            f"num_keys={len(payload_keys)} "
-            f"first={payload_keys[:10]}",
-            flush=True,
-        )
+            t_backward1 = time.perf_counter()
 
-        t_backward0 = time.perf_counter()
+            clone_grads_ms = 0.0
 
-        payload_bytes = req["payload"].to_jin1_bytes()
-        
-        jin_set_payload_bytes_from_python(
-            payload_bytes=payload_bytes,
-            step=step,
-        )
+            if send_grads:
+                t_grads0 = time.perf_counter()
+                
+                with nvtx_range("B_clone_grads_to_cpu"):
+                    grads, grad_bytes, grad_tensors = (
+                        clone_grads(model)
+                    )
+                t_grads1 = time.perf_counter()
+                clone_grads_ms = (t_grads1 - t_grads0) * 1000
 
-        loss = runtime_b.backward_jin(
-            x_dummy,
-            y=y,
-            payload=req["payload"],
-            loss_fn=F.cross_entropy,
-            payload_path=req["payload_path"],
-            tensor_policy=req.get("tensor_policy", None),
-            dryrun_backward_plan=plan
-        )
-        append_recompute_experiment_csv(
-            runtime=runtime_b,
-            csv_path=os.environ.get(
-                "JIN_RECOMPUTE_EXPERIMENT_CSV",
-                "./recompute_cost_experiments.csv",
-            ),
-        )
+            else:
+                grads = None 
+                grad_bytes = 0 
+                grad_tensors = 0
 
-        experiment_metrics = getattr(
-            runtime_b,
-            "last_experiment_metrics",
-            {},
-        )
+            t_opt0 = time.perf_counter()
 
-        t_backward1 = time.perf_counter()
+            with nvtx_range("B_optimizer_step"):
+                optimizer.step()
 
-        clone_grads_ms = 0.0
+            t_opt1 = time.perf_counter()
 
-        if send_grads:
-            t_grads0 = time.perf_counter()
-            grads, grad_bytes, grad_tensors = clone_grads(model)
-            t_grads1 = time.perf_counter()
-            clone_grads_ms = (t_grads1 - t_grads0) * 1000
-
-        else:
-            grads = None 
-            grad_bytes = 0 
-            grad_tensors = 0
-
-        t_opt0 = time.perf_counter()
-        optimizer.step()
-        t_opt1 = time.perf_counter()
-
-        t_state_dump0 = time.perf_counter()
-
-        updated_state = {}
-        state_bytes = 0
-        state_tensors = 0
-
-        for k, v in model.state_dict().items():
-            t = v.detach().cpu().clone()
-            updated_state[k] = t
-
-            state_tensors += 1
-            state_bytes += t.numel() * t.element_size()
-
-        t_state_dump1 = time.perf_counter()
-
-        payload_mb = req["num_bytes"] / 1024 / 1024
-
-        t_send0 = time.perf_counter()
-
-        node_b_processing_ms = (
-            t_send0 - t_step0
-        ) * 1000
-        reply = {
-            "status": "ok",
-            "step": step,
-            "loss": float(loss.detach().cpu()),
-            "bytes": req["num_bytes"],
-            "updated_state_dict": updated_state,
-
-            "missing_count": experiment_metrics.get(
-                "missing_count",
-                0,
-            ),
-
-            "estimated_grouped_ms": experiment_metrics.get(
-                "estimated_grouped_ms",
-                0.0,
-            ),
-
-            "predicted_operator_ms": experiment_metrics.get(
-                "predicted_operator_ms",
-                0.0,
-            ),
-
-            "recompute_wall_ms": experiment_metrics.get(
-                "recompute_wall_ms",
-                0.0,
-            ),
-
-            "recompute_overhead_ms": experiment_metrics.get(
-                "recompute_overhead_ms",
-                0.0,
-            ),
-
-            "recompute_prediction_ratio": experiment_metrics.get(
-                "recompute_prediction_ratio",
-                0.0,
-            ),
-
-            "recomputed_mb": experiment_metrics.get(
-                "recomputed_mb",
-                0.0,
-            ),
-
-            "recompute_executed_node_count": experiment_metrics.get(
-                "recompute_executed_node_count",
-                0,
-            ),
-
-            "recompute_profiled_node_count": experiment_metrics.get(
-                "recompute_profiled_node_count",
-                0,
-            ),
-
-            "recompute_missing_profile_count": experiment_metrics.get(
-                "recompute_missing_profile_count",
-                0,
-            ),
-
-            "recompute_plan_ms": experiment_metrics.get(
-                "recompute_plan_ms",
-                0.0,
-            ),
-
-            "inject_ms": experiment_metrics.get(
-                "inject_ms",
-                0.0,
-            ),
-
-            "torch_backward_ms": experiment_metrics.get(
-                "torch_backward_ms",
-                0.0,
-            ),
-
-            "backward_jin_ms": experiment_metrics.get(
-                "backward_jin_ms",
-                0.0,
-            ),
-
-            "node_b_processing_ms": node_b_processing_ms,
-        }
-        if send_grads:
-            reply["grads"] = grads
-
-        server.send_reply(reply)
-            
-        print(
-            f"[Node B] step={step} "
-            f"loss={loss.item():.6f} "
-            f"payload_mb={payload_mb:.3f}"
-        )
-
-        t_send1 = time.perf_counter()
-
-        t_step1 = time.perf_counter()
-
-        recv_wait_ms = (t_recv1 - t_recv0) * 1000
-        read_jin1_ms = (t_read1 - t_read0) * 1000
-        alias_ms = (t_alias1 - t_alias0) * 1000
-        state_load_ms = (t_state_load1 - t_state_load0) * 1000
-        backward_jin_ms = (t_backward1 - t_backward0) * 1000
-        optimizer_step_ms = (t_opt1 - t_opt0) * 1000
-        state_dump_ms = (t_state_dump1 - t_state_dump0) * 1000
-        send_reply_ms = (t_send1 - t_send0) * 1000
-        total_step_ms = (t_step1 - t_step0) * 1000
+            t_state_dump0 = time.perf_counter()
 
 
-        print(
-            f"[Node B] step={step} "
-            f"loss={loss.item():.6f} "
-            f"payload_mb={payload_mb:.3f} "
-            f"read_jin1_ms={read_jin1_ms:.3f} "
-            f"backward_jin_ms={backward_jin_ms:.3f} "
-            f"state_dump_ms={state_dump_ms:.3f} "
-            f"state_mb={state_bytes / 1024 / 1024:.3f} "
-            f"state_tensors={state_tensors} "
-            f"send_reply_ms={send_reply_ms:.3f} "
-            f"clone_grads_ms={clone_grads_ms:.3f} "
-            # f"grads_mb={grad_bytes / 1024 / 1024:.3f} "
-            # f"grad_tensors={grad_tensors} "
-            f"total_step_ms={total_step_ms:.3f}",
-            
-            flush=True,
-        )
+            with nvtx_range("B_state_dump_to_cpu"):
+                updated_state = {}
+                state_bytes = 0
+                state_tensors = 0
 
-        logger.write([
-            step,
-            float(loss.detach().cpu()),
-            payload_mb,
-            recv_wait_ms,
-            read_jin1_ms,
-            alias_ms,
-            state_load_ms,
-            backward_jin_ms,
-            clone_grads_ms,
-            # grad_bytes / 1024 / 1024,
-            # grad_tensors,
-            optimizer_step_ms,
-            state_dump_ms,
-            state_bytes / 1024 / 1024,
-            state_tensors,
-            send_reply_ms,
-            total_step_ms,
-        ])
+                for k, v in model.state_dict().items():
+                    t = v.detach().cpu().clone()
+                    updated_state[k] = t
 
-        step += 1
+                    state_tensors += 1
+                    state_bytes += t.numel() * t.element_size()
+
+                t_state_dump1 = time.perf_counter()
+
+            payload_mb = req["num_bytes"] / 1024 / 1024
+
+            t_send0 = time.perf_counter()
+
+            server_recv_complete_ts = req.get(
+                "_server_recv_complete_ts",
+                t_step0,
+            )
+            node_b_processing_ms = (
+                t_send0 - server_recv_complete_ts
+            ) * 1000
+
+            with nvtx_range("B_build_reply"):
+
+                reply = {
+                    "status": "ok",
+                    "step": step,
+                    "loss": float(loss.detach().cpu()),
+                    "bytes": req["num_bytes"],
+                    "updated_state_dict": updated_state,
+
+                    "missing_count": experiment_metrics.get(
+                        "missing_count",
+                        0,
+                    ),
+
+                    "estimated_grouped_ms": experiment_metrics.get(
+                        "estimated_grouped_ms",
+                        0.0,
+                    ),
+
+                    "predicted_operator_ms": experiment_metrics.get(
+                        "predicted_operator_ms",
+                        0.0,
+                    ),
+
+                    "recompute_wall_ms": experiment_metrics.get(
+                        "recompute_wall_ms",
+                        0.0,
+                    ),
+
+                    "recompute_overhead_ms": experiment_metrics.get(
+                        "recompute_overhead_ms",
+                        0.0,
+                    ),
+
+                    "recompute_prediction_ratio": experiment_metrics.get(
+                        "recompute_prediction_ratio",
+                        0.0,
+                    ),
+
+                    "recomputed_mb": experiment_metrics.get(
+                        "recomputed_mb",
+                        0.0,
+                    ),
+
+                    "recompute_executed_node_count": experiment_metrics.get(
+                        "recompute_executed_node_count",
+                        0,
+                    ),
+
+                    "recompute_profiled_node_count": experiment_metrics.get(
+                        "recompute_profiled_node_count",
+                        0,
+                    ),
+
+                    "recompute_missing_profile_count": experiment_metrics.get(
+                        "recompute_missing_profile_count",
+                        0,
+                    ),
+
+                    "recompute_plan_ms": experiment_metrics.get(
+                        "recompute_plan_ms",
+                        0.0,
+                    ),
+
+                    "inject_ms": experiment_metrics.get(
+                        "inject_ms",
+                        0.0,
+                    ),
+
+                    "torch_backward_ms": experiment_metrics.get(
+                        "torch_backward_ms",
+                        0.0,
+                    ),
+
+                    "backward_jin_ms": experiment_metrics.get(
+                        "backward_jin_ms",
+                        0.0,
+                    ),
+
+                    "node_b_processing_ms": node_b_processing_ms,
+                }
+
+            if send_grads:
+                reply["grads"] = grads
+
+            with nvtx_range("B_zmq_send_reply"):
+                server.send_reply(reply)
+                
+            print(
+                f"[Node B] step={step} "
+                f"loss={loss.item():.6f} "
+                f"payload_mb={payload_mb:.3f}"
+            )
+
+            t_send1 = time.perf_counter()
+
+            t_step1 = time.perf_counter()
+
+            recv_wait_ms = (t_recv1 - t_recv0) * 1000
+            read_jin1_ms = (t_read1 - t_read0) * 1000
+            alias_ms = (t_alias1 - t_alias0) * 1000
+            state_load_ms = (t_state_load1 - t_state_load0) * 1000
+            backward_jin_ms = (t_backward1 - t_backward0) * 1000
+            optimizer_step_ms = (t_opt1 - t_opt0) * 1000
+            state_dump_ms = (t_state_dump1 - t_state_dump0) * 1000
+            send_reply_ms = (t_send1 - t_send0) * 1000
+            total_step_ms = (t_step1 - t_step0) * 1000
+
+
+            print(
+                f"[Node B] step={step} "
+                f"loss={loss.item():.6f} "
+                f"payload_mb={payload_mb:.3f} "
+                f"read_jin1_ms={read_jin1_ms:.3f} "
+                f"backward_jin_ms={backward_jin_ms:.3f} "
+                f"state_dump_ms={state_dump_ms:.3f} "
+                f"state_mb={state_bytes / 1024 / 1024:.3f} "
+                f"state_tensors={state_tensors} "
+                f"send_reply_ms={send_reply_ms:.3f} "
+                f"clone_grads_ms={clone_grads_ms:.3f} "
+                # f"grads_mb={grad_bytes / 1024 / 1024:.3f} "
+                # f"grad_tensors={grad_tensors} "
+                f"total_step_ms={total_step_ms:.3f}",
+                
+                flush=True,
+            )
+
+            logger.write([
+                step,
+                float(loss.detach().cpu()),
+                payload_mb,
+                recv_wait_ms,
+                read_jin1_ms,
+                alias_ms,
+                state_load_ms,
+                backward_jin_ms,
+                clone_grads_ms,
+                # grad_bytes / 1024 / 1024,
+                # grad_tensors,
+                optimizer_step_ms,
+                state_dump_ms,
+                state_bytes / 1024 / 1024,
+                state_tensors,
+                send_reply_ms,
+                total_step_ms,
+            ])
+
+            step += 1
+            if step >= max_steps:
+                print(
+                    f"[Node B][DONE] "
+                    f"completed_steps={step}",
+                    flush=True,
+                )
+                break
