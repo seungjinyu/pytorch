@@ -69,6 +69,7 @@ QUEUE_LIMIT="${QUEUE_LIMIT:-1000}"
 RUN_ID="${RUN_ID:-0}"
 DROP_RATIO="${DROP_RATIO:-0.5}"
 MPS_PERCENT="${MPS_PERCENT:-100}"
+MAX_STEPS="${MAX_STEPS:-5}"
 
 # Namespace names
 NS_A="${NS_A:-splitmagic_a}"
@@ -99,6 +100,12 @@ NSYS_OUTPUT="${RUN_DIR}/node_b_${NETWORK_MBPS}_${MPS_PERCENT}_${DROP_RATIO}"
 NODE_B_START_TIMEOUT="${NODE_B_START_TIMEOUT:-30}"
 EXPERIMENT_TIMEOUT="${EXPERIMENT_TIMEOUT:-300}"
 
+
+SELECTION_POLICY="${SELECTION_POLICY:-cost}"
+
+RECOMPUTE_COST_CSV="${RECOMPUTE_COST_CSV:-${PROJECT_DIR}/menus_offline/${MODEL}_cuda_mps${MPS_PERCENT}/final_menu.csv}"
+
+RECOMPUTE_LAYER_PROFILE_CSV="${RECOMPUTE_LAYER_PROFILE_CSV:-${PROJECT_DIR}/merged_profiles/${MODEL}_cuda_mps${MPS_PERCENT}_recompute_profile.csv}"
 
 # echo "$CUDA_MPS_PIPE_DIRECTORY"
 # echo "$CUDA_MPS_LOG_DIRECTORY"
@@ -234,6 +241,18 @@ require_command tee
 
 [[ -d "$PROJECT_DIR" ]] ||
     die "PROJECT_DIR does not exist: $PROJECT_DIR"
+
+if [[ "$SELECTION_POLICY" == "cost" ]]; then
+    [[ -f "$RECOMPUTE_COST_CSV" ]] ||
+        die "Recompute cost menu not found: $RECOMPUTE_COST_CSV"
+
+    [[ -f "$RECOMPUTE_LAYER_PROFILE_CSV" ]] ||
+        die "Recompute layer profile not found: $RECOMPUTE_LAYER_PROFILE_CSV"
+fi
+
+log "Selection policy  : ${SELECTION_POLICY}"
+log "Cost menu         : ${RECOMPUTE_COST_CSV}"
+log "Layer profile     : ${RECOMPUTE_LAYER_PROFILE_CSV}"
 
 mkdir -p "$RUN_DIR"
 
@@ -415,7 +434,6 @@ ip netns exec "$NS_B" \
         JIN_ALIAS_PATH="$ALIAS_PATH" \
         CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
         CUDA_MPS_PIPE_DIRECTORY="${CUDA_MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps}" \
-        CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
         CUDA_MPS_ACTIVE_THREAD_PERCENTAGE="$MPS_PERCENT" \
     bash -c "
         cd '$PROJECT_DIR'
@@ -483,9 +501,13 @@ timeout \
         JIN_EXPERIMENT_RUN_ID="$RUN_ID" \
         JIN_NETWORK_MBPS="$NETWORK_MBPS" \
         JIN_AUTO_DROP_RATIO="$DROP_RATIO" \
+        JIN_MPS_PERCENT="$MPS_PERCENT" \
+        JIN_SELECTION_POLICY="$SELECTION_POLICY" \
+        JIN_RECOMPUTE_COST_CSV="$RECOMPUTE_COST_CSV" \
         JIN_TEMPLATE_PLAN_A_PATH="$TEMPLATE_PLAN_A_PATH" \
         JIN_MAX_STEPS="$MAX_STEPS" \
         JIN_ENDPOINT="$NODE_A_ENDPOINT" \
+        SPLITMAGIC_RECOMPUTE_PROFILE_CSV="$RECOMPUTE_LAYER_PROFILE_CSV" \
     bash -c "
         cd '$PROJECT_DIR'
 

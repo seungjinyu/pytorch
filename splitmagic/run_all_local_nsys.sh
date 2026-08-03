@@ -20,17 +20,21 @@ NETWORKS=(
     1000
     # 500
     # 200
-    100
+    # 100
     # 50
 )
 
 DROP_RATIOS=(
-    # 0.0
+    0.0
     0.1
-    # 0.25
+    0.2
+    0.3
+    0.4
     0.5
-    # 0.75
-    0.9
+    0.6
+    0.7
+    0.8
+    0.99
 )
 
 MPS_PERCENTAGES=(
@@ -41,9 +45,9 @@ MPS_PERCENTAGES=(
 )
 
 REPEATS="${REPEATS:-1}"
-MAX_STEPS="${MAX_STEPS:-5}"
+MAX_STEPS="${MAX_STEPS:-120}"
 LATENCY_MS="${LATENCY_MS:-0}"
-MODEL="${MODEL:-vgg}"
+MODEL="${MODEL:-resnet18}"
 
 # 실험 사이 GPU/프로세스 정리 대기
 SLEEP_BETWEEN_RUNS="${SLEEP_BETWEEN_RUNS:-3}"
