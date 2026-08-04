@@ -465,7 +465,6 @@ def run_node_a(
                                 candidate_keys=candidate_keys,
                                 cost_table=recompute_cost_table,
                                 network_mbps=network_mbps,
-                                inject_ms_per_mb=inject_ms_per_mb,
                                 min_benefit_ms=min_benefit_ms,
                                 max_drop_ratio=max_cost_drop_ratio,
                             )

@@ -8,7 +8,12 @@ from pathlib import Path
 class RecomputeCost:
     key: str
     recompute_ms: float
-    
+    output_to_cpu_ms: float
+    patch_ms: float 
+    start: str
+    target: str
+    path: tuple[str, ...]
+
 @dataclass(frozen=True)
 class RecomputeCalibration:
     operator_scale: float
@@ -60,7 +65,15 @@ def load_recompute_cost_table(
     with path.open("r", newline="") as f:
         reader = csv.DictReader(f)
 
-        required = {"key", "recompute_ms"}
+        required = {
+            "key",
+            "recompute_ms",
+            "output_to_cpu_ms",
+            "patch_ms",
+            "start",
+            "target",
+            "path",
+        }
         missing = required - set(reader.fieldnames or [])
 
         if missing:
@@ -71,39 +84,175 @@ def load_recompute_cost_table(
 
         for row in reader:
             key = (row.get("key") or "").strip()
-            recompute_ms_raw = (
-                row.get("recompute_ms") or ""
-            ).strip()
 
             if not key:
                 continue
 
-            # 측정값이 비어 있는 candidate는 cost table에서 제외
+            recompute_ms_raw = (
+                row.get("recompute_ms") or ""
+            ).strip()
+
+            output_to_cpu_ms_raw = (
+                row.get("output_to_cpu_ms") or ""
+            ).strip()
+
+            patch_ms_raw = (
+                row.get("patch_ms") or ""
+            ).strip()
+
+            inject_missing_raw = (
+                row.get("inject_profile_missing") or "0"
+            ).strip()
+
+            output_missing = int(
+                float(
+                    row.get(
+                        "output_profile_missing",
+                        "0",
+                    )
+                )
+            )
+
+            try:
+                inject_missing = int(
+                    float(inject_missing_raw)
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid inject_profile_missing="
+                    f"{inject_missing_raw!r} "
+                    f"for key={key!r}"
+                ) from exc
+
+            if inject_missing:
+                print(
+                    f"[COST_TABLE_SKIP] "
+                    f"key={key} "
+                    f"reason=inject_profile_missing",
+                    flush=True,
+                )
+                continue
+
+            if output_missing:
+                print(
+                    f"[COST_TABLE_SKIP] "
+                    f"key={key} "
+                    f"reason=output_profile_missing",
+                    flush=True,
+                )
+                continue
+
             if not recompute_ms_raw:
                 print(
                     f"[COST_TABLE_SKIP] "
-                    f"key={key} reason=empty_recompute_ms",
+                    f"key={key} "
+                    f"reason=empty_recompute_ms",
+                    flush=True,
+                )
+                continue
+
+            if not output_to_cpu_ms_raw:
+                print(
+                    f"[COST_TABLE_SKIP] "
+                    f"key={key} "
+                    f"reason=empty_output_to_cpu_ms",
+                    flush=True,
+                )
+                continue
+
+            if not patch_ms_raw:
+                print(
+                    f"[COST_TABLE_SKIP] "
+                    f"key={key} "
+                    f"reason=empty_patch_ms",
                     flush=True,
                 )
                 continue
 
             try:
-                recompute_ms = float(recompute_ms_raw)
-            except ValueError as e:
-                raise ValueError(
-                    f"Invalid recompute_ms={recompute_ms_raw!r} "
-                    f"for key={key!r}"
-                ) from e
-
-            if recompute_ms < 0:
-                raise ValueError(
-                    f"Recompute cost must be non-negative: "
-                    f"{recompute_ms} for key={key}"
+                recompute_ms = float(
+                    recompute_ms_raw
                 )
+                output_to_cpu_ms = float(
+                    output_to_cpu_ms_raw
+                )
+                patch_ms = float(
+                    patch_ms_raw
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid cost for key={key!r}: "
+                    f"recompute_ms={recompute_ms_raw!r}, "
+                    f"output_to_cpu_ms={output_to_cpu_ms_raw!r}, "
+                    f"patch_ms={patch_ms_raw!r}"
+                ) from exc
+            
+            if (
+                recompute_ms < 0
+                or output_to_cpu_ms < 0
+                or patch_ms < 0
+            ):
+                raise ValueError(
+                    f"Costs must be non-negative "
+                    f"for key={key!r}: "
+                    f"recompute_ms={recompute_ms}, "
+                    f"output_to_cpu_ms={output_to_cpu_ms}, "
+                    f"patch_ms={patch_ms}"
+                )
+
+            start = (
+                row.get("start") or ""
+            ).strip()
+
+            target = (
+                row.get("target") or ""
+            ).strip()
+
+            path_text = (
+                row.get("path") or ""
+            ).strip()
+
+            path_nodes = tuple(
+                node.strip()
+                for node in path_text.split("->")
+                if node.strip()
+            )
+
+            if not start:
+                print(
+                    f"[COST_TABLE_SKIP] "
+                    f"key={key} "
+                    f"reason=empty_start",
+                    flush=True,
+                )
+                continue
+
+            if not target:
+                print(
+                    f"[COST_TABLE_SKIP] "
+                    f"key={key} "
+                    f"reason=empty_target",
+                    flush=True,
+                )
+                continue
+
+            if not path_nodes:
+                print(
+                    f"[COST_TABLE_SKIP] "
+                    f"key={key} "
+                    f"reason=empty_path",
+                    flush=True,
+                )
+                continue
 
             costs[key] = RecomputeCost(
                 key=key,
                 recompute_ms=recompute_ms,
+                output_to_cpu_ms=output_to_cpu_ms,
+                patch_ms=patch_ms,
+                start=start,
+                target=target,
+                path=path_nodes,
             )
 
     if not costs:
@@ -114,12 +263,20 @@ def load_recompute_cost_table(
     return costs
 
 
+from collections.abc import Callable
+from typing import Any
+
 def auto_drop_by_cost(
     payload,
     candidate_keys,
     cost_table: dict[str, RecomputeCost],
     network_mbps: float,
-    inject_ms_per_mb: float =0.0,
+
+    estimate_selected_cost: Callable[
+        [set[str]],
+        dict[str, Any],
+    ],
+
     min_benefit_ms: float = 0.0,
     max_drop_ratio: float | None = None,
 ):
@@ -185,19 +342,22 @@ def auto_drop_by_cost(
 
         operator_ms = profile.recompute_ms
 
-        predicted_inject_ms = (
-            tensor_mb * inject_ms_per_mb
+        predicted_output_to_cpu_ms = (
+            profile.output_to_cpu_ms
         )
 
-        marginal_recompute_ms = (
+        predicted_patch_ms = profile.patch_ms
+
+        # 이 값은 초기 정렬용 추정치다.
+        initial_candidate_cost_ms = (
             operator_ms
-            + predicted_inject_ms
+            + predicted_output_to_cpu_ms
+            + predicted_patch_ms
         )
 
-
-        marginal_benefit_ms = (
+        initial_benefit_ms = (
             send_ms
-            - marginal_recompute_ms
+            - initial_candidate_cost_ms
         )
 
         rows.append({
@@ -207,10 +367,15 @@ def auto_drop_by_cost(
             "send_ms": send_ms,
 
             "operator_ms": operator_ms,
-            "predicted_inject_ms": predicted_inject_ms,
-            "marginal_recompute_ms": marginal_recompute_ms,
+            "predicted_output_to_cpu_ms": (
+                predicted_output_to_cpu_ms
+            ),
+            "predicted_patch_ms": predicted_patch_ms,
+            "marginal_recompute_ms": (
+                initial_candidate_cost_ms
+            ),
 
-            "benefit_ms": marginal_benefit_ms,
+            "benefit_ms": initial_benefit_ms,
         })
 
     rows.sort(
@@ -221,69 +386,198 @@ def auto_drop_by_cost(
     ####
 
     selected_rows = []
+    selected_keys: set[str] = set()
     selected_bytes = 0
 
-    # 우선 fixed cost를 제외한 marginal benefit 기준으로 후보를 선택한다.
+    current_cost = {
+        "operator_ms": 0.0,
+        "output_to_cpu_ms": 0.0,
+        "patch_ms": 0.0,
+        "inject_ms": 0.0,
+        "total_ms": 0.0,
+        "missing": [],
+    }
+
+    current_send_saved_ms = 0.0
+    current_benefit_ms = 0.0
+
     for row in rows:
-        if row["benefit_ms"] <= 0.0:
-            continue
+        key = row["key"]
 
         would_exceed_limit = (
             max_drop_bytes is not None
-            and selected_bytes + row["nbytes"] > max_drop_bytes
+            and selected_bytes + row["nbytes"]
+            > max_drop_bytes
         )
 
         if would_exceed_limit:
+            print(
+                f"[AUTO_DROP_COST_REJECT] "
+                f"key={key} "
+                f"reason=max_drop_ratio",
+                flush=True,
+            )
             continue
 
+        # 현재까지 선택한 후보 + 새 후보
+        trial_keys = selected_keys | {key}
+
+        # trial_keys 전체를 동시에 drop했을 때의
+        # recompute + inject 비용
+        trial_cost = estimate_selected_cost(
+            trial_keys
+        )
+
+        missing = trial_cost.get("missing", [])
+
+        if missing:
+            print(
+                f"[AUTO_DROP_COST_REJECT] "
+                f"key={key} "
+                f"reason=missing_cost "
+                f"missing={missing[:10]}",
+                flush=True,
+            )
+            continue
+
+        trial_total_ms = float(
+            trial_cost["total_ms"]
+        )
+
+        # 후보 하나를 추가함으로써 증가한 비용
+        additional_total_cost_ms = (
+            trial_total_ms
+            - float(current_cost["total_ms"])
+        )
+
+        # 이 후보 tensor를 보내는 비용
+        additional_send_ms = float(
+            row["send_ms"]
+        )
+
+        # 핵심 판단
+        #
+        # 전송 비용이
+        # 추가 recompute + inject 비용보다 크면
+        # 해당 후보를 drop한다.
+        if (
+            additional_send_ms
+            <= additional_total_cost_ms
+        ):
+            print(
+                f"[AUTO_DROP_COST_REJECT] "
+                f"key={key} "
+                f"send_ms={additional_send_ms:.3f} "
+                f"additional_cost_ms="
+                f"{additional_total_cost_ms:.3f}",
+                flush=True,
+            )
+            continue
+
+        trial_send_saved_ms = (
+            current_send_saved_ms
+            + additional_send_ms
+        )
+
+        trial_benefit_ms = (
+            trial_send_saved_ms
+            - trial_total_ms
+        )
+
+        if trial_benefit_ms <= min_benefit_ms:
+            print(
+                f"[AUTO_DROP_COST_REJECT] "
+                f"key={key} "
+                f"reason=min_benefit "
+                f"trial_benefit_ms="
+                f"{trial_benefit_ms:.3f}",
+                flush=True,
+            )
+            continue
+
+        # 채택
+        selected_keys = trial_keys
         selected_rows.append(row)
         selected_bytes += row["nbytes"]
 
+        current_cost = trial_cost
+        current_send_saved_ms = (
+            trial_send_saved_ms
+        )
+        current_benefit_ms = (
+            trial_benefit_ms
+        )
 
-    predicted_send_saved_ms = sum(
-        row["send_ms"]
-        for row in selected_rows
+        print(
+            f"[AUTO_DROP_COST_ACCEPT] "
+            f"key={key} "
+            f"send_ms={additional_send_ms:.3f} "
+            f"additional_cost_ms="
+            f"{additional_total_cost_ms:.3f} "
+            f"selected={len(selected_keys)} "
+            f"total_cost_ms={trial_total_ms:.3f} "
+            f"total_benefit_ms="
+            f"{trial_benefit_ms:.3f}",
+            flush=True,
+        )
+
+
+    predicted_send_saved_ms = float(
+        current_send_saved_ms
     )
 
-    #
-    predicted_operator_ms = sum(
-        row["operator_ms"]
-        for row in selected_rows
+    predicted_operator_ms = float(
+        current_cost["operator_ms"]
+    )
+    predicted_output_to_cpu_ms = float(
+        current_cost.get(
+            "output_to_cpu_ms",
+            0.0,
+        )
     )
 
-    predicted_inject_ms = sum(
-        row["predicted_inject_ms"]
-        for row in selected_rows
+    predicted_patch_ms = float(
+        current_cost.get(
+            "patch_ms",
+            current_cost.get("inject_ms", 0.0),
+        )
+    )
+    predicted_inject_ms = predicted_patch_ms
+
+    predicted_recompute_ms = float(
+        current_cost["total_ms"]
     )
 
-    predicted_recompute_ms = (
-        predicted_operator_ms
-        + predicted_inject_ms
-    )
-    #
-
-    predicted_benefit_ms = (
-        predicted_send_saved_ms
-        - predicted_recompute_ms
+    predicted_benefit_ms = float(
+        current_benefit_ms
     )
 
     # 전체 선택 결과가 fixed cost까지 포함해서 유리하지 않으면
     # 아무것도 드롭하지 않는다.
     if predicted_benefit_ms <= min_benefit_ms:
         selected_rows = []
+        selected_keys = set()
         selected_bytes = 0
+
+        current_cost = {
+            "operator_ms": 0.0,
+            "output_to_cpu_ms": 0.0,
+            "patch_ms": 0.0,
+            "inject_ms": 0.0,
+            "total_ms": 0.0,
+            "missing": [],
+        }
+
+        current_send_saved_ms = 0.0
+        current_benefit_ms = 0.0
 
         predicted_send_saved_ms = 0.0
         predicted_operator_ms = 0.0
+        predicted_output_to_cpu_ms = 0.0
+        predicted_patch_ms = 0.0
         predicted_inject_ms = 0.0
         predicted_recompute_ms = 0.0
         predicted_benefit_ms = 0.0
-
-
-    selected_keys = {
-        row["key"]
-        for row in selected_rows
-    }
 
     dropped = []
     saved_bytes = 0
@@ -329,6 +623,13 @@ def auto_drop_by_cost(
     payload.meta["drop_ratio"] = float(dropped_ratio)
     payload.meta["dropped_count"] = len(dropped)
     payload.meta["saved_mb"] = saved_bytes / 1024 / 1024
+    payload.meta[
+        "predicted_output_to_cpu_ms"
+    ] = predicted_output_to_cpu_ms
+
+    payload.meta[
+        "predicted_patch_ms"
+    ] = predicted_patch_ms
 
     payload.meta["predicted_send_saved_ms"] = (
         predicted_send_saved_ms

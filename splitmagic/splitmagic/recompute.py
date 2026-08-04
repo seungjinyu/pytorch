@@ -3,11 +3,15 @@ import torch
 
 from contextlib import nullcontext
 
-def nvtx_range(name):
-    if torch.cuda.is_available():
-        return torch.cuda.nvtx.range(name)
-    return nullcontext()
+import nvtx
 
+# def nvtx_range(name):
+#     if torch.cuda.is_available():
+#         return torch.cuda.nvtx.range(name)
+#     return nullcontext()
+
+def nvtx_range(name):
+    return torch.cuda.nvtx.range(name)
 
 class FXRecomputeEngine:
     def __init__(self, model, gm=None, node_values=None):

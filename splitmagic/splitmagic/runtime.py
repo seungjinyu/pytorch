@@ -6,9 +6,8 @@ import time
 
 from .payload import  payload_from_jin_items
 from .resolver import SavedTensorResolver
-from splitmagic.recompute_cost import RecomputeCostDB
 
-from contextlib import nullcontext
+from contextlib import contextmanager
 
 from .fx_trace import (
     build_available_tensors_from_payload,
@@ -21,10 +20,22 @@ from .recompute import FXRecomputeEngine
 
 ALWAYS_LOCAL_KEYS = set()
 
-def nvtx_range(name:str):
-    if torch.cuda.is_available():
-        return torch.cuda.nvtx.range(name)
-    return nullcontext()
+@contextmanager
+def nvtx_range(name):
+    print(f"[NVTX] {name}", flush=True)
+
+    try:
+        torch.cuda.nvtx.range_push(name)
+    except Exception:
+        pass
+
+    try:
+        yield
+    finally:
+        try:
+            torch.cuda.nvtx.range_pop()
+        except Exception:
+            pass
 
 def jin_patch_tensor_from_python(key, tensor, step):
     import ctypes
@@ -281,11 +292,77 @@ class SplitRuntime:
 
         if profile_csv_path:
             try:
-                self.recompute_cost_db = RecomputeCostDB(
-                    csv_path=profile_csv_path,
-                    concurrency=1,
-                    metric="avg_ms",
+                import csv
+
+                with open(
+                    profile_csv_path,
+                    "r",
+                    newline="",
+                    encoding="utf-8",
+                ) as f:
+                    reader = csv.DictReader(f)
+
+                    if reader.fieldnames is None:
+                        raise RuntimeError(
+                            f"Layer profile has no header: "
+                            f"{profile_csv_path}"
+                        )
+
+                    if "node_name" not in reader.fieldnames:
+                        raise RuntimeError(
+                            f"Layer profile missing node_name: "
+                            f"{profile_csv_path}"
+                        )
+
+                    if "median_ms" in reader.fieldnames:
+                        metric = "median_ms"
+                    elif "avg_ms" in reader.fieldnames:
+                        metric = "avg_ms"
+                    else:
+                        raise RuntimeError(
+                            "Layer profile requires median_ms "
+                            "or avg_ms column"
+                        )
+
+                    for row in reader:
+                        node_name = (
+                            row.get("node_name") or ""
+                        ).strip()
+
+                        value_raw = (
+                            row.get(metric) or ""
+                        ).strip()
+
+                        if not node_name or not value_raw:
+                            continue
+
+                        value = float(value_raw)
+
+                        if value < 0:
+                            raise ValueError(
+                                f"Negative layer cost: "
+                                f"node={node_name} "
+                                f"value={value}"
+                            )
+
+                        self.recompute_layer_costs[
+                            node_name
+                        ] = value
+
+                if not self.recompute_layer_costs:
+                    raise RuntimeError(
+                        f"No layer costs loaded from: "
+                        f"{profile_csv_path}"
+                    )
+
+                print(
+                    f"[SplitRuntime][LAYER_COST_LOAD] "
+                    f"path={profile_csv_path} "
+                    f"metric={metric} "
+                    f"nodes={len(self.recompute_layer_costs)}",
+                    flush=True,
                 )
+
             except Exception as exc:
                 print(
                     "[SplitRuntime][RECOMPUTE_COST_DB_ERROR] "
@@ -299,16 +376,230 @@ class SplitRuntime:
 
         try:
             import torch.fx as fx
+
             self.fx_gm = fx.symbolic_trace(self.model)
             print("[SplitRuntime][FX_TRACE] ok", flush=True)
         except Exception as e:
             self.fx_gm = None
-            print(f"[SplitRuntime][FX_TRACE_FAIL] {type(e).__name__}: {e}", flush=True)
+            self.fx_node_map = None
+            self.fx_key_to_node = None
 
         if self.role not in ("A","B"):
             raise ValueError("Role must be either 'A' or 'B'")
+    def estimate_selected_cost(
+        self,
+        *,
+        payload,
+        selected_keys: set[str],
+        cost_table,
+    ):
+        """
+        selected_keys를 동시에 payload에서 제거한다고 가정하고,
+        남아 있는 activation에서 각 target까지 필요한 경로를
+        다시 계산하여 전체 recompute + inject 비용을 추정한다.
+        """
+
+        if not selected_keys:
+            return {
+                "operator_ms": 0.0,
+                "output_to_cpu_ms": 0.0,
+                "patch_ms": 0.0,
+                "inject_ms": 0.0,
+                "total_ms": 0.0,
+                "missing": [],
+                "executed_nodes": [],
+                "paths": {},
+            }
+
+        if not self.recompute_layer_costs:
+            return {
+                "operator_ms": 0.0,
+                "output_to_cpu_ms": 0.0,
+                "patch_ms": 0.0,
+                "inject_ms": 0.0,
+                "total_ms": 0.0,
+                "missing": [
+                    "recompute_layer_costs:not_loaded"
+                ],
+                "executed_nodes": [],
+                "paths": {},
+            }
+
+        # payload 원본을 건드리지 않기 위해
+        # selected key를 제외한 임시 payload를 만든다.
+        import copy
+
+        trial_payload = copy.copy(payload)
+        trial_payload.tensors = {
+            key: tensor
+            for key, tensor in payload.tensors.items()
+            if key not in selected_keys
+        }
+
+        # alias도 selected key를 가리키면 사용할 수 없으므로 제거한다.
+        original_aliases = dict(
+            getattr(payload, "aliases", {})
+            or getattr(payload, "meta", {}).get(
+                "aliases",
+                {},
+            )
+        )
+
+        trial_payload.aliases = {
+            alias_key: canonical_key
+            for alias_key, canonical_key
+            in original_aliases.items()
+            if (
+                alias_key not in selected_keys
+                and canonical_key not in selected_keys
+            )
+        }
+
+        trial_payload.meta = dict(
+            getattr(payload, "meta", {})
+        )
+        trial_payload.meta["aliases"] = (
+            trial_payload.aliases
+        )
+
+        if (
+            self.fx_node_map is None
+            or self.fx_key_to_node is None
+        ):
+            return {
+                "operator_ms": 0.0,
+                "output_to_cpu_ms": 0.0,
+                "patch_ms": 0.0,
+                "inject_ms": 0.0,
+                "total_ms": 0.0,
+                "missing": [
+                    "fx_context:not_available"
+                ],
+                "executed_nodes": [],
+                "paths": {},
+            }
+
+        # 남아 있는 payload tensor를 FX node로 변환한다.
+        available_tensors = (
+            build_available_tensors_from_payload(
+                model=self.model,
+                payload=trial_payload,
+                device="cpu",
+                key_to_node=self.fx_key_to_node,
+            )
+        )
+
+        available_nodes = set(
+            available_tensors.keys()
+        )
 
 
+
+        node_map = self.fx_node_map
+        key_to_node = self.fx_key_to_node
+
+        missing: list[str] = []
+        executed_nodes: set[str] = set()
+        paths: dict[str, list[str]] = {}
+
+        for key in sorted(selected_keys):
+            target_node = key_to_node.get(key)
+
+            if target_node is None:
+                missing.append(
+                    f"{key}:missing_target"
+                )
+                continue
+
+            # selected key의 target은 trial에서 없는 값이어야 한다.
+            available_nodes.discard(target_node)
+
+            start = find_nearest_available_start(
+                node_map=node_map,
+                node_name=target_node,
+                available_nodes=available_nodes,
+            )
+
+            if start is None:
+                missing.append(
+                    f"{key}:no_available_start"
+                )
+                continue
+
+            path = build_path_from_start_to_node(
+                node_map=node_map,
+                start_node=start,
+                target_node=target_node,
+            )
+
+            if not path:
+                missing.append(
+                    f"{key}:no_path"
+                )
+                continue
+
+            paths[key] = list(path)
+
+            # path[0]은 이미 보유한 start activation이다.
+            for node_name in path[1:]:
+                executed_nodes.add(node_name)
+
+        operator_ms = 0.0
+
+        for node_name in sorted(executed_nodes):
+            node_cost = self.recompute_layer_costs.get(
+                node_name
+            )
+
+            if node_cost is None:
+                missing.append(
+                    f"{node_name}:missing_layer_cost"
+                )
+                continue
+
+            operator_ms += float(node_cost)
+
+        output_to_cpu_ms = 0.0
+        patch_ms = 0.0
+
+        for key in selected_keys:
+            profile = cost_table.get(key)
+
+            if profile is None:
+                missing.append(
+                    f"{key}:missing_key_cost"
+                )
+                continue
+
+            output_to_cpu_ms += float(
+                profile.output_to_cpu_ms
+            )
+
+            patch_ms += float(
+                profile.patch_ms
+            )
+
+        total_ms = (
+            operator_ms
+            + output_to_cpu_ms
+            + patch_ms
+        )
+
+        return {
+            "operator_ms": operator_ms,
+            "output_to_cpu_ms": output_to_cpu_ms,
+            "patch_ms": patch_ms,
+
+            # 기존 코드와 로그 호환용
+            "inject_ms": patch_ms,
+
+            "total_ms": total_ms,
+            "missing": missing,
+            "executed_nodes": sorted(
+                executed_nodes
+            ),
+            "paths": paths,
+        }
     def capture_jin_forward_plan(self, x, plan):
         #
         # Step 1. Build lookup queues from backward execution plan
@@ -1111,11 +1402,14 @@ class SplitRuntime:
 
         with nvtx_range("B_recompute_output_to_cpu"):
             for key, out in gpu_outputs.items():
-                recomputed[key] = (
-                    out.detach()
-                    .cpu()
-                    .contiguous()
-                )
+                 with nvtx_range(
+                    f"OUTPUT_TO_CPU/{key}"
+                ):
+                    recomputed[key] = (
+                        out.detach()
+                        .cpu()
+                        .contiguous()
+                    )
         output_copy_ms = (
             time.perf_counter() - output_copy_t0
         ) * 1000.0
@@ -1354,13 +1648,14 @@ def inject_recomputed_tensors(payload, payload_path, recomputed):
 
     total_bytes = 0
 
-    t0 = time.perf_counter()
-    for key, tensor in recomputed.items():
-        t = tensor.detach().cpu().contiguous()
-        payload.tensors[key] = t
-        total_bytes += t.numel() * t.element_size()
-    t1 = time.perf_counter()
-    inject_mem_ms = (t1 - t0) * 1000
+    with nvtx_range("INJECT/python_payload_update"):
+        t0 = time.perf_counter()
+        for key, tensor in recomputed.items():
+            t = tensor.detach().cpu().contiguous()
+            payload.tensors[key] = t
+            total_bytes += t.numel() * t.element_size()
+        t1 = time.perf_counter()
+        inject_mem_ms = (t1 - t0) * 1000
 
     print(
         f"[PY][SET_MEM_PAYLOAD] "
@@ -1377,15 +1672,20 @@ def inject_recomputed_tensors(payload, payload_path, recomputed):
 
     patch_tensor_ms = 0.0
 
-    for key, tensor in recomputed.items():
-        tt0 = time.perf_counter()
-        jin_patch_tensor_from_python(
-            key=key,
-            tensor=tensor,
-            step=step,
-        )
-        tt1 = time.perf_counter()
-        patch_tensor_ms += (tt1 - tt0) * 1000
+    with nvtx_range("INJECT/jin_patch_all"):
+
+        for key, tensor in recomputed.items():
+            tt0 = time.perf_counter()
+            with nvtx_range(
+                f"INJECT/Patch/{key}"
+            ):
+                jin_patch_tensor_from_python(
+                    key=key,
+                    tensor=tensor,
+                    step=step,
+                )
+                tt1 = time.perf_counter()
+                patch_tensor_ms += (tt1 - tt0) * 1000
 
     t1 = time.perf_counter()
 
@@ -1417,6 +1717,8 @@ def is_recomputable_key(key):
     if key.startswith("graph:addmm:") and key.endswith(":mat1"):
         return True
     if key.startswith("graph:bn:") and key.endswith(":input"):
+        return True
+    if key.startswith("graph:maxpool2d:") and key.endswith(":input"):
         return True
 
     # BN result1/result2는 bn input에서 special recompute

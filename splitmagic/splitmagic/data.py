@@ -80,7 +80,7 @@ def make_imagenet_loaders(
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=False,
-        drop_last=False,
+        drop_last=True,
     )
 
     val_loader = DataLoader(

@@ -11,6 +11,7 @@ from splitmagic.runtime import jin_set_payload_bytes_from_python
 from contextlib import nullcontext
 
 from contextlib import contextmanager
+import nvtx
 
 print(
     f"[Node B][SCRIPT_CHECK] "
@@ -21,20 +22,44 @@ print(
     flush=True,
 )
 
+# @contextmanager
+# def nvtx_range(name: str):
+#     print(f"[NVTX][ENTER] {name}", flush=True)
+
+#     if torch.cuda.is_available():
+#         torch.cuda.nvtx.range_push(name)
+
+#     try:
+#         yield
+#     finally:
+#         if torch.cuda.is_available():
+#             torch.cuda.nvtx.range_pop()
+
+#         print(f"[NVTX][EXIT] {name}", flush=True)
+
 @contextmanager
 def nvtx_range(name: str):
-    print(f"[NVTX][ENTER] {name}", flush=True)
+    print(
+        f"[NVTX][ENTER] {name}",
+        flush=True,
+    )
+
+    pushed = False
 
     if torch.cuda.is_available():
         torch.cuda.nvtx.range_push(name)
+        pushed = True
 
     try:
         yield
     finally:
-        if torch.cuda.is_available():
+        if pushed:
             torch.cuda.nvtx.range_pop()
 
-        print(f"[NVTX][EXIT] {name}", flush=True)
+        print(
+            f"[NVTX][EXIT] {name}",
+            flush=True,
+        )
 
 def append_recompute_experiment_csv(
     runtime,
@@ -276,7 +301,13 @@ def clone_grads(model):
     return grads, grad_bytes, grad_tensors
 
 
-def build_template_plan_on_b(model, batch_size, device):
+def build_template_plan_on_b(
+        model, 
+        batch_size, 
+        device,
+        input_shape=(3, 32, 32),
+        num_classes=10,
+    ):
 
     template_plan_path = os.environ.get(
         "JIN_TEMPLATE_PLAN_PATH",
@@ -292,11 +323,43 @@ def build_template_plan_on_b(model, batch_size, device):
 
     model.zero_grad(set_to_none=True)
 
-    x_dummy = torch.randn(batch_size, 3, 32, 32, device=device)
-    y_dummy = torch.zeros(batch_size, dtype=torch.long, device=device)
+    input_shape = tuple(
+        int(dim)
+        for dim in input_shape
+    )
+
+    if len(input_shape) != 3:
+        raise ValueError(
+            "input_shape must be (C, H, W), "
+            f"got {input_shape}"
+        )
+    
+    x_dummy = torch.randn(
+        batch_size,
+        *input_shape,
+        device=device,
+    )
+
+    y_dummy = torch.zeros(
+        batch_size,
+        dtype=torch.long,
+        device=device,
+    )
 
     with nvtx_range("B_template_dryrun"):
         out = model(x_dummy)
+        if out.ndim != 2:
+            raise RuntimeError(
+                "[Node B] unexpected model output shape: "
+                f"{tuple(out.shape)}"
+            )
+
+        if out.size(1) != num_classes:
+            raise RuntimeError(
+                "[Node B] output class mismatch: "
+                f"model_output={out.size(1)}, "
+                f"num_classes={num_classes}"
+            )
         loss = F.cross_entropy(out, y_dummy)
         loss.backward()
 
@@ -310,7 +373,15 @@ def build_template_plan_on_b(model, batch_size, device):
     if not plan:
         raise RuntimeError(f"[Node B] template plan empty: {template_plan_path}")
 
-    print(f"[Node B][TEMPLATE_PLAN] path={template_plan_path} len={len(plan)}")
+    print(
+        "[Node B][TEMPLATE_PLAN] "
+        f"path={template_plan_path} "
+        f"len={len(plan)} "
+        f"batch_size={batch_size} "
+        f"input_shape={input_shape} "
+        f"num_classes={num_classes}",
+        flush=True,
+    )
 
     return plan
 
@@ -377,6 +448,8 @@ def run_node_b(
     csv_path="node_b_timing.csv",
     lr=0.1,
     template_batch_size=16,
+    template_input_shape=(3, 32, 32),
+    num_classes=10,
     log_level="2",
     send_grads=False,
 ):
@@ -392,18 +465,55 @@ def run_node_b(
     printed_payload_summary = False
 
     # We are assuming the node B has a better computation power
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # device = "cpu"
-    model = model.to(device)
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    requested_device = os.environ.get(
+        "JIN_NODE_B_DEVICE",
+        "cuda",
+    ).lower()
+
+    if requested_device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "[Node B] CUDA was requested, "
+                "but torch.cuda.is_available() is False"
+            )
+
+        device = torch.device("cuda")
+
+    elif requested_device == "cpu":
+        device = torch.device("cpu")
+
+    else:
+        raise ValueError(
+            "[Node B] unsupported device: "
+            f"{requested_device!r}"
+        )
+
+    model = model.to(device)
     os.environ["JIN_ROLE"] = "B"
     os.environ["JIN_LOG_LEVEL"] = log_level
+    template_input_shape = tuple(
+        int(dim)
+        for dim in template_input_shape
+    )
+    os.environ["JIN_BATCH_SIZE"] = str(
+        template_batch_size
+    )
+
+    if len(template_input_shape) != 3:
+        raise ValueError(
+            "template_input_shape must be (C, H, W), "
+            f"got {template_input_shape}"
+        )
 
     # Build template plan 
     template_plan = build_template_plan_on_b(
         model=model,
         batch_size=template_batch_size,
         device=device,
+        input_shape=template_input_shape,
+        num_classes=num_classes,
     )
 
     write_execution_plan(template_plan)
@@ -436,7 +546,14 @@ def run_node_b(
 
     server = ZMQServer(endpoint)
 
-    print("[Node B] listening")
+    print(
+        "[Node B] listening "
+        f"device={device} "
+        f"batch_size={template_batch_size} "
+        f"input_shape={template_input_shape} "
+        f"num_classes={num_classes}",
+        flush=True,
+    )
 
     step = 0
 
@@ -533,16 +650,63 @@ def run_node_b(
             os.environ["JIN_STEP"] = str(step)
 
             with nvtx_range("B_prepare_inputs"):
-
                 y = req["y"].to(device)
 
+                request_batch_size = int(
+                    req["batch_size"]
+                )
+
+                request_input_shape = tuple(
+                    int(dim)
+                    for dim in req.get(
+                        "input_shape",
+                        template_input_shape,
+                    )
+                )
+
+                if len(request_input_shape) != 3:
+                    raise RuntimeError(
+                        "[Node B] invalid request input shape: "
+                        f"{request_input_shape}"
+                    )
+
+                if request_input_shape != template_input_shape:
+                    raise RuntimeError(
+                        "[Node B] request/template input shape mismatch: "
+                        f"request={request_input_shape}, "
+                        f"template={template_input_shape}"
+                    )
+
                 x_dummy = torch.randn(
-                    req["batch_size"],
-                    3,
-                    32,
-                    32,
+                    request_batch_size,
+                    *request_input_shape,
                     device=device,
                 )
+
+                if y.ndim != 1:
+                    raise RuntimeError(
+                        "[Node B] invalid label shape: "
+                        f"{tuple(y.shape)}"
+                    )
+
+                if y.size(0) != request_batch_size:
+                    raise RuntimeError(
+                        "[Node B] batch-size mismatch: "
+                        f"x={request_batch_size}, "
+                        f"y={y.size(0)}"
+                    )
+
+                if y.numel() > 0:
+                    min_label = int(y.min().item())
+                    max_label = int(y.max().item())
+
+                    if min_label < 0 or max_label >= num_classes:
+                        raise RuntimeError(
+                            "[Node B] label out of range: "
+                            f"min={min_label}, "
+                            f"max={max_label}, "
+                            f"num_classes={num_classes}"
+                        )
 
             # Setting up to zero   
             optimizer.zero_grad(set_to_none=True)

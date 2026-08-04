@@ -50,23 +50,52 @@ RECOMPUTE_POLICIES = {
         },
     },
 
+    # "vgg_exact": {
+    #     "keep": {
+    #         "model.output",
+    #         # 여기에 VGG seed relu/checkpoint 넣기
+    #         "graph:relu:8:result",
+    #         "graph:relu:6:result",
+    #         "graph:relu:4:result",
+    #         "graph:relu:2:result",
+    #         "graph:addmm:1:mat1",
+    #     },
+    #     "drop": {
+    #         *{f"graph:bn:{i}:input" for i in range(8)},
+    #         "graph:relu:7:result",
+    #         "graph:relu:5:result",
+    #         "graph:relu:3:result",
+    #         "graph:relu:1:result",
+    #         "graph:relu:0:result",
+    #     },
+    # },
     "vgg_exact": {
         "keep": {
             "model.output",
-            # 여기에 VGG seed relu/checkpoint 넣기
-            "graph:relu:8:result",
-            "graph:relu:6:result",
-            "graph:relu:4:result",
-            "graph:relu:2:result",
-            "graph:addmm:1:mat1",
+            # First real model input checkpoint
+            "graph:conv:0:input",
+
+            # Intermediate feature checkpoints
+            # "graph:relu:2:result",
+            # "graph:relu:4:result",
+            # "graph:relu:6:result",
+
+            # Classifier checkpoint
+            
         },
+
         "drop": {
+            *{f"graph:conv:{i}:input" for i in range(1, 7)},
             *{f"graph:bn:{i}:input" for i in range(8)},
-            "graph:relu:7:result",
-            "graph:relu:5:result",
-            "graph:relu:3:result",
-            "graph:relu:1:result",
-            "graph:relu:0:result",
+            *{f"graph:relu:{i}:result" for i in range(1, 9)},
+
+            *{
+                f"graph:maxpool2d:{i}:input"
+                for i in range(5)
+            },
+
+            "graph:addmm:0:mat1",
+            "graph:addmm:1:mat1",
         },
     },
 }
