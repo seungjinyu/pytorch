@@ -24,30 +24,36 @@ NETWORKS=(
     # 50
 )
 
-DROP_RATIOS=(
+MAX_RATIOS=(
     0.0
-    0.1
-    0.2
-    0.3
-    0.4
-    0.5
-    0.6
-    0.7
-    0.8
-    0.99
+    # 0.1
+    # 0.2
+    # 0.3
+    # 0.4
+    # 0.5
+    # 0.6
+    # 0.7
+    # 0.8
+    # 0.9
+    # 0.95
+    # 0.96
+    # 0.97
+    # 0.98
+    # 0.99
 )
 
 MPS_PERCENTAGES=(
-    100
+    # 100
     # 50
     # 25
     10
 )
 
 REPEATS="${REPEATS:-1}"
-MAX_STEPS="${MAX_STEPS:-120}"
+MAX_STEPS="${MAX_STEPS:-1}"
 LATENCY_MS="${LATENCY_MS:-0}"
-MODEL="${MODEL:-resnet18}"
+# resnet18 , vgg, resnet18_imagenet
+MODEL="${MODEL:-resnet18_imagenet}"
 
 # 실험 사이 GPU/프로세스 정리 대기
 SLEEP_BETWEEN_RUNS="${SLEEP_BETWEEN_RUNS:-3}"
@@ -68,7 +74,7 @@ cd "$PROJECT_DIR"
 
 TOTAL_RUNS=$(( \
     ${#NETWORKS[@]} * \
-    ${#DROP_RATIOS[@]} * \
+    ${#MAX_RATIOS[@]} * \
     ${#MPS_PERCENTAGES[@]} * \
     REPEATS \
 ))
@@ -77,13 +83,13 @@ CURRENT_RUN=0
 
 log "Starting SplitMagic sweep"
 log "Networks          : ${NETWORKS[*]}"
-log "Drop ratios       : ${DROP_RATIOS[*]}"
+log "Max ratios       : ${MAX_RATIOS[*]}"
 log "MPS percentages   : ${MPS_PERCENTAGES[*]}"
 log "Repeats           : ${REPEATS}"
 log "Total runs        : ${TOTAL_RUNS}"
 
 for network in "${NETWORKS[@]}"; do
-    for ratio in "${DROP_RATIOS[@]}"; do
+    for max_ratio in "${MAX_RATIOS[@]}"; do
         for mps in "${MPS_PERCENTAGES[@]}"; do
             for ((run_id = 0; run_id < REPEATS; run_id++)); do
                 CURRENT_RUN=$((CURRENT_RUN + 1))
@@ -91,7 +97,7 @@ for network in "${NETWORKS[@]}"; do
                 log "============================================================"
                 log "Run ${CURRENT_RUN}/${TOTAL_RUNS}"
                 log "network=${network} Mbps"
-                log "drop_ratio=${ratio}"
+                log "max_ratio=${max_ratio}"
                 log "mps=${mps}%"
                 log "run_id=${run_id}"
                 log "============================================================"
@@ -100,7 +106,8 @@ for network in "${NETWORKS[@]}"; do
                     PROJECT_DIR="$PROJECT_DIR" \
                     NETWORK_MBPS="$network" \
                     LATENCY_MS="$LATENCY_MS" \
-                    DROP_RATIO="$ratio" \
+                    DROP_RATIO="$max_ratio" \
+                    SELECTION_POLICY="ratio" \
                     MPS_PERCENT="$mps" \
                     RUN_ID="$run_id" \
                     MAX_STEPS="$MAX_STEPS" \

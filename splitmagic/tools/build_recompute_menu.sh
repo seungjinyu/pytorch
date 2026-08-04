@@ -35,7 +35,7 @@ OUTPUT_MENU_DIR="$(
 OUTPUT_MENU="${OUTPUT_MENU_DIR}/$(basename "${OUTPUT_MENU}")"
 
 stop_node_b() {
-    pkill -f '[t]ests/test_node_b_resnet18.py' || true
+    pkill -f '[t]ests/test_node_b_vgg.py' || true
     sleep 2
 }
 
@@ -59,7 +59,7 @@ nohup env \
     JIN_RECOMPUTE_PROFILE_PATH="${LAYER_PROFILE}" \
     JIN_RECOMPUTE_MENU_PATH="${OUTPUT_MENU}" \
     "${PYTHON_BIN}" -u \
-    tests/test_node_b_resnet18.py \
+    tests/test_node_b_vgg.py \
     > "${NODE_B_LOG}" 2>&1 \
     < /dev/null &
 
@@ -74,7 +74,7 @@ for _ in $(seq 1 60); do
         break
     fi
 
-    if ! pgrep -f '[t]ests/test_node_b_resnet18.py' >/dev/null
+    if ! pgrep -f '[t]ests/test_node_b_vgg.py' >/dev/null
     then
         echo "[ERROR] Node B exited"
         tail -100 "${NODE_B_LOG}" || true
@@ -97,7 +97,7 @@ JIN_AUTO_DROP_RATIO=0.0 \
 JIN_MAX_STEPS=1 \
 JIN_ENDPOINT="tcp://127.0.0.1:5556" \
 "${PYTHON_BIN}" -u \
-tests/test_node_a_cost_resnet18.py
+tests/test_node_a_vgg.py
 
 if [[ ! -f "${OUTPUT_MENU}" ]]; then
     echo "[ERROR] recompute menu was not created"

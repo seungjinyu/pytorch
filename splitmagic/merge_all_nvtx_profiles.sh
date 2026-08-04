@@ -2,19 +2,22 @@
 set -Eeuo pipefail
 
 # ============================================================
-# Merge per-experiment recompute/inject profiles into one
-# profile per model + device resource condition.
+# Merge per-experiment recompute/inject/output-to-CPU
+# profiles into one profile per model + device resource
+# condition.
 #
 # Input:
 #   *_recompute_layer_profile_details.csv
 #   *_inject_key_profile_details.csv
-#
+#   *_output_to_cpu_key_profile_details.csv
 # Output:
 #   merged_profiles/
 #     resnet18_cuda_mps100_recompute_profile.csv
 #     resnet18_cuda_mps100_recompute_profile_details.csv
 #     resnet18_cuda_mps100_inject_profile.csv
 #     resnet18_cuda_mps100_inject_profile_details.csv
+#     resnet18_cuda_mps100_output_to_cpu_profile.csv
+#     resnet18_cuda_mps100_output_to_cpu_profile_details.csv
 #
 # Usage:
 #   ./merge_all_nvtx_profiles.sh [ROOT] [OUTPUT_DIR]
@@ -28,6 +31,11 @@ set -Eeuo pipefail
 ROOT="${1:-./nsys_results}"
 OUTPUT_DIR="${2:-./merged_profiles}"
 FORCE="${FORCE:-0}"
+
+# 비어 있으면 모든 ratio를 병합한다.
+# 메뉴 생성용으로 PROFILE_RATIO=0.99를 지정하면
+# ratio0.99 디렉터리의 결과만 병합한다.
+PROFILE_RATIO="${PROFILE_RATIO:-}"
 
 PYTHON_BIN="${PYTHON_BIN:-/home/syu23/miniconda3/envs/torch-build/bin/python3}"
 
@@ -49,11 +57,13 @@ OUTPUT_DIR="$(realpath "${OUTPUT_DIR}")"
 echo "[INFO] ROOT=${ROOT}"
 echo "[INFO] OUTPUT_DIR=${OUTPUT_DIR}"
 echo "[INFO] FORCE=${FORCE}"
+echo "[INFO] PROFILE_RATIO=${PROFILE_RATIO:-all}"
 
 "${PYTHON_BIN}" - \
     "${ROOT}" \
     "${OUTPUT_DIR}" \
-    "${FORCE}" <<'PY'
+    "${FORCE}" \
+    "${PROFILE_RATIO}" <<'PY'
 from __future__ import annotations
 
 import csv
@@ -67,6 +77,21 @@ from typing import Any
 root = Path(sys.argv[1])
 output_dir = Path(sys.argv[2])
 force = sys.argv[3] == "1"
+
+profile_ratio = sys.argv[4].strip()
+
+ratio_marker = (
+    f"ratio{profile_ratio}"
+    if profile_ratio
+    else None
+)
+
+print(
+    "[MERGE_FILTER] "
+    f"profile_ratio={profile_ratio or 'all'} "
+    f"marker={ratio_marker or 'none'}",
+    flush=True,
+)
 
 
 MPS_RE = re.compile(r"mps(?P<value>\d+)")
@@ -87,13 +112,24 @@ def infer_model(path: Path) -> str:
 
     return "unknown"
 
+def infer_resource(
+    path: Path,
+) -> tuple[str, str, int | None]:
 
-def infer_resource(path: Path) -> tuple[str, str, int | None]:
-    text = str(path).lower()
+    # path:
+    # experiment_dir/nsys_csv/profile.csv
+    experiment_name = (
+        path.parent.parent.name.lower()
+    )
 
-    thread_match = THREAD_RE.search(text)
+    thread_match = THREAD_RE.search(
+        experiment_name
+    )
 
-    if "_cpu_" in text or thread_match is not None:
+    if (
+        "_cpu_" in experiment_name
+        or thread_match is not None
+    ):
         value = (
             int(thread_match.group("value"))
             if thread_match is not None
@@ -102,7 +138,9 @@ def infer_resource(path: Path) -> tuple[str, str, int | None]:
 
         return "cpu", "threads", value
 
-    mps_match = MPS_RE.search(text)
+    mps_match = MPS_RE.search(
+        experiment_name
+    )
 
     value = (
         int(mps_match.group("value"))
@@ -167,13 +205,35 @@ inject_files: dict[
     list[Path],
 ] = defaultdict(list)
 
+output_files: dict[
+    tuple[str, str, str, int],
+    list[Path],
+] = defaultdict(list)
+
+def ratio_matches(path: Path) -> bool:
+    """
+    PROFILE_RATIO가 비어 있으면 모든 실험을 허용한다.
+
+    PROFILE_RATIO=0.99이면 경로에 ratio0.99가 포함된
+    실험 결과만 허용한다.
+    """
+    if ratio_marker is None:
+        return True
+
+    return ratio_marker in str(path)
+
 
 for path in sorted(
     root.rglob(
         "*_recompute_layer_profile_details.csv"
     )
 ):
-    recompute_files[condition_key(path)].append(path)
+    if not ratio_matches(path):
+        continue
+
+    recompute_files[
+        condition_key(path)
+    ].append(path)
 
 
 for path in sorted(
@@ -181,18 +241,41 @@ for path in sorted(
         "*_inject_key_profile_details.csv"
     )
 ):
-    inject_files[condition_key(path)].append(path)
+    if not ratio_matches(path):
+        continue
+
+    inject_files[
+        condition_key(path)
+    ].append(path)
+
+
+for path in sorted(
+    root.rglob(
+        "*_output_to_cpu_key_profile_details.csv"
+    )
+):
+    if not ratio_matches(path):
+        continue
+
+    output_files[
+        condition_key(path)
+    ].append(path)
 
 
 conditions = sorted(
     set(recompute_files)
     | set(inject_files)
+    | set(output_files)
 )
 
 print(
     f"[INFO] conditions={len(conditions)} "
-    f"recompute_files={sum(map(len, recompute_files.values()))} "
-    f"inject_files={sum(map(len, inject_files.values()))}"
+    f"recompute_files="
+    f"{sum(map(len, recompute_files.values()))} "
+    f"inject_files="
+    f"{sum(map(len, inject_files.values()))} "
+    f"output_files="
+    f"{sum(map(len, output_files.values()))}"
 )
 
 
@@ -346,7 +429,7 @@ for condition in conditions:
                     writer.writerow({
                         "node_name": row["node_name"],
                         "avg_ms": (
-                            f"{row['avg_ms']:.9f}"
+                            f"{row['median_ms']:.9f}"
                         ),
                     })
 
@@ -510,7 +593,7 @@ for condition in conditions:
                     writer.writerow({
                         "key": row["key"],
                         "patch_ms": (
-                            f"{row['patch_ms']:.9f}"
+                            f"{row['median_ms']:.9f}"
                         ),
                     })
 
@@ -546,6 +629,193 @@ for condition in conditions:
 
     else:
         print("[INJECT] no inputs")
+
+    # ========================================================
+    # Output-to-CPU profile merge
+    # ========================================================
+
+    output_inputs = output_files.get(
+        condition,
+        [],
+    )
+
+    if output_inputs:
+        by_key: dict[str, dict[str, Any]] = {}
+
+        for path in output_inputs:
+            for row in read_csv(path):
+                jin_key = row["key"]
+
+                item = by_key.setdefault(
+                    jin_key,
+                    {
+                        "key": jin_key,
+                        "range_name": row[
+                            "range_name"
+                        ],
+                        "total_ms": 0.0,
+                        "instances": 0,
+                        "min_ms": float("inf"),
+                        "max_ms": float("-inf"),
+                        "source_profiles": 0,
+                        "medians": [],
+                    },
+                )
+
+                item["total_ms"] += to_float(
+                    row,
+                    "total_ms",
+                )
+
+                item["instances"] += to_int(
+                    row,
+                    "instances",
+                )
+
+                item["min_ms"] = min(
+                    item["min_ms"],
+                    to_float(row, "min_ms"),
+                )
+
+                item["max_ms"] = max(
+                    item["max_ms"],
+                    to_float(row, "max_ms"),
+                )
+
+                item["source_profiles"] += 1
+
+                item["medians"].append(
+                    to_float(
+                        row,
+                        "median_ms",
+                    )
+                )
+
+        rows = []
+
+        for item in by_key.values():
+            instances = item["instances"]
+
+            weighted_avg_ms = (
+                item["total_ms"] / instances
+                if instances > 0
+                else 0.0
+            )
+
+            medians = sorted(
+                item["medians"]
+            )
+            count = len(medians)
+
+            if count == 0:
+                median_of_medians = 0.0
+            elif count % 2 == 1:
+                median_of_medians = (
+                    medians[count // 2]
+                )
+            else:
+                median_of_medians = (
+                    medians[count // 2 - 1]
+                    + medians[count // 2]
+                ) / 2.0
+
+            rows.append({
+                "key": item["key"],
+                "range_name": item[
+                    "range_name"
+                ],
+                "output_to_cpu_ms": (
+                    weighted_avg_ms
+                ),
+                "median_ms": (
+                    median_of_medians
+                ),
+                "min_ms": item["min_ms"],
+                "max_ms": item["max_ms"],
+                "total_ms": item["total_ms"],
+                "instances": instances,
+                "source_profiles": item[
+                    "source_profiles"
+                ],
+            })
+
+        rows.sort(
+            key=lambda row: row["key"]
+        )
+
+        simple_path = (
+            output_dir
+            / (
+                f"{condition_name}"
+                f"_output_to_cpu_profile.csv"
+            )
+        )
+
+        details_path = (
+            output_dir
+            / (
+                f"{condition_name}"
+                f"_output_to_cpu_profile_details.csv"
+            )
+        )
+
+        if force or not simple_path.exists():
+            with simple_path.open(
+                "w",
+                newline="",
+                encoding="utf-8",
+            ) as file:
+                writer = csv.DictWriter(
+                    file,
+                    fieldnames=[
+                        "key",
+                        "output_to_cpu_ms",
+                    ],
+                )
+
+                writer.writeheader()
+
+                for row in rows:
+                    writer.writerow({
+                        "key": row["key"],
+                        "output_to_cpu_ms": (
+                            f"{row['median_ms']:.9f}"
+                        ),
+                    })
+
+        if force or not details_path.exists():
+            with details_path.open(
+                "w",
+                newline="",
+                encoding="utf-8",
+            ) as file:
+                writer = csv.DictWriter(
+                    file,
+                    fieldnames=[
+                        "key",
+                        "range_name",
+                        "output_to_cpu_ms",
+                        "median_ms",
+                        "min_ms",
+                        "max_ms",
+                        "total_ms",
+                        "instances",
+                        "source_profiles",
+                    ],
+                )
+
+                writer.writeheader()
+                writer.writerows(rows)
+
+        print(
+            f"[OUTPUT_TO_CPU] "
+            f"inputs={len(output_inputs)} "
+            f"keys={len(rows)} "
+            f"output={simple_path.name}"
+        )
+
+    else:
+        print("[OUTPUT_TO_CPU] no inputs")
 PY
 
 echo

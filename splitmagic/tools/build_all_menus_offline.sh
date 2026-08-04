@@ -57,6 +57,8 @@ while IFS= read -r -d '' recompute_profile; do
     condition="${filename%_recompute_profile.csv}"
 
     inject_profile="${recompute_profile%_recompute_profile.csv}_inject_profile.csv"
+    output_profile="${recompute_profile%_recompute_profile.csv}_output_to_cpu_profile.csv"
+
     output_dir="${OUTPUT_ROOT}/${condition}"
     final_menu="${output_dir}/final_menu.csv"
 
@@ -65,10 +67,17 @@ while IFS= read -r -d '' recompute_profile; do
     echo "[CONDITION] ${condition}"
     echo "[RECOMPUTE] ${recompute_profile}"
     echo "[INJECT] ${inject_profile}"
+    echo "[OUTPUT_TO_CPU] ${output_profile}"
     echo "============================================================"
 
     if [[ ! -f "${inject_profile}" ]]; then
         echo "[FAIL] inject profile not found"
+        failed=$((failed + 1))
+        continue
+    fi
+
+    if [[ ! -f "${output_profile}" ]]; then
+        echo "[FAIL] output-to-CPU profile not found: ${output_profile}"
         failed=$((failed + 1))
         continue
     fi
@@ -84,8 +93,14 @@ while IFS= read -r -d '' recompute_profile; do
         --plan "${PLAN}" \
         --recompute-profile "${recompute_profile}" \
         --inject-profile "${inject_profile}" \
+        --output-profile "${output_profile}" \
         --output-dir "${output_dir}" \
-        --batch-size "${BATCH_SIZE}"; then
+        --batch-size "${BATCH_SIZE}"\
+        --network-mbps "${NETWORK_MBPS:-1000}" \
+        --mps-percent "${condition##*mps}" \
+        --profile-steps "${PROFILE_STEPS:-1000}" \
+        --metric "${METRIC:-median}" \
+        --drop-ratio "-0.99"; then
 
         success=$((success + 1))
     else

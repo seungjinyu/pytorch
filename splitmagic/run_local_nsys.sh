@@ -70,6 +70,7 @@ RUN_ID="${RUN_ID:-0}"
 DROP_RATIO="${DROP_RATIO:-0.5}"
 MPS_PERCENT="${MPS_PERCENT:-100}"
 MAX_STEPS="${MAX_STEPS:-5}"
+SELECTION_POLICY="${SELECTION_POLICY:-cost}"
 
 # Namespace names
 NS_A="${NS_A:-splitmagic_a}"
@@ -82,7 +83,7 @@ VETH_B="${VETH_B:-veth_sm_b}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_DIR}/nsys_results}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
-RUN_NAME="${RUN_NAME:-${TIMESTAMP}_${MODEL}_${NETWORK_MBPS}mbps_${LATENCY_MS}ms_ratio${DROP_RATIO}_mps${MPS_PERCENT}_run${RUN_ID}}"
+RUN_NAME="${RUN_NAME:-${TIMESTAMP}_${MODEL}_${NETWORK_MBPS}mbps_${LATENCY_MS}ms_policy${SELECTION_POLICY}_maxratio${DROP_RATIO}_mps${MPS_PERCENT}_run${RUN_ID}}"
 RUN_DIR="${OUTPUT_ROOT}/${RUN_NAME}"
 
 TEMPLATE_PLAN_PATH="${RUN_DIR}/jin_template_plan.tsv"
@@ -99,9 +100,6 @@ NSYS_OUTPUT="${RUN_DIR}/node_b_${NETWORK_MBPS}_${MPS_PERCENT}_${DROP_RATIO}"
 # Timeouts
 NODE_B_START_TIMEOUT="${NODE_B_START_TIMEOUT:-30}"
 EXPERIMENT_TIMEOUT="${EXPERIMENT_TIMEOUT:-300}"
-
-
-SELECTION_POLICY="${SELECTION_POLICY:-cost}"
 
 RECOMPUTE_COST_CSV="${RECOMPUTE_COST_CSV:-${PROJECT_DIR}/menus_offline/${MODEL}_cuda_mps${MPS_PERCENT}/final_menu.csv}"
 
@@ -251,8 +249,14 @@ if [[ "$SELECTION_POLICY" == "cost" ]]; then
 fi
 
 log "Selection policy  : ${SELECTION_POLICY}"
-log "Cost menu         : ${RECOMPUTE_COST_CSV}"
-log "Layer profile     : ${RECOMPUTE_LAYER_PROFILE_CSV}"
+
+if [[ "${SELECTION_POLICY}" == "cost" ]]; then
+    log "Cost menu         : ${RECOMPUTE_COST_CSV}"
+    log "Layer profile     : ${RECOMPUTE_LAYER_PROFILE_CSV}"
+else
+    log "Cost menu         : not used"
+    log "Layer profile     : not used"
+fi
 
 mkdir -p "$RUN_DIR"
 
@@ -264,7 +268,8 @@ log "Python binary     : $PYTHON_BIN"
 log "PYTHONPATH        : $PYTHONPATH_VALUE"
 log "Network           : ${NETWORK_MBPS} Mbps"
 log "Latency           : ${LATENCY_MS} ms"
-log "Drop ratio        : ${DROP_RATIO}"
+log "Selection policy  : ${SELECTION_POLICY}"
+log "Max drop ratio    : ${DROP_RATIO}"
 log "MPS percent       : ${MPS_PERCENT}%"
 log "Run ID            : ${RUN_ID}"
 
@@ -391,9 +396,12 @@ RUN_ID=${RUN_ID}
 NETWORK_MBPS=${NETWORK_MBPS}
 LATENCY_MS=${LATENCY_MS}
 JITTER_MS=${JITTER_MS}
+SELECTION_POLICY=${SELECTION_POLICY}
 DROP_RATIO=${DROP_RATIO}
 MPS_PERCENT=${MPS_PERCENT}
 MAX_STEPS=${MAX_STEPS}
+RECOMPUTE_COST_CSV=${RECOMPUTE_COST_CSV}
+RECOMPUTE_LAYER_PROFILE_CSV=${RECOMPUTE_LAYER_PROFILE_CSV}
 NODE_A_IP=${NODE_A_IP}
 NODE_B_IP=${NODE_B_IP}
 PORT=${PORT}
@@ -411,6 +419,16 @@ ip netns exec "$NS_B" tc -s qdisc show dev "$VETH_B" \
 # ------------------------------------------------------------
 # 8. Start Node B under Nsight Systems
 # ------------------------------------------------------------
+
+NODE_A_COST_ENV=()
+
+if [[ "${SELECTION_POLICY}" == "cost" ]]; then
+    NODE_A_COST_ENV+=(
+        "JIN_RECOMPUTE_COST_CSV=${RECOMPUTE_COST_CSV}"
+        "SPLITMAGIC_RECOMPUTE_PROFILE_CSV=${RECOMPUTE_LAYER_PROFILE_CSV}"
+    )
+fi
+
 
 log "Starting Node B..."
 
@@ -497,17 +515,16 @@ timeout \
         PATH="/usr/lib/nsight-systems/host-linux-x64:/home/syu23/miniconda3/envs/torch-build/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin" \
         LD_LIBRARY_PATH="/usr/lib/nsight-systems/host-linux-x64:${LD_LIBRARY_PATH:-}" \
         PYTHONPATH="$PYTHONPATH_VALUE" \
+        "${NODE_A_COST_ENV[@]}" \
         JIN_RUN_ID="$RUN_ID" \
         JIN_EXPERIMENT_RUN_ID="$RUN_ID" \
         JIN_NETWORK_MBPS="$NETWORK_MBPS" \
         JIN_AUTO_DROP_RATIO="$DROP_RATIO" \
         JIN_MPS_PERCENT="$MPS_PERCENT" \
         JIN_SELECTION_POLICY="$SELECTION_POLICY" \
-        JIN_RECOMPUTE_COST_CSV="$RECOMPUTE_COST_CSV" \
         JIN_TEMPLATE_PLAN_A_PATH="$TEMPLATE_PLAN_A_PATH" \
         JIN_MAX_STEPS="$MAX_STEPS" \
         JIN_ENDPOINT="$NODE_A_ENDPOINT" \
-        SPLITMAGIC_RECOMPUTE_PROFILE_CSV="$RECOMPUTE_LAYER_PROFILE_CSV" \
     bash -c "
         cd '$PROJECT_DIR'
 

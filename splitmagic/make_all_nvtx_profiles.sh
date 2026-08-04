@@ -74,6 +74,8 @@ while IFS= read -r -d '' input_csv; do
     recompute_details="${output_dir}/${base}_recompute_layer_profile_details.csv"
     inject_profile="${output_dir}/${base}_inject_key_profile.csv"
     inject_details="${output_dir}/${base}_inject_key_profile_details.csv"
+    output_profile="${output_dir}/${base}_output_to_cpu_key_profile.csv"
+    output_details="${output_dir}/${base}_output_to_cpu_key_profile_details.csv"
 
     echo
     echo "============================================================"
@@ -81,9 +83,11 @@ while IFS= read -r -d '' input_csv; do
     echo "============================================================"
 
     if [[ "${FORCE}" != "1" ]] &&
-       [[ -s "${recompute_profile}" || -s "${inject_profile}" ]]; then
+        [[ -s "${recompute_profile}" ]] &&
+        [[ -s "${inject_profile}" ]] &&
+        [[ -s "${output_profile}" ]]; then
 
-        echo "[SKIP] profile output already exists"
+        echo "[SKIP] all profile outputs already exist"
         skipped=$((skipped + 1))
         continue
     fi
@@ -94,6 +98,8 @@ while IFS= read -r -d '' input_csv; do
         "${recompute_details}" \
         "${inject_profile}" \
         "${inject_details}" \
+        "${output_profile}" \
+        "${output_details}" \
         "${METRIC}" <<'PY'
 from __future__ import annotations
 
@@ -108,7 +114,9 @@ recompute_profile_path = Path(sys.argv[2])
 recompute_details_path = Path(sys.argv[3])
 inject_profile_path = Path(sys.argv[4])
 inject_details_path = Path(sys.argv[5])
-metric = sys.argv[6]
+output_profile_path = Path(sys.argv[6])
+output_details_path = Path(sys.argv[7])
+metric = sys.argv[8]
 
 
 def find_header_index(lines: list[str]) -> int:
@@ -176,6 +184,7 @@ reader = csv.DictReader(lines[header_index:])
 
 recompute_rows: list[dict[str, Any]] = []
 inject_rows: list[dict[str, Any]] = []
+output_rows: list[dict[str, Any]] = []
 
 for source_row in reader:
     range_name = (
@@ -244,6 +253,22 @@ for source_row in reader:
             "range_name": range_name,
             **metrics,
         })
+
+        continue
+
+    prefix = "OUTPUT_TO_CPU/"
+
+    if range_name.startswith(prefix):
+
+        key = range_name[len(prefix):]
+
+        output_rows.append({
+            "key": key,
+            "range_name": range_name,
+            **metrics,
+        })
+
+        continue
 
 
 # ============================================================
@@ -382,8 +407,87 @@ else:
 
     print("[INJECT_EMPTY]")
 
+# ============================================================
+# OUTPUT_TO_CPU output
+# ============================================================
 
-if not recompute_rows and not inject_rows:
+if output_rows:
+
+    output_rows.sort(
+        key=lambda x: x["key"]
+    )
+
+    with output_profile_path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "key",
+                "output_to_cpu_ms",
+            ],
+        )
+
+        writer.writeheader()
+
+        for row in output_rows:
+
+            writer.writerow({
+                "key": row["key"],
+                "output_to_cpu_ms":
+                    f"{row['selected_ms']:.9f}",
+            })
+
+    with output_details_path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "key",
+                "range_name",
+                "selected_ms",
+                "avg_ms",
+                "median_ms",
+                "min_ms",
+                "max_ms",
+                "total_ms",
+                "instances",
+            ],
+        )
+
+        writer.writeheader()
+        writer.writerows(output_rows)
+
+    print(
+        f"[OUTPUT_TO_CPU] "
+        f"keys={len(output_rows)} "
+        f"profile={output_profile_path.name}"
+    )
+
+else:
+
+    output_profile_path.unlink(
+        missing_ok=True
+    )
+
+    output_details_path.unlink(
+        missing_ok=True
+    )
+
+    print("[OUTPUT_TO_CPU_EMPTY]")
+
+if (
+    not recompute_rows
+    and not inject_rows
+    and not output_rows
+):
     raise SystemExit(3)
 PY
     then
@@ -410,11 +514,20 @@ PY
     fi
 
 done < <(
-    find "${ROOT}" \
-        -type f \
-        -name '*_nvtxsum.csv' \
-        -print0 |
-    sort -z
+    PROFILE_RATIO="${PROFILE_RATIO:-}"
+
+    if [[ -n "${PROFILE_RATIO}" ]]; then
+        find "${ROOT}" \
+            -type f \
+            -path "*ratio${PROFILE_RATIO}*" \
+            -name '*_nvtxsum.csv' \
+            -print0
+    else
+        find "${ROOT}" \
+            -type f \
+            -name '*_nvtxsum.csv' \
+            -print0
+    fi
 )
 
 echo
