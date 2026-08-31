@@ -26,6 +26,7 @@ RECOMPUTE_POLICIES = {
             "graph:conv:3:input",
             "graph:conv:2:input",
             "graph:conv:1:input",
+            "graph:conv:0:input",
 
             "graph:relu:16:result",
             "graph:relu:14:result",
@@ -47,6 +48,9 @@ RECOMPUTE_POLICIES = {
             "graph:relu:0:result",
 
             "graph:addmm:0:mat1",
+
+            "graph:maxpool2d:0:input",
+            "graph:maxpool2d:0:indices",
         },
     },
 

@@ -94,6 +94,12 @@ def main():
             "node_b": "tests/test_node_b_mobilenetv2.py",
             "compare": "tests/test_compare_mobilenetv2.py",
         },
+        "resnet50_imagenet": {
+            "single": "tests/test_single_resnet50_imagenet.py",
+            "node_a": "tests/test_node_a_resnet50_imagenet.py",
+            "node_b": "tests/test_node_b_resnet50_imagenet.py",
+            "compare": "tests/test_compare_resnet50_imagenet.py",
+        },
 
     }
 

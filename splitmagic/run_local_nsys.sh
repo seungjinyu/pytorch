@@ -70,6 +70,7 @@ RUN_ID="${RUN_ID:-0}"
 DROP_RATIO="${DROP_RATIO:-0.5}"
 MPS_PERCENT="${MPS_PERCENT:-100}"
 MAX_STEPS="${MAX_STEPS:-5}"
+BATCH_SIZE="${JIN_BATCH_SIZE:-32}"
 SELECTION_POLICY="${SELECTION_POLICY:-cost}"
 
 # Namespace names
@@ -83,7 +84,7 @@ VETH_B="${VETH_B:-veth_sm_b}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_DIR}/nsys_results}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
-RUN_NAME="${RUN_NAME:-${TIMESTAMP}_${MODEL}_${NETWORK_MBPS}mbps_${LATENCY_MS}ms_policy${SELECTION_POLICY}_maxratio${DROP_RATIO}_mps${MPS_PERCENT}_run${RUN_ID}}"
+RUN_NAME="${RUN_NAME:-${TIMESTAMP}_${MODEL}_bs${BATCH_SIZE}_${NETWORK_MBPS}mbps_${LATENCY_MS}ms_policy_${SELECTION_POLICY}_maxratio${DROP_RATIO}_mps${MPS_PERCENT}_run${RUN_ID}}"
 RUN_DIR="${OUTPUT_ROOT}/${RUN_NAME}"
 
 TEMPLATE_PLAN_PATH="${RUN_DIR}/jin_template_plan.tsv"
@@ -99,7 +100,7 @@ NSYS_OUTPUT="${RUN_DIR}/node_b_${NETWORK_MBPS}_${MPS_PERCENT}_${DROP_RATIO}"
 
 # Timeouts
 NODE_B_START_TIMEOUT="${NODE_B_START_TIMEOUT:-30}"
-EXPERIMENT_TIMEOUT="${EXPERIMENT_TIMEOUT:-300}"
+EXPERIMENT_TIMEOUT="${EXPERIMENT_TIMEOUT:-600}"
 
 RECOMPUTE_COST_CSV="${RECOMPUTE_COST_CSV:-${PROJECT_DIR}/menus_offline/${MODEL}_cuda_mps${MPS_PERCENT}/final_menu.csv}"
 
@@ -400,6 +401,7 @@ SELECTION_POLICY=${SELECTION_POLICY}
 DROP_RATIO=${DROP_RATIO}
 MPS_PERCENT=${MPS_PERCENT}
 MAX_STEPS=${MAX_STEPS}
+BATCH_SIZE=${BATCH_SIZE}
 RECOMPUTE_COST_CSV=${RECOMPUTE_COST_CSV}
 RECOMPUTE_LAYER_PROFILE_CSV=${RECOMPUTE_LAYER_PROFILE_CSV}
 NODE_A_IP=${NODE_A_IP}
@@ -524,6 +526,7 @@ timeout \
         JIN_SELECTION_POLICY="$SELECTION_POLICY" \
         JIN_TEMPLATE_PLAN_A_PATH="$TEMPLATE_PLAN_A_PATH" \
         JIN_MAX_STEPS="$MAX_STEPS" \
+        JIN_BATCH_SIZE="$BATCH_SIZE" \
         JIN_ENDPOINT="$NODE_A_ENDPOINT" \
     bash -c "
         cd '$PROJECT_DIR'
@@ -606,30 +609,67 @@ ip netns exec "$NS_B" tc -s qdisc show dev "$VETH_B" \
 
 
 # ------------------------------------------------------------
-# 13. Validate Nsight output
+# 13. Export Nsight statistics
 # ------------------------------------------------------------
 
-if [[ -f "${NSYS_OUTPUT}.nsys-rep" ]]; then
-    NSYS_REPORT="${NSYS_OUTPUT}.nsys-rep"
-elif [[ -f "${NSYS_OUTPUT}.qdrep" ]]; then
-    NSYS_REPORT="${NSYS_OUTPUT}.qdrep"
-else
-    NSYS_REPORT=""
-fi
+NODE_A_REPORT="${RUN_DIR}/node_a_${NETWORK_MBPS}_${MPS_PERCENT}_${DROP_RATIO}.nsys-rep"
+NODE_B_REPORT="${RUN_DIR}/node_b_${NETWORK_MBPS}_${MPS_PERCENT}_${DROP_RATIO}.nsys-rep"
 
-if [[ -n "$NSYS_REPORT" ]]; then
-    log "Nsight report created: $NSYS_REPORT"
+export_nsys_csv() {
+    local report="$1"
+    local prefix="$2"
+
+    if [[ ! -f "$report" ]]; then
+        log "WARNING: Nsight report not found: $report"
+        return 0
+    fi
+
+    log "Exporting Nsight statistics: $report"
 
     nsys stats \
-        --report nvtxsum,cudaapisum,gpukernsum \
-        "$NSYS_REPORT" \
-        >"${RUN_DIR}/nsys_stats.txt" \
-        2>"${RUN_DIR}/nsys_stats_error.txt" ||
-        log "nsys stats could not generate every requested report."
-else
-    log "WARNING: Nsight report was not found."
-fi
+        --report nvtxsum \
+        --format csv \
+        "$report" \
+        >"${RUN_DIR}/${prefix}_nvtxsum.csv" \
+        2>"${RUN_DIR}/${prefix}_nvtxsum_error.txt" ||
+        log "WARNING: Failed to export ${prefix} NVTX summary."
 
+    nsys stats \
+        --report osrtsum \
+        --format csv \
+        "$report" \
+        >"${RUN_DIR}/${prefix}_osrtsum.csv" \
+        2>"${RUN_DIR}/${prefix}_osrtsum_error.txt" ||
+        log "WARNING: Failed to export ${prefix} OS runtime summary."
+}
+
+export_node_b_cuda_csv() {
+    local report="$1"
+
+    if [[ ! -f "$report" ]]; then
+        return 0
+    fi
+
+    nsys stats \
+        --report cudaapisum \
+        --format csv \
+        "$report" \
+        >"${RUN_DIR}/node_b_cudaapisum.csv" \
+        2>"${RUN_DIR}/node_b_cudaapisum_error.txt" ||
+        log "WARNING: Failed to export Node B CUDA API summary."
+
+    nsys stats \
+        --report gpukernsum \
+        --format csv \
+        "$report" \
+        >"${RUN_DIR}/node_b_gpukernsum.csv" \
+        2>"${RUN_DIR}/node_b_gpukernsum_error.txt" ||
+        log "WARNING: Failed to export Node B GPU kernel summary."
+}
+
+export_nsys_csv "$NODE_A_REPORT" "node_a"
+export_nsys_csv "$NODE_B_REPORT" "node_b"
+export_node_b_cuda_csv "$NODE_B_REPORT"
 
 # ------------------------------------------------------------
 # 14. Summary
@@ -639,8 +679,12 @@ log "Experiment complete"
 log "Node A log : $NODE_A_LOG"
 log "Node B log : $NODE_B_LOG"
 
-if [[ -n "$NSYS_REPORT" ]]; then
-    log "NSYS report: $NSYS_REPORT"
+if [[ -f "$NODE_A_REPORT" ]]; then
+    log "Node A NSYS report: $NODE_A_REPORT"
+fi
+
+if [[ -f "$NODE_B_REPORT" ]]; then
+    log "Node B NSYS report: $NODE_B_REPORT"
 fi
 
 log "Results directory: $RUN_DIR"

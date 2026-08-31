@@ -40,10 +40,16 @@ PYTHON_BIN="${PYTHON_BIN:-/home/syu23/miniconda3/envs/torch-build/bin/python3}"
 NETWORK_MBPS="${NETWORK_MBPS:-1000}"
 LATENCY_MS="${LATENCY_MS:-0}"
 DROP_RATIO="${DROP_RATIO:-0.99}"
+
+SELECTION_POLICY="${SELECTION_POLICY:-ratio}"
+RECOMPUTE_POLICY="${RECOMPUTE_POLICY:-resnet18_exact}"
+RECOMPUTE_COST_CSV="${RECOMPUTE_COST_CSV:-}"
+
 CPU_THREADS="${CPU_THREADS:-1}"
 RUN_ID="${RUN_ID:-0}"
 MAX_STEPS="${MAX_STEPS:-5}"
 MODEL="${MODEL:-resnet18}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
 
 PORT="${PORT:-5555}"
 
@@ -62,7 +68,7 @@ SUBNET_CIDR="${SUBNET_CIDR:-24}"
 
 TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
 
-OUTPUT_DIR="${PROJECT_DIR}/nsys_results/${TIMESTAMP}_${MODEL}_cpu_${NETWORK_MBPS}mbps_${LATENCY_MS}ms_ratio${DROP_RATIO}_threads${CPU_THREADS}_run${RUN_ID}"
+OUTPUT_DIR="${PROJECT_DIR}/nsys_results/${TIMESTAMP}_${MODEL}_bs${BATCH_SIZE}_cpu_${NETWORK_MBPS}mbps_${LATENCY_MS}ms_ratio${DROP_RATIO}_threads${CPU_THREADS}_run${RUN_ID}"
 
 NODE_A_LOG="${OUTPUT_DIR}/node_a.log"
 NODE_B_LOG="${OUTPUT_DIR}/node_b.log"
@@ -77,7 +83,8 @@ TEMPLATE_PLAN_B="${OUTPUT_DIR}/jin_template_plan_b.tsv"
 EXECUTION_PLAN="${OUTPUT_DIR}/jin_execution_plan.tsv"
 ALIAS_PATH="${OUTPUT_DIR}/jin_payload.alias"
 
-NSYS_BASE="${OUTPUT_DIR}/node_b_${NETWORK_MBPS}_cpu_t${CPU_THREADS}_${DROP_RATIO}"
+NSYS_BASE_A="${OUTPUT_DIR}/node_a_${NETWORK_MBPS}_cpu_t${CPU_THREADS}_${DROP_RATIO}"
+NSYS_BASE_B="${OUTPUT_DIR}/node_b_${NETWORK_MBPS}_cpu_t${CPU_THREADS}_${DROP_RATIO}"
 
 
 # ------------------------------------------------------------
@@ -94,10 +101,14 @@ case "${MODEL}" in
         NODE_A_SCRIPT="tests/test_node_a_vgg.py"
         NODE_B_SCRIPT="tests/test_node_b_vgg.py"
         ;;
+    resnet18_imagenet)
+        NODE_A_SCRIPT="tests/test_node_a_resnet18_imagenet.py"
+        NODE_B_SCRIPT="tests/test_node_b_resnet18_imagenet.py"
+        ;;
 
     *)
         echo "[ERROR] Unsupported MODEL=${MODEL}" >&2
-        echo "[ERROR] Expected resnet18, vgg, or vgg11bn" >&2
+        echo "[ERROR] Expected resnet18, resnet18_imagenet, vgg, or vgg11bn" >&2
         exit 1
         ;;
 esac
@@ -225,6 +236,7 @@ log "Network           : ${NETWORK_MBPS} Mbps"
 log "Latency           : ${LATENCY_MS} ms"
 log "Drop ratio        : ${DROP_RATIO}"
 log "CPU threads       : ${CPU_THREADS}"
+log "Batch size        : ${BATCH_SIZE}"
 log "Run ID            : ${RUN_ID}"
 log "Max steps         : ${MAX_STEPS}"
 
@@ -348,6 +360,7 @@ CPU_ENV=(
     "MKL_NUM_THREADS=${CPU_THREADS}"
     "OPENBLAS_NUM_THREADS=${CPU_THREADS}"
     "NUMEXPR_NUM_THREADS=${CPU_THREADS}"
+
     "VECLIB_MAXIMUM_THREADS=${CPU_THREADS}"
 )
 
@@ -372,18 +385,21 @@ setsid ip netns exec "${NS_B}" \
     JIN_MAX_STEPS="${MAX_STEPS}" \
     JIN_NETWORK_MBPS="${NETWORK_MBPS}" \
     JIN_AUTO_DROP_RATIO="${DROP_RATIO}" \
+    JIN_SELECTION_POLICY="${SELECTION_POLICY}" \
+    JIN_RECOMPUTE_POLICY="${RECOMPUTE_POLICY}" \
+    JIN_RECOMPUTE_COST_CSV="${RECOMPUTE_COST_CSV}" \
     JIN_RUN_ID="${RUN_ID}" \
     JIN_EXPERIMENT_RUN_ID="${RUN_ID}" \
-    JIN_BATCH_SIZE="32" \
+    JIN_BATCH_SIZE="${BATCH_SIZE}" \
     JIN_TEMPLATE_PLAN_PATH="${TEMPLATE_PLAN_B}" \
     JIN_EXECUTION_PLAN_PATH="${EXECUTION_PLAN}" \
     JIN_ALIAS_PATH="${ALIAS_PATH}" \
     JIN_RECOMPUTE_EXPERIMENT_CSV="${OUTPUT_DIR}/recompute_cost_experiments_cpu.csv" \
     nsys profile \
-        --trace=cuda,nvtx,osrt \
+        --trace=nvtx,osrt \
         --sample=none \
         --force-overwrite=true \
-        --output="${NSYS_BASE}" \
+        --output="${NSYS_BASE_B}" \
         "${PYTHON_BIN}" -u "${NODE_B_SCRIPT}" \
     >"${NODE_B_LOG}" 2>&1 &
 
@@ -432,7 +448,7 @@ log "Node B is ready"
 # Start Node A
 # ------------------------------------------------------------
 
-log "Starting Node A..."
+log "Starting Node A on CPU under Nsight Systems..."
 
 setsid ip netns exec "${NS_A}" \
     env \
@@ -441,15 +457,26 @@ setsid ip netns exec "${NS_A}" \
     JIN_MAX_STEPS="${MAX_STEPS}" \
     JIN_NETWORK_MBPS="${NETWORK_MBPS}" \
     JIN_AUTO_DROP_RATIO="${DROP_RATIO}" \
+    JIN_SELECTION_POLICY="${SELECTION_POLICY}" \
+    JIN_RECOMPUTE_POLICY="${RECOMPUTE_POLICY}" \
+    JIN_RECOMPUTE_COST_CSV="${RECOMPUTE_COST_CSV}" \
     JIN_RUN_ID="${RUN_ID}" \
     JIN_EXPERIMENT_RUN_ID="${RUN_ID}" \
     JIN_TEMPLATE_PLAN_A_PATH="${TEMPLATE_PLAN_A}" \
     JIN_EXPERIMENT_CSV="${EXPERIMENT_CSV}" \
-    CPU_THREADS="1" \
-    OMP_NUM_THREADS="1" \
-    MKL_NUM_THREADS="1" \
-    OPENBLAS_NUM_THREADS="1" \
-    "${PYTHON_BIN}" -u "${NODE_A_SCRIPT}" \
+    JIN_BATCH_SIZE="${BATCH_SIZE}" \
+    CPU_THREADS="${CPU_THREADS}" \
+    OMP_NUM_THREADS="${CPU_THREADS}" \
+    MKL_NUM_THREADS="${CPU_THREADS}" \
+    OPENBLAS_NUM_THREADS="${CPU_THREADS}" \
+    NUMEXPR_NUM_THREADS="${CPU_THREADS}" \
+    VECLIB_MAXIMUM_THREADS="${CPU_THREADS}" \
+    nsys profile \
+        --trace=nvtx,osrt \
+        --sample=none \
+        --force-overwrite=true \
+        --output="${NSYS_BASE_A}" \
+        "${PYTHON_BIN}" -u "${NODE_A_SCRIPT}" \
     >"${NODE_A_LOG}" 2>&1 &
 
 NODE_A_PID=$!
@@ -531,53 +558,61 @@ fi
 # Locate/convert Nsight report
 # ------------------------------------------------------------
 
-NSYS_REPORT="${NSYS_BASE}.nsys-rep"
-QDSTRM_REPORT="${NSYS_BASE}.qdstrm"
+NSYS_REPORT_A="${NSYS_BASE_A}.nsys-rep"
+QDSTRM_REPORT_A="${NSYS_BASE_A}.qdstrm"
 
-if [[ ! -f "${NSYS_REPORT}" && -f "${QDSTRM_REPORT}" ]]; then
-    IMPORTER="/usr/lib/nsight-systems/host-linux-x64/QdstrmImporter"
+NSYS_REPORT_B="${NSYS_BASE_B}.nsys-rep"
+QDSTRM_REPORT_B="${NSYS_BASE_B}.qdstrm"
 
-    if [[ ! -x "${IMPORTER}" ]]; then
-        IMPORTER="/usr/lib/x86_64-linux-gnu/nsight-systems/host-linux-x64/QdstrmImporter"
+# ------------------------------------------------------------
+# Locate/convert/export Nsight reports
+# ------------------------------------------------------------
+
+convert_and_export_nsys() {
+    local role="$1"
+    local nsys_base="$2"
+    local log_file="$3"
+
+    local nsys_report="${nsys_base}.nsys-rep"
+    local qdstrm_report="${nsys_base}.qdstrm"
+
+    if [[ ! -f "${nsys_report}" && -f "${qdstrm_report}" ]]; then
+        local importer="/usr/lib/nsight-systems/host-linux-x64/QdstrmImporter"
+
+        if [[ ! -x "${importer}" ]]; then
+            importer="/usr/lib/x86_64-linux-gnu/nsight-systems/host-linux-x64/QdstrmImporter"
+        fi
+
+        if [[ -x "${importer}" ]]; then
+            log "Converting ${role} QDSTRM to NSYS-REP..."
+
+            "${importer}" \
+                "${qdstrm_report}" \
+                --output-file "${nsys_report}" \
+                >>"${log_file}" 2>&1 || true
+        else
+            log "WARNING: QdstrmImporter not found"
+        fi
     fi
 
-    if [[ -x "${IMPORTER}" ]]; then
-        log "Converting QDSTRM to NSYS-REP..."
-
-        "${IMPORTER}" \
-            "${QDSTRM_REPORT}" \
-            --output-file "${NSYS_REPORT}" \
-            >>"${NODE_B_LOG}" 2>&1 || true
+    if [[ -f "${nsys_report}" ]]; then
+        log "${role} NSYS report : ${nsys_report}"
     else
-        log "WARNING: QdstrmImporter not found"
+        log "WARNING: ${role} NSYS report was not generated."
+        log "Expected: ${nsys_report}"
+        log "QDSTRM  : ${qdstrm_report}"
     fi
-fi
+}
 
+convert_and_export_nsys \
+    "Node A" \
+    "${NSYS_BASE_A}" \
+    "${NODE_A_LOG}"
 
-# ------------------------------------------------------------
-# Export NVTX summary
-# ------------------------------------------------------------
-
-if [[ -f "${NSYS_REPORT}" ]]; then
-    NVTX_CSV="${OUTPUT_DIR}/node_b_${NETWORK_MBPS}_cpu_t${CPU_THREADS}_${DROP_RATIO}_nvtxsum.csv"
-
-    log "Exporting NVTX summary..."
-
-    nsys stats \
-        --report nvtxsum \
-        --format csv \
-        --output "${NVTX_CSV}" \
-        "${NSYS_REPORT}" \
-        >>"${NODE_B_LOG}" 2>&1 || true
-
-    log "NSYS report : ${NSYS_REPORT}"
-    log "NVTX CSV    : ${NVTX_CSV}"
-else
-    log "WARNING: NSYS report was not generated."
-    log "Expected: ${NSYS_REPORT}"
-    log "QDSTRM  : ${QDSTRM_REPORT}"
-fi
-
+convert_and_export_nsys \
+    "Node B" \
+    "${NSYS_BASE_B}" \
+    "${NODE_B_LOG}"
 
 # ------------------------------------------------------------
 # Final validation

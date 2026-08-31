@@ -91,6 +91,7 @@ class FXRecomputeEngine:
                 op_type = "Unknown"
 
         return f"RECOMP/{op_type}/{node_name}"
+    
     def _value_for_node(self, node_name):
         if node_name in self.node_values:
             return self.node_values[node_name]
@@ -184,7 +185,59 @@ class FXRecomputeEngine:
             out = lhs + rhs
 
         return out
-    
+
+    def recompute_maxpool_from_input(
+        self,
+        node_name,
+        input_tensor,
+        use_nvtx=True,
+    ):
+        module = self._get_module_for_node(node_name)
+        
+        if module is None:
+            raise RuntimeError(
+                f"[RECOMPUTE][MAXPOOL] "
+                f"module not found: {node_name}"
+            )
+        ctx = (
+            nvtx_range(
+                self._get_nvtx_range_name(node_name)
+            )
+            if use_nvtx
+            else nullcontext()
+        )
+        with ctx:
+            self.executed_recompute_nodes.append(
+                node_name
+            )
+
+            pool_output, pool_indices = (
+                torch.nn.functional.max_pool2d(
+                    input_tensor,
+                    kernel_size=module.kernel_size,
+                    stride=module.stride,
+                    padding=module.padding,
+                    dilation=module.dilation,
+                    ceil_mode=module.ceil_mode,
+                    return_indices=True,
+                )
+            )
+
+        if not isinstance(module, torch.nn.MaxPool2d):
+            raise RuntimeError(
+                f"[RECOMPUTE][MAXPOOL] "
+                f"not MaxPool2d: {node_name} "
+                f"type={type(module).__name__}"
+            )
+
+        self.node_values[node_name] = pool_output
+
+        self.node_values[
+            f"{node_name}__indices"
+        ] = pool_indices
+
+        return pool_output, pool_indices
+
     def recompute_path(
         self,
         start_tensor,
@@ -282,10 +335,18 @@ class FXRecomputeEngine:
                         )
                         continue
 
-                    self.executed_recompute_nodes.append(node_name)
+                    if isinstance(module, torch.nn.MaxPool2d):
+                        cur, _ = self.recompute_maxpool_from_input(
+                            node_name=node_name,
+                            input_tensor=cur,
+                            use_nvtx=False,
+                        )
 
-                    cur = module(cur)
-                    self.node_values[node_name] = cur
+                    else:
+                        self.executed_recompute_nodes.append(node_name)
+
+                        cur = module(cur)
+                        self.node_values[node_name] = cur
 
         if use_cuda_timer:
             end_event.record()

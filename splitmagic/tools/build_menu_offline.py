@@ -12,7 +12,12 @@ import numpy as np
 import torch
 import json
 
-from splitmagic.models import make_resnet18_cifar10
+from splitmagic.models import (
+    make_resnet18_cifar10,
+    make_resnet18_imagenet,
+    make_vgg11_bn_cifar10,
+
+)
 from splitmagic.runtime import (
     SplitRuntime,
     get_required_keys_from_plan,
@@ -20,6 +25,33 @@ from splitmagic.runtime import (
     read_dryrun_plan,
 )
 
+
+MODEL_CONFIGS = {
+    "resnet18": {
+        "input_size": 32,
+        "num_classes": 10,
+    },
+    "resnet18_imagenet": {
+        "input_size": 224,
+        "num_classes": 200,
+    },
+    "resnet50": {
+        "input_size": 32,
+        "num_classes": 10,
+    },
+    "resnet50_imagenet": {
+        "input_size": 224,
+        "num_classes": 200,
+    },
+    "vgg11bn": {
+        "input_size": 32,
+        "num_classes": 10,
+    },
+    "lenet": {
+        "input_size": 32,
+        "num_classes": 10,
+    },
+}
 
 FINAL_FIELDS = [
     "key",
@@ -48,11 +80,17 @@ def build_model(model_name: str) -> torch.nn.Module:
     if model_name == "resnet18":
         return make_resnet18_cifar10()
 
-    raise ValueError(
-        f"Unsupported model={model_name}. "
-        "현재 스크립트는 resnet18부터 지원한다."
-    )
+    if model_name == "resnet18_imagenet":
+        return make_resnet18_imagenet(
+            num_classes=200,
+        )
+    
+    if model_name == "vgg11bn":
+        return make_vgg11bn_cifar10()
 
+    raise ValueError(
+        f"Unsupported model={model_name}"
+    )
 
 def load_inject_profile(
     path: Path,
@@ -131,6 +169,88 @@ def load_output_profile(
             prices[key] = float(value)
 
     return prices
+
+def load_forward_profile(
+    path: Path,
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+
+    with path.open(
+        "r",
+        encoding="utf-8",
+        newline="",
+    ) as file:
+        reader = csv.DictReader(file)
+
+        required = {
+            "node_name",
+            "avg_ms",
+        }
+
+        missing = required - set(
+            reader.fieldnames or []
+        )
+
+        if missing:
+            raise RuntimeError(
+                f"Forward profile columns missing: "
+                f"{sorted(missing)}"
+            )
+
+        for row in reader:
+            node_name = (
+                row.get("node_name") or ""
+            ).strip()
+
+            forward_ms = (
+                row.get("avg_ms") or ""
+            ).strip()
+
+            if not node_name or not forward_ms:
+                continue
+
+            rows.append({
+                "node_name": node_name,
+                "forward_ms": forward_ms,
+            })
+
+    return rows
+
+def build_forward_menu(
+    forward_profile_path: Path,
+    forward_menu_path: Path,
+) -> None:
+    rows = load_forward_profile(
+        forward_profile_path
+    )
+
+    forward_menu_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with forward_menu_path.open(
+        "w",
+        encoding="utf-8",
+        newline="",
+    ) as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=[
+                "node_name",
+                "forward_ms",
+            ],
+        )
+
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(
+        "[FORWARD_MENU] "
+        f"rows={len(rows)} "
+        f"path={forward_menu_path}",
+        flush=True,
+    )
 
 def attach_runtime_costs(
     recompute_menu_path: Path,
@@ -338,10 +458,16 @@ def main() -> None:
 
     parser.add_argument(
         "--model",
-        choices=["resnet18"],
+        choices=[
+            "resnet18",
+            "resnet18_imagenet",
+            "resnet50",
+            "resnet50_imagenet",
+            "vgg11bn",
+            "lenet",
+        ],
         required=True,
     )
-
     parser.add_argument(
         "--plan",
         type=Path,
@@ -365,7 +491,11 @@ def main() -> None:
         type=Path,
         required=True,
     )
-
+    parser.add_argument(
+        "--forward-profile",
+        type=Path,
+        required=True,
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -378,15 +508,27 @@ def main() -> None:
         default=32,
     )
     parser.add_argument(
-    "--network-mbps",
-    type=float,
-    default=None,
+        "--network-mbps",
+        type=float,
+        default=None,
     )
 
     parser.add_argument(
-        "--mps-percent",
+        "--device",
+        choices=["cuda", "cpu"],
+        required=True,
+    )
+
+    parser.add_argument(
+        "--resource-name",
+        choices=["mps", "threads"],
+        required=True,
+    )
+
+    parser.add_argument(
+        "--resource-value",
         type=int,
-        default=None,
+        required=True,
     )
 
     parser.add_argument(
@@ -404,7 +546,7 @@ def main() -> None:
     parser.add_argument(
         "--drop-ratio",
         type=float,
-        default=0.99,
+        default=1.0,
     )
 
     parser.add_argument(
@@ -414,11 +556,22 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    if args.device == "cuda":
+        if args.resource_name != "mps":
+            raise ValueError(
+                "CUDA condition requires resource-name=mps"
+            )
 
-    if abs(args.drop_ratio - 0.99) > 1e-9:
+    elif args.device == "cpu":
+        if args.resource_name != "threads":
+            raise ValueError(
+                "CPU condition requires resource-name=threads"
+            )
+
+    if abs(args.drop_ratio - 1.0) != 0.0:
         raise ValueError(
             "Offline final menu must be built from "
-            "drop_ratio=0.99 profiling. "
+            "drop_ratio=1.0 profiling. "
             f"received={args.drop_ratio}"
         )
 
@@ -434,6 +587,12 @@ def main() -> None:
         .expanduser()
         .resolve()
     )
+    forward_profile = (
+        args.forward_profile
+        .expanduser()
+        .resolve()
+    )
+
     inject_profile = (
         args.inject_profile
         .expanduser()
@@ -450,6 +609,7 @@ def main() -> None:
         recompute_profile,
         inject_profile,
         output_profile,
+        forward_profile,
     ):
         if not path.is_file():
             raise FileNotFoundError(path)
@@ -479,19 +639,27 @@ def main() -> None:
     print(
         "[OFFLINE_CONFIG] "
         f"model={args.model} "
+        f"device={args.device} "
+        f"resource={args.resource_name}"
+        f"{args.resource_value} "
         f"batch_size={args.batch_size} "
         f"plan_rows={len(plan)} "
         f"recompute_profile={recompute_profile} "
-        f"inject_profile={inject_profile}"
-        f"output_profile={output_profile} ",
+        f"inject_profile={inject_profile} "
+        f"output_profile={output_profile} "
+        f"forward_profile={forward_profile}",
         flush=True,
     )
+
+    config = MODEL_CONFIGS[args.model]
+
+    input_size = config["input_size"]
 
     dummy_x = torch.randn(
         args.batch_size,
         3,
-        32,
-        32,
+        input_size,
+        input_size,
         device=device,
     )
 
@@ -548,12 +716,24 @@ def main() -> None:
     inject_menu_path = (
         output_dir / "inject_menu.csv"
     )
+
     output_menu_path = (
         output_dir / "output_to_cpu_menu.csv"
     )
 
+    resource_tag = (
+        f"{args.resource_name}"
+        f"{args.resource_value}"
+    )
+
+    forward_menu_path = (
+        output_dir
+        / f"{args.model}_{resource_tag}_forward_menu.csv"
+    )
+
     final_menu_path = (
-        output_dir / "final_menu.csv"
+        output_dir
+        / f"{args.model}_{resource_tag}_final_menu.csv"
     )
 
     menu_runtime.build_recompute_menu(
@@ -572,14 +752,21 @@ def main() -> None:
         output_menu_path=output_menu_path,
         final_menu_path=final_menu_path,
     )
+
+    build_forward_menu(
+        forward_profile_path=forward_profile,
+        forward_menu_path=forward_menu_path,
+    )
     metadata_path = (
         output_dir / "metadata.json"
     )
 
     metadata = {
         "model": args.model,
+        "device": args.device,
+        "resource_name": args.resource_name,
+        "resource_value": args.resource_value,
         "network_mbps": args.network_mbps,
-        "mps_percent": args.mps_percent,
         "profile_steps": args.profile_steps,
         "metric": args.metric,
         "profiling_drop_ratio": (
@@ -595,6 +782,12 @@ def main() -> None:
         ),
         "output_to_cpu_profile_path": str(
             output_profile
+        ),
+        "forward_profile_path": str(
+            forward_profile
+        ),
+        "forward_menu_path": str(
+            forward_menu_path
         ),
         "final_menu_path": str(
             final_menu_path

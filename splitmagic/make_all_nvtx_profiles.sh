@@ -24,7 +24,7 @@ set -Eeuo pipefail
 # ============================================================
 
 ROOT="${1:-./nsys_results}"
-METRIC="${METRIC:-median}"
+METRIC="${METRIC:-avg}"
 FORCE="${FORCE:-0}"
 
 PYTHON_BIN="${PYTHON_BIN:-/home/syu23/miniconda3/envs/torch-build/bin/python3}"
@@ -61,6 +61,8 @@ failed=0
 skipped=0
 no_recompute=0
 no_inject=0
+no_output=0
+no_forward=0
 
 while IFS= read -r -d '' input_csv; do
     count=$((count + 1))
@@ -76,6 +78,8 @@ while IFS= read -r -d '' input_csv; do
     inject_details="${output_dir}/${base}_inject_key_profile_details.csv"
     output_profile="${output_dir}/${base}_output_to_cpu_key_profile.csv"
     output_details="${output_dir}/${base}_output_to_cpu_key_profile_details.csv"
+    forward_profile="${output_dir}/${base}_forward_layer_profile.csv"
+    forward_details="${output_dir}/${base}_forward_layer_profile_details.csv"
 
     echo
     echo "============================================================"
@@ -85,7 +89,8 @@ while IFS= read -r -d '' input_csv; do
     if [[ "${FORCE}" != "1" ]] &&
         [[ -s "${recompute_profile}" ]] &&
         [[ -s "${inject_profile}" ]] &&
-        [[ -s "${output_profile}" ]]; then
+        [[ -s "${output_profile}" ]] &&
+        [[ -s "${forward_profile}" ]]; then
 
         echo "[SKIP] all profile outputs already exist"
         skipped=$((skipped + 1))
@@ -100,6 +105,8 @@ while IFS= read -r -d '' input_csv; do
         "${inject_details}" \
         "${output_profile}" \
         "${output_details}" \
+        "${forward_profile}" \
+        "${forward_details}" \
         "${METRIC}" <<'PY'
 from __future__ import annotations
 
@@ -116,7 +123,9 @@ inject_profile_path = Path(sys.argv[4])
 inject_details_path = Path(sys.argv[5])
 output_profile_path = Path(sys.argv[6])
 output_details_path = Path(sys.argv[7])
-metric = sys.argv[8]
+forward_profile_path = Path(sys.argv[8])
+forward_details_path = Path(sys.argv[9])
+metric = sys.argv[10]
 
 
 def find_header_index(lines: list[str]) -> int:
@@ -185,6 +194,7 @@ reader = csv.DictReader(lines[header_index:])
 recompute_rows: list[dict[str, Any]] = []
 inject_rows: list[dict[str, Any]] = []
 output_rows: list[dict[str, Any]] = []
+forward_rows: list[dict[str, Any]] = []
 
 for source_row in reader:
     range_name = (
@@ -270,6 +280,26 @@ for source_row in reader:
 
         continue
 
+    if range_name.startswith("FORWARD/"):
+        parts = range_name.split("/", 2)
+
+        if len(parts) != 3:
+            print(
+                f"[WARN] invalid FORWARD range: {range_name}",
+                file=sys.stderr,
+            )
+            continue
+
+        _, op_type, node_name = parts
+
+        forward_rows.append({
+            "node_name": node_name,
+            "op_type": op_type,
+            "range_name": range_name,
+            **metrics,
+        })
+
+        continue
 
 # ============================================================
 # Recompute output
@@ -483,10 +513,87 @@ else:
 
     print("[OUTPUT_TO_CPU_EMPTY]")
 
+# ============================================================
+# FORWARD output
+# ============================================================
+
+if forward_rows:
+
+    forward_rows.sort(
+        key=lambda item: str(item["node_name"])
+    )
+
+    with forward_profile_path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=[
+                "node_name",
+                "avg_ms",
+            ],
+        )
+
+        writer.writeheader()
+
+        for item in forward_rows:
+            writer.writerow({
+                "node_name": item["node_name"],
+                "avg_ms": f"{item['selected_ms']:.9f}",
+            })
+
+    forward_detail_fields = [
+        "node_name",
+        "op_type",
+        "range_name",
+        "selected_ms",
+        "avg_ms",
+        "median_ms",
+        "min_ms",
+        "max_ms",
+        "total_ms",
+        "instances",
+    ]
+
+    with forward_details_path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=forward_detail_fields,
+        )
+
+        writer.writeheader()
+        writer.writerows(forward_rows)
+
+    print(
+        f"[FORWARD] nodes={len(forward_rows)} "
+        f"profile={forward_profile_path.name}"
+    )
+
+else:
+    forward_profile_path.unlink(
+        missing_ok=True
+    )
+
+    forward_details_path.unlink(
+        missing_ok=True
+    )
+
+    print("[FORWARD_EMPTY]")
+
 if (
     not recompute_rows
     and not inject_rows
     and not output_rows
+    and not forward_rows
+
 ):
     raise SystemExit(3)
 PY
@@ -500,13 +607,21 @@ PY
         if [[ ! -s "${inject_profile}" ]]; then
             no_inject=$((no_inject + 1))
         fi
+        if [[ ! -s "${output_profile}" ]]; then
+            no_output=$((no_output + 1))
+        fi
+
+        if [[ ! -s "${forward_profile}" ]]; then
+            no_forward=$((no_forward + 1))
+        fi
     else
         status=$?
 
         if [[ "${status}" -eq 3 ]]; then
-            echo "[EMPTY] no RECOMP or INJECT/Patch ranges"
+            echo "[EMPTY] no RECOMP, INJECT/Patch, OUTPUT_TO_CPU, or FORWARD ranges"
             no_recompute=$((no_recompute + 1))
             no_inject=$((no_inject + 1))
+            no_forward=$((no_forward + 1))
         else
             echo "[FAIL] ${input_csv}"
             failed=$((failed + 1))
@@ -537,6 +652,7 @@ echo "successful       : ${success}"
 echo "skipped          : ${skipped}"
 echo "no RECOMP        : ${no_recompute}"
 echo "no INJECT/Patch  : ${no_inject}"
+echo "no FORWARD       : ${no_forward}"
 echo "failed           : ${failed}"
 echo "============================================================"
 

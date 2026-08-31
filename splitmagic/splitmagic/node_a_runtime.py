@@ -408,6 +408,12 @@ def run_node_a(
 
                 with nvtx_range_cpu("A_capture_forward"):
 
+                    if global_step == 0:
+                        runtime_a.profile_forward_layers(
+                            x,
+                            csv_path="./forward_layer_profile_cpu.csv",
+                        )
+
                     # 중요: A는 forward only. backward 호출 없음.
                     payload = runtime_a.capture_jin_forward_plan(
                         x=x,

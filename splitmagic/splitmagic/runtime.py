@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.fx as fx
 import os 
 import time 
+import csv
 
 from .payload import  payload_from_jin_items
 from .resolver import SavedTensorResolver
@@ -280,6 +282,207 @@ def get_missing_keys(required_keys, payload, payload_path=None):
 
     return missing
 
+def _tensor_mb(x):
+    if isinstance(x, torch.Tensor):
+        return (
+            x.numel()
+            * x.element_size()
+            / 1024
+            / 1024
+        )
+
+    if isinstance(x, (tuple, list)):
+        return sum(
+            _tensor_mb(v)
+            for v in x
+        )
+
+    if isinstance(x, dict):
+        return sum(
+            _tensor_mb(v)
+            for v in x.values()
+        )
+
+    return 0.0
+
+
+def _tensor_shape(x):
+    if isinstance(x, torch.Tensor):
+        return str(tuple(x.shape))
+
+    if isinstance(x, (tuple, list)):
+        shapes = []
+
+        for value in x:
+            shape = _tensor_shape(value)
+
+            if shape:
+                shapes.append(shape)
+
+        return "|".join(shapes)
+
+    if isinstance(x, dict):
+        shapes = []
+
+        for value in x.values():
+            shape = _tensor_shape(value)
+
+            if shape:
+                shapes.append(shape)
+
+        return "|".join(shapes)
+
+    return ""
+
+
+def _forward_op_type(
+    gm: fx.GraphModule,
+    node: fx.Node,
+):
+    if node.op == "call_module":
+        module = gm.get_submodule(
+            str(node.target)
+        )
+
+        mapping = {
+            nn.Conv2d: "Conv",
+            nn.BatchNorm2d: "BN",
+            nn.ReLU: "ReLU",
+            nn.MaxPool2d: "MaxPool",
+            nn.AdaptiveAvgPool2d: "AdaptiveAvgPool",
+            nn.Linear: "Linear",
+            nn.Identity: "Identity",
+        }
+
+        for module_type, name in mapping.items():
+            if isinstance(module, module_type):
+                return name
+
+        return type(module).__name__
+
+    if node.op == "call_function":
+        target_name = getattr(
+            node.target,
+            "__name__",
+            str(node.target),
+        )
+
+        if target_name in (
+            "add",
+            "add_",
+        ):
+            return "Add"
+
+        if target_name == "flatten":
+            return "Flatten"
+
+        return target_name
+
+    if node.op == "call_method":
+        if str(node.target) == "flatten":
+            return "Flatten"
+
+        return str(node.target)
+
+    return node.op
+
+class ForwardFXProfiler(fx.Interpreter):
+    def __init__(
+        self,
+        gm,
+        csv_path=None,
+    ):
+        super().__init__(gm)
+
+        self.gm = gm
+        self.csv_path = csv_path
+        self.rows = []
+
+    def run_node(self, node):
+        # placeholder/output은 실제 layer가 아니므로
+        # profiling 대상에서 제외
+        if node.op in (
+            "placeholder",
+            "output",
+            "get_attr",
+        ):
+            return super().run_node(node)
+
+        args, kwargs = self.fetch_args_kwargs_from_env(
+            node
+        )
+
+        op_type = _forward_op_type(
+            self.gm,
+            node,
+        )
+
+        input_shape = _tensor_shape(args)
+        input_mb = _tensor_mb(args)
+
+        range_name = (
+            f"FORWARD/{op_type}/{node.name}"
+        )
+
+        # --------------------------------------------------
+        # NVTX range = actual forward operator execution
+        # --------------------------------------------------
+        with nvtx_range(range_name):
+            result = super().run_node(node)
+
+        output_shape = _tensor_shape(result)
+        output_mb = _tensor_mb(result)
+
+        self.rows.append({
+            "node_name": node.name,
+            "op_type": op_type,
+            "range_name": range_name,
+            "input_shape": input_shape,
+            "input_mb": input_mb,
+            "output_shape": output_shape,
+            "output_mb": output_mb,
+        })
+
+        return result
+
+    def save_csv(self):
+        if not self.csv_path:
+            return
+
+        directory = os.path.dirname(
+            self.csv_path
+        )
+
+        if directory:
+            os.makedirs(
+                directory,
+                exist_ok=True,
+            )
+
+        with open(
+            self.csv_path,
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as file:
+            fieldnames = [
+                "node_name",
+                "op_type",
+                "range_name",
+                "input_shape",
+                "input_mb",
+                "output_shape",
+                "output_mb",
+            ]
+
+            writer = csv.DictWriter(
+                file,
+                fieldnames=fieldnames,
+            )
+
+            writer.writeheader()
+            writer.writerows(self.rows)
+
 class SplitRuntime:
     def __init__(self, model, role: str):
         self.model = model 
@@ -386,6 +589,36 @@ class SplitRuntime:
 
         if self.role not in ("A","B"):
             raise ValueError("Role must be either 'A' or 'B'")
+
+    def profile_forward_layers(
+        self,
+        x,
+        csv_path=None,
+    ):
+        if self.fx_gm is None:
+            raise RuntimeError(
+                "[FORWARD_PROFILE] FX graph is not available"
+            )
+
+        profiler = ForwardFXProfiler(
+            self.fx_gm,
+            csv_path=csv_path,
+        )
+
+        with torch.no_grad():
+            out = profiler.run(x)
+
+        profiler.save_csv()
+
+        print(
+            f"[FORWARD_PROFILE] "
+            f"nodes={len(profiler.rows)} "
+            f"csv={csv_path}",
+            flush=True,
+        )
+
+        return out
+
     def estimate_selected_cost(
         self,
         *,
@@ -851,6 +1084,18 @@ class SplitRuntime:
             payload.meta = getattr(payload, "meta",{})
             payload.meta["aliases"] = aliases
 
+            for k in [
+                "graph:maxpool2d:0:input",
+                "graph:maxpool2d:0:indices",
+            ]:
+                print(
+                    f"[MAXPOOL_CHECK] "
+                    f"key={k} "
+                    f"in_payload={k in payload.tensors} "
+                    f"in_alias={k in aliases}",
+                    flush=True,
+                )
+
             missing_keys = sorted([
                 k for k in required_keys
                 if (not is_always_local_key(k))
@@ -1181,6 +1426,18 @@ class SplitRuntime:
             k for k in missing_keys
             if is_recomputable_key(k)
         ]
+        maxpool_indices_keys = [
+            k for k in recomputable
+            if (
+                k.startswith("graph:maxpool2d:")
+                and k.endswith(":indices")
+            )
+        ]
+
+        regular_recomputable = [
+            k for k in recomputable
+            if k not in maxpool_indices_keys
+        ]
 
         non_recomputable = [
             k for k in missing_keys
@@ -1212,9 +1469,33 @@ class SplitRuntime:
             reverse_order=reverse_order,
         )
 
+        modules = dict(self.model.named_modules())
+
+        maxpool_nodes = []
+
+        if self.fx_gm is not None:
+            for node in self.fx_gm.graph.nodes:
+                if node.op != "call_module":
+                    continue
+
+                module = modules.get(str(node.target))
+
+                if isinstance(module, nn.MaxPool2d):
+                    maxpool_nodes.append(node.name)
+
+        # JIN maxpool numbering follows backward-plan order,
+        # while FX graph nodes are in forward order.
+        maxpool_nodes = list(reversed(maxpool_nodes))
+
+        print(
+            f"[B][MAXPOOL_NODE_MAP] "
+            f"nodes={maxpool_nodes}",
+            flush=True,
+        )
+
         available_tensor_nodes = set(available_tensors.keys())
 
-        gm = getattr(self, "fx_gm",None)
+        gm = getattr(self, "fx_gm", None)
 
         recompute_engine = FXRecomputeEngine(
             self.model,
@@ -1253,7 +1534,8 @@ class SplitRuntime:
 
         with nvtx_range("B_recompute_plan"):
 
-            for key in recomputable:
+            # for key in recomputable:
+            for key in regular_recomputable:
                 if key not in key_to_node:
                     print(f"[B][RECOMPUTE_SKIP] no FX target for key={key}")
                     continue
@@ -1386,6 +1668,85 @@ class SplitRuntime:
                         f"start={start} shape={tuple(out.shape)}",
                         flush=True,
                     )
+                # ResNet-18 ImageNet MaxPool indices 전용 recompute
+        for indices_key in maxpool_indices_keys:
+            # graph:maxpool2d:3:indices
+            #                  ↑
+            pool_idx = int(
+                indices_key.split(":")[2]
+            )
+
+            if pool_idx >= len(maxpool_nodes):
+                print(
+                    f"[B][MAXPOOL_INDICES_SKIP] "
+                    f"key={indices_key} "
+                    f"reason=pool_index_out_of_range "
+                    f"pool_idx={pool_idx} "
+                    f"num_pools={len(maxpool_nodes)}",
+                    flush=True,
+                )
+                continue
+
+            pool_node_name = maxpool_nodes[pool_idx]
+
+            input_key = (
+                f"graph:maxpool2d:{pool_idx}:input"
+            )
+
+            # MaxPool에 들어가는 실제 input.
+            # 앞에서 recompute했다면 gpu_outputs에 있음.
+            pool_input = gpu_outputs.get(input_key)
+
+            if pool_input is None:
+                pool_input = payload.tensors.get(input_key)
+
+                if pool_input is not None:
+                    pool_input = pool_input.to(device)
+
+            if pool_input is None:
+                print(
+                    f"[B][MAXPOOL_INDICES_SKIP] "
+                    f"key={indices_key} "
+                    f"pool_node={pool_node_name} "
+                    f"reason=missing_pool_input",
+                    flush=True,
+                )
+                continue
+
+            cache_key = (
+                f"{pool_node_name}__indices"
+            )
+
+            pool_indices = (
+                recompute_engine.node_values.get(
+                    cache_key
+                )
+            )
+
+            # 아직 MaxPool 자체가 실행되지 않았다면
+            # recompute.py에서 실행한다.
+            if pool_indices is None:
+                _, pool_indices = (
+                    recompute_engine.recompute_maxpool_from_input(
+                        node_name=pool_node_name,
+                        input_tensor=pool_input,
+                        use_nvtx=True,
+                    )
+                )
+
+            gpu_outputs[indices_key] = pool_indices
+
+            print(
+                f"[B][MAXPOOL_INDICES_FROM_RECOMPUTE] "
+                f"key={indices_key} "
+                f"pool_idx={pool_idx} "
+                f"pool_node={pool_node_name} "
+                f"cache_key={cache_key} "
+                f"input_shape={tuple(pool_input.shape)} "
+                f"indices_shape={tuple(pool_indices.shape)} "
+                f"dtype={pool_indices.dtype}",
+                flush=True,
+            )
         # GPU recompute가 끝날 때까지 기다린 후 측정 종료
         if (
             torch.cuda.is_available()
@@ -1524,6 +1885,28 @@ class SplitRuntime:
         key_to_node = build_jin_key_to_fx_node(
             self.model,
             reverse_order=True,
+        )
+        modules = dict(self.model.named_modules())
+
+        maxpool_nodes = []
+
+        for node in self.fx_gm.graph.nodes:
+            if node.op != "call_module":
+                continue
+
+            module = modules.get(str(node.target))
+
+            if isinstance(module, nn.MaxPool2d):
+                maxpool_nodes.append(node.name)
+
+        # JIN graph:maxpool2d:i 번호는 backward plan 순서이므로
+        # forward FX 순서의 반대로 맞춘다.
+        maxpool_nodes = list(reversed(maxpool_nodes))
+
+        print(
+            f"[B][MAXPOOL_NODE_MAP] "
+            f"nodes={maxpool_nodes}",
+            flush=True,
         )
 
         engine = FXRecomputeEngine(
@@ -1719,6 +2102,8 @@ def is_recomputable_key(key):
     if key.startswith("graph:bn:") and key.endswith(":input"):
         return True
     if key.startswith("graph:maxpool2d:") and key.endswith(":input"):
+        return True
+    if key.startswith("graph:maxpool2d:") and key.endswith(":indices"):
         return True
 
     # BN result1/result2는 bn input에서 special recompute

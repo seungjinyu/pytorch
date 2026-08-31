@@ -267,3 +267,19 @@ def _prepare_resnet_cifar10(model):
 def make_resnet50_cifar10():
     model = resnet50(weights=None)
     return _prepare_resnet_cifar10(model)
+
+
+def make_resnet50_imagenet(num_classes=1000):
+    model = resnet50(weights=None)
+
+    if num_classes != 1000:
+        model.fc = nn.Linear(
+            model.fc.in_features,
+            num_classes,
+        )
+
+    for module in model.modules():
+        if isinstance(module, nn.ReLU):
+            module.inplace = False
+
+    return model

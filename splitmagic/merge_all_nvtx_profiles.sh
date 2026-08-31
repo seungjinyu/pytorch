@@ -2,7 +2,8 @@
 set -Eeuo pipefail
 
 # ============================================================
-# Merge per-experiment recompute/inject/output-to-CPU
+# Merge per-experiment
+# recompute/inject/output-to-CPU/forward
 # profiles into one profile per model + device resource
 # condition.
 #
@@ -10,6 +11,7 @@ set -Eeuo pipefail
 #   *_recompute_layer_profile_details.csv
 #   *_inject_key_profile_details.csv
 #   *_output_to_cpu_key_profile_details.csv
+#   *_forward_layer_profile_details.csv
 # Output:
 #   merged_profiles/
 #     resnet18_cuda_mps100_recompute_profile.csv
@@ -18,6 +20,8 @@ set -Eeuo pipefail
 #     resnet18_cuda_mps100_inject_profile_details.csv
 #     resnet18_cuda_mps100_output_to_cpu_profile.csv
 #     resnet18_cuda_mps100_output_to_cpu_profile_details.csv
+#     resnet18_cuda_mps100_forward_profile.csv
+#     resnet18_cuda_mps100_forward_profile_details.csv
 #
 # Usage:
 #   ./merge_all_nvtx_profiles.sh [ROOT] [OUTPUT_DIR]
@@ -101,26 +105,71 @@ THREAD_RE = re.compile(r"threads?(?P<value>\d+)")
 def infer_model(path: Path) -> str:
     text = str(path).lower()
 
-    if "resnet18" in text or "resnet" in text:
+    # More specific names MUST come first.
+    if "resnet18_imagenet" in text:
+        return "resnet18_imagenet"
+
+    if "resnet18" in text:
         return "resnet18"
 
-    if "vgg11" in text or "vgg" in text:
+    if "resnet50_imagenet" in text:
+        return "resnet50_imagenet"
+
+    if "resnet50" in text:
+        return "resnet50"
+
+    if "vgg11bn_imagenet" in text:
+        return "vgg11bn_imagenet"
+
+    if "vgg11bn" in text or "vgg11" in text or "vgg" in text:
         return "vgg11bn"
 
-    if "mobilenet" in text:
+    if "lenet" in text:
+        return "lenet"
+
+    if "mobilenetv2" in text or "mobilenet" in text:
         return "mobilenetv2"
 
     return "unknown"
+    
 
 def infer_resource(
     path: Path,
 ) -> tuple[str, str, int | None]:
 
-    # path:
+    # 지원하는 두 구조:
+    #
+    # 1)
     # experiment_dir/nsys_csv/profile.csv
-    experiment_name = (
-        path.parent.parent.name.lower()
-    )
+    #
+    # 2)
+    # experiment_dir/profile.csv
+    #
+    # 따라서 parent와 parent.parent를 모두 검사한다.
+
+    candidates = [
+        path.parent,
+        path.parent.parent,
+    ]
+
+    experiment_name = None
+
+    for candidate in candidates:
+        name = candidate.name.lower()
+
+        if (
+            "_cpu_" in name
+            or THREAD_RE.search(name) is not None
+            or MPS_RE.search(name) is not None
+        ):
+            experiment_name = name
+            break
+
+    if experiment_name is None:
+        raise RuntimeError(
+            f"Cannot infer experiment directory from path: "
+            f"{path}"
+        )
 
     thread_match = THREAD_RE.search(
         experiment_name
@@ -150,15 +199,15 @@ def infer_resource(
 
     return "cuda", "mps", value
 
+def condition_key(
+    path: Path,
+) -> tuple[str, str, str, int]:
 
-def condition_key(path: Path) -> tuple[str, str, str, int]:
     model = infer_model(path)
-    device, resource_name, resource_value = infer_resource(path)
 
-    if model == "unknown":
-        raise RuntimeError(
-            f"Cannot infer model from path: {path}"
-        )
+    device, resource_name, resource_value = (
+        infer_resource(path)
+    )
 
     if resource_value is None:
         raise RuntimeError(
@@ -171,7 +220,6 @@ def condition_key(path: Path) -> tuple[str, str, str, int]:
         resource_name,
         resource_value,
     )
-
 
 def read_csv(path: Path) -> list[dict[str, str]]:
     with path.open(
@@ -206,6 +254,11 @@ inject_files: dict[
 ] = defaultdict(list)
 
 output_files: dict[
+    tuple[str, str, str, int],
+    list[Path],
+] = defaultdict(list)
+
+forward_files: dict[
     tuple[str, str, str, int],
     list[Path],
 ] = defaultdict(list)
@@ -261,11 +314,22 @@ for path in sorted(
         condition_key(path)
     ].append(path)
 
+for path in sorted(
+    root.rglob(
+        "*_forward_layer_profile_details.csv"
+    )
+):
+    if not ratio_matches(path):
+        continue
 
+    forward_files[
+        condition_key(path)
+    ].append(path)
 conditions = sorted(
     set(recompute_files)
     | set(inject_files)
     | set(output_files)
+    | set(forward_files)
 )
 
 print(
@@ -275,7 +339,9 @@ print(
     f"inject_files="
     f"{sum(map(len, inject_files.values()))} "
     f"output_files="
-    f"{sum(map(len, output_files.values()))}"
+    f"{sum(map(len, output_files.values()))} "
+    f"forward_files="
+    f"{sum(map(len, forward_files.values()))}"
 )
 
 
@@ -463,6 +529,8 @@ for condition in conditions:
             f"nodes={len(rows)} "
             f"output={simple_path.name}"
         )
+        for path in recomp_inputs:
+            print(f"    {path}")
 
     else:
         print("[RECOMPUTE] no inputs")
@@ -626,6 +694,8 @@ for condition in conditions:
             f"keys={len(rows)} "
             f"output={simple_path.name}"
         )
+        for path in inject_inputs:
+            print(f"    {path}")
 
     else:
         print("[INJECT] no inputs")
@@ -757,7 +827,7 @@ for condition in conditions:
                 f"{condition_name}"
                 f"_output_to_cpu_profile_details.csv"
             )
-        )
+        ) 
 
         if force or not simple_path.exists():
             with simple_path.open(
@@ -813,9 +883,202 @@ for condition in conditions:
             f"keys={len(rows)} "
             f"output={simple_path.name}"
         )
+        for path in output_inputs:
+            print(f"    {path}")
 
     else:
         print("[OUTPUT_TO_CPU] no inputs")
+
+    # ========================================================
+    # Forward profile merge
+    # ========================================================
+
+    forward_inputs = forward_files.get(
+        condition,
+        [],
+    )
+
+    if forward_inputs:
+        by_node: dict[
+            tuple[str, str, str],
+            dict[str, Any],
+        ] = {}
+
+        for path in forward_inputs:
+            for row in read_csv(path):
+                node_name = row["node_name"]
+                op_type = row["op_type"]
+                range_name = row["range_name"]
+
+                key = (
+                    node_name,
+                    op_type,
+                    range_name,
+                )
+
+                item = by_node.setdefault(
+                    key,
+                    {
+                        "node_name": node_name,
+                        "op_type": op_type,
+                        "range_name": range_name,
+                        "total_ms": 0.0,
+                        "instances": 0,
+                        "min_ms": float("inf"),
+                        "max_ms": float("-inf"),
+                        "source_profiles": 0,
+                        "medians": [],
+                    },
+                )
+
+                item["total_ms"] += to_float(
+                    row,
+                    "total_ms",
+                )
+
+                item["instances"] += to_int(
+                    row,
+                    "instances",
+                )
+
+                item["min_ms"] = min(
+                    item["min_ms"],
+                    to_float(row, "min_ms"),
+                )
+
+                item["max_ms"] = max(
+                    item["max_ms"],
+                    to_float(row, "max_ms"),
+                )
+
+                item["source_profiles"] += 1
+
+                item["medians"].append(
+                    to_float(
+                        row,
+                        "median_ms",
+                    )
+                )
+
+        rows = []
+
+        for item in by_node.values():
+            instances = item["instances"]
+
+            weighted_avg_ms = (
+                item["total_ms"] / instances
+                if instances > 0
+                else 0.0
+            )
+
+            medians = sorted(
+                item["medians"]
+            )
+
+            count = len(medians)
+
+            if count == 0:
+                median_of_medians = 0.0
+            elif count % 2 == 1:
+                median_of_medians = (
+                    medians[count // 2]
+                )
+            else:
+                median_of_medians = (
+                    medians[count // 2 - 1]
+                    + medians[count // 2]
+                ) / 2.0
+
+            rows.append({
+                "node_name": item["node_name"],
+                "op_type": item["op_type"],
+                "range_name": item["range_name"],
+                "avg_ms": weighted_avg_ms,
+                "median_ms": median_of_medians,
+                "min_ms": item["min_ms"],
+                "max_ms": item["max_ms"],
+                "total_ms": item["total_ms"],
+                "instances": instances,
+                "source_profiles": item[
+                    "source_profiles"
+                ],
+            })
+
+        rows.sort(
+            key=lambda row: row["node_name"]
+        )
+
+        simple_path = (
+            output_dir
+            / f"{condition_name}_forward_profile.csv"
+        )
+
+        details_path = (
+            output_dir
+            / f"{condition_name}_forward_profile_details.csv"
+        )
+
+        if force or not simple_path.exists():
+            with simple_path.open(
+                "w",
+                newline="",
+                encoding="utf-8",
+            ) as file:
+                writer = csv.DictWriter(
+                    file,
+                    fieldnames=[
+                        "node_name",
+                        "avg_ms",
+                    ],
+                )
+
+                writer.writeheader()
+
+                for row in rows:
+                    writer.writerow({
+                        "node_name": row["node_name"],
+                        "avg_ms": (
+                            f"{row['median_ms']:.9f}"
+                        ),
+                    })
+
+        if force or not details_path.exists():
+            with details_path.open(
+                "w",
+                newline="",
+                encoding="utf-8",
+            ) as file:
+                writer = csv.DictWriter(
+                    file,
+                    fieldnames=[
+                        "node_name",
+                        "op_type",
+                        "range_name",
+                        "avg_ms",
+                        "median_ms",
+                        "min_ms",
+                        "max_ms",
+                        "total_ms",
+                        "instances",
+                        "source_profiles",
+                    ],
+                )
+
+                writer.writeheader()
+                writer.writerows(rows)
+
+        print(
+            f"[FORWARD] "
+            f"inputs={len(forward_inputs)} "
+            f"nodes={len(rows)} "
+            f"output={simple_path.name}"
+        )
+
+        for path in forward_inputs:
+            print(f"    {path}")
+
+    else:
+        print("[FORWARD] no inputs")
 PY
 
 echo

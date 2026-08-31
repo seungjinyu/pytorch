@@ -14,3 +14,8 @@ profiles/*
 *.nsys-rep
 nsys_results/*
 *.log
+menu/*
+nsys_results_remote/*
+nsys_backup/*
+menu_backup/*
+exp_csv/*

@@ -743,6 +743,13 @@ static bool jin_next_exec_item_locked(
         item.shape.c_str()
     );
     fflush(stderr);
+    TORCH_CHECK(
+        item.op == expected_op &&
+        item.suffix == expected_suffix,
+        "[PLAN ERROR] cursor=", st.exec_cursor,
+        " expected=", expected_op, ":", expected_suffix,
+        " got=", item.op, ":", item.suffix
+    );
   
     if (item.op != expected_op || item.suffix != expected_suffix) {
       fprintf(

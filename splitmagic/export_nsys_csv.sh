@@ -78,11 +78,11 @@ while IFS= read -r -d '' rep; do
 
     mkdir -p "$out_dir"
 
-    echo
-    echo "============================================================"
-    echo "[FILE] $rep"
-    echo "[OUT ] $out_dir"
-    echo "============================================================"
+    # echo
+    # echo "============================================================"
+    # echo "[FILE] $rep"
+    # echo "[OUT ] $out_dir"
+    # echo "============================================================"
 
     file_failed=0
 
@@ -97,8 +97,8 @@ while IFS= read -r -d '' rep; do
         out_csv="$out_dir/${base}_${report}.csv"
 
         if [[ -s "$out_csv" && "$FORCE" != "1" ]]; then
-            echo "[SKIP] exists: $out_csv"
-            echo "[SKIP] report=$report output=$out_csv" >> "$log_file"
+            # echo "[SKIP] exists: $out_csv"
+            # echo "[SKIP] report=$report output=$out_csv" >> "$log_file"
             ((skipped += 1))
             continue
         fi

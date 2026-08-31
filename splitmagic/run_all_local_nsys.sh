@@ -25,7 +25,8 @@ NETWORKS=(
 )
 
 MAX_RATIOS=(
-    0.0
+    # 0.0
+    # 0.0
     # 0.1
     # 0.2
     # 0.3
@@ -40,20 +41,30 @@ MAX_RATIOS=(
     # 0.97
     # 0.98
     # 0.99
+    1.0
 )
 
 MPS_PERCENTAGES=(
     # 100
+    # 90
+    # 80
+    # 70
+    # 60
     # 50
-    # 25
-    10
+    # 40
+    # 30
+    # 20
+    # 10
+    25
 )
 
 REPEATS="${REPEATS:-1}"
-MAX_STEPS="${MAX_STEPS:-1}"
+MAX_STEPS="${MAX_STEPS:-50}"
 LATENCY_MS="${LATENCY_MS:-0}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
 # resnet18 , vgg, resnet18_imagenet
-MODEL="${MODEL:-resnet18_imagenet}"
+# MODEL="${MODEL:-resnet18}"
+MODEL="${MODEL:-resnet18}"
 
 # 실험 사이 GPU/프로세스 정리 대기
 SLEEP_BETWEEN_RUNS="${SLEEP_BETWEEN_RUNS:-3}"
@@ -110,6 +121,7 @@ for network in "${NETWORKS[@]}"; do
                     SELECTION_POLICY="ratio" \
                     MPS_PERCENT="$mps" \
                     RUN_ID="$run_id" \
+                    JIN_BATCH_SIZE="${BATCH_SIZE}" \
                     MAX_STEPS="$MAX_STEPS" \
                     MODEL="$MODEL" \
                     "$RUN_SCRIPT"

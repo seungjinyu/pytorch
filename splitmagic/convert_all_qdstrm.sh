@@ -10,7 +10,7 @@ find "$ROOT" -type f -name "*.qdstrm" | while read -r qdstrm; do
 
     # 이미 변환되어 있으면 skip
     if [[ -f "$rep" ]]; then
-        echo "[SKIP] $(basename "$rep") already exists"
+        # echo "[SKIP] $(basename "$rep") already exists"
         continue
     fi
 

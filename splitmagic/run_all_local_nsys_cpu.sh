@@ -18,35 +18,43 @@ RUN_SCRIPT="${RUN_SCRIPT:-${PROJECT_DIR}/run_local_nsys_cpu.sh}"
 
 NETWORKS=(
     1000
-    500
-    200
-    100
-    50
+    # 500
+    # 200
+    # 100
+    # 50
 )
 
 DROP_RATIOS=(
-    0.1
-    0.2
-    0.3
-    0.4
-    0.5
-    0.6
-    0.7
-    0.8
-    0.9
-    0.99
+    # 0.0
+    # 0.1
+    # 0.2
+    # 0.3
+    # 0.4
+    # 0.5
+    # 0.6
+    # 0.7
+    # 0.8
+    # 0.9
+    # 0.95
+    # 0.96
+    # 0.97
+    # 0.98
+    # 0.99
+    1.0
 )
 
 CPU_THREAD_COUNTS=(
-    2
-    4
-    8
+    1
+    # 2
+    # 4
+    # 6
 )
 
-REPEATS="${REPEATS:-5}"
-MAX_STEPS="${MAX_STEPS:-5}"
+REPEATS="${REPEATS:-1}"
+MAX_STEPS="${MAX_STEPS:-10}"
 LATENCY_MS="${LATENCY_MS:-0}"
-MODEL="${MODEL:-vgg}"
+MODEL="${MODEL:-resnet18_imagenet}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
 
 SLEEP_BETWEEN_RUNS="${SLEEP_BETWEEN_RUNS:-3}"
 
@@ -83,6 +91,7 @@ log "Repeats         : ${REPEATS}"
 log "Max steps       : ${MAX_STEPS}"
 log "Latency         : ${LATENCY_MS} ms"
 log "Model           : ${MODEL}"
+log "Batch size      : ${BATCH_SIZE}"
 log "Total runs      : ${TOTAL_RUNS}"
 
 for network in "${NETWORKS[@]}"; do
@@ -108,6 +117,7 @@ for network in "${NETWORKS[@]}"; do
                     RUN_ID="${run_id}" \
                     MAX_STEPS="${MAX_STEPS}" \
                     MODEL="${MODEL}" \
+                    BATCH_SIZE="${BATCH_SIZE}" \
                     "${RUN_SCRIPT}"
 
                 log "Finished run ${CURRENT_RUN}/${TOTAL_RUNS}"

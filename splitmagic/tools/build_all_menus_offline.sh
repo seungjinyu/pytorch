@@ -6,9 +6,11 @@ PROJECT_ROOT="$(
     pwd
 )"
 
-MERGED_ROOT="${1:-${PROJECT_ROOT}/merged_profiles}"
-OUTPUT_ROOT="${2:-${PROJECT_ROOT}/menus_offline}"
-NSYS_ROOT="${3:-${PROJECT_ROOT}/nsys_results}"
+MODEL="${MODEL:-resnet18_imagenet}"
+
+MERGED_ROOT="${1:-${PROJECT_ROOT}/merged_profiles_remote}"
+OUTPUT_ROOT="${2:-${PROJECT_ROOT}/menus_offline_remote}"
+NSYS_ROOT="${3:-${PROJECT_ROOT}/nsys_results_remote}"
 
 PYTHON_BIN="${PYTHON_BIN:-/home/syu23/miniconda3/envs/torch-build/bin/python3}"
 FORCE="${FORCE:-0}"
@@ -31,14 +33,31 @@ fi
 PLAN="$(
     find "${NSYS_ROOT}" \
         -type f \
-        -path '*resnet18*' \
-        -name 'jin_template_plan_a.tsv' \
+        -name 'jin_template_plan.tsv' \
+    | while read -r p; do
+        run_dir="$(basename "$(dirname "$p")")"
+
+        if [[ "${run_dir}" == *_${MODEL}_* ]] &&
+           [[ "${run_dir}" == *_bs${BATCH_SIZE}_* ]]; then
+            case "${MODEL}" in
+                resnet18)
+                    [[ "${run_dir}" == *_resnet18_imagenet_* ]] && continue
+                    ;;
+                resnet50)
+                    [[ "${run_dir}" == *_resnet50_imagenet_* ]] && continue
+                    ;;
+            esac
+
+            echo "$p"
+        fi
+    done \
     | sort \
-    | tail -1
+    | tail -1 \
+    || true
 )"
 
 if [[ -z "${PLAN}" ]]; then
-    echo "[ERROR] ResNet18 template plan not found" >&2
+    echo "[ERROR] ${MODEL} template plan not found" >&2
     exit 1
 fi
 
@@ -56,11 +75,32 @@ while IFS= read -r -d '' recompute_profile; do
     filename="$(basename "${recompute_profile}")"
     condition="${filename%_recompute_profile.csv}"
 
+    device=""
+    resource_name=""
+    resource_value=""
+
+    if [[ "${condition}" =~ _cuda_mps([0-9]+)$ ]]; then
+        device="cuda"
+        resource_name="mps"
+        resource_value="${BASH_REMATCH[1]}"
+
+    elif [[ "${condition}" =~ _cpu_threads([0-9]+)$ ]]; then
+        device="cpu"
+        resource_name="threads"
+        resource_value="${BASH_REMATCH[1]}"
+
+    else
+        echo "[FAIL] cannot parse condition: ${condition}"
+        failed=$((failed + 1))
+        continue
+    fi
+
     inject_profile="${recompute_profile%_recompute_profile.csv}_inject_profile.csv"
     output_profile="${recompute_profile%_recompute_profile.csv}_output_to_cpu_profile.csv"
+    forward_profile="${recompute_profile%_recompute_profile.csv}_forward_profile.csv"
 
     output_dir="${OUTPUT_ROOT}/${condition}"
-    final_menu="${output_dir}/final_menu.csv"
+    final_menu="${output_dir}/${MODEL}_${resource_name}${resource_value}_final_menu.csv"
 
     echo
     echo "============================================================"
@@ -68,6 +108,9 @@ while IFS= read -r -d '' recompute_profile; do
     echo "[RECOMPUTE] ${recompute_profile}"
     echo "[INJECT] ${inject_profile}"
     echo "[OUTPUT_TO_CPU] ${output_profile}"
+    echo "[FORWARD] ${forward_profile}"
+    echo "[DEVICE] ${device}"
+    echo "[RESOURCE] ${resource_name}=${resource_value}"
     echo "============================================================"
 
     if [[ ! -f "${inject_profile}" ]]; then
@@ -87,20 +130,28 @@ while IFS= read -r -d '' recompute_profile; do
         skipped=$((skipped + 1))
         continue
     fi
+    if [[ ! -f "${forward_profile}" ]]; then
+        echo "[FAIL] forward profile not found: ${forward_profile}"
+        failed=$((failed + 1))
+        continue
+    fi
 
     if "${PYTHON_BIN}" "${BUILDER}" \
-        --model resnet18 \
+        --model "${MODEL}" \
         --plan "${PLAN}" \
         --recompute-profile "${recompute_profile}" \
         --inject-profile "${inject_profile}" \
+        --forward-profile "${forward_profile}" \
         --output-profile "${output_profile}" \
         --output-dir "${output_dir}" \
-        --batch-size "${BATCH_SIZE}"\
+        --batch-size "${BATCH_SIZE}" \
         --network-mbps "${NETWORK_MBPS:-1000}" \
-        --mps-percent "${condition##*mps}" \
+        --device "${device}" \
+        --resource-name "${resource_name}" \
+        --resource-value "${resource_value}" \
         --profile-steps "${PROFILE_STEPS:-1000}" \
         --metric "${METRIC:-median}" \
-        --drop-ratio "-0.99"; then
+        --drop-ratio "1.0"; then
 
         success=$((success + 1))
     else
@@ -111,7 +162,11 @@ done < <(
     find "${MERGED_ROOT}" \
         -maxdepth 1 \
         -type f \
-        -name 'resnet18_*_recompute_profile.csv' \
+        \( \
+            -name "${MODEL}_cuda_*_recompute_profile.csv" \
+            -o \
+            -name "${MODEL}_cpu_*_recompute_profile.csv" \
+        \) \
         -print0 |
     sort -z
 )
