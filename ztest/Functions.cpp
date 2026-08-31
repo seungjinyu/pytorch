@@ -979,21 +979,92 @@ variable_list BmmBackward0::apply(variable_list&& grads) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   IndexRangeGenerator gen;
+
   auto self_ix = gen.range(1);
   auto mat2_ix = gen.range(1);
+
   variable_list grad_inputs(gen.size());
+
   const auto& grad = grads[0];
+
   auto mat2 = mat2_.unpack();
   auto self = self_.unpack();
-  bool any_grad_defined = any_variable_defined(grads);
+
+
+  // ============================================================
+  // JIN: BMM saved tensors
+  // ============================================================
+
+  static int64_t jin_dryrun_bmm_i = 0;
+
+  if (jin_is_dryrun()) {
+
+    const int64_t idx =
+        jin_dryrun_bmm_i++;
+
+    jin_record_exec(
+        "bmm",
+        idx,
+        "self",
+        self);
+
+    jin_record_exec(
+        "bmm",
+        idx,
+        "mat2",
+        mat2);
+
+  } else {
+
+    jin_overwrite_bmm_self(self);
+    jin_overwrite_bmm_mat2(mat2);
+
+  }
+
+  // ============================================================
+
+
+  bool any_grad_defined =
+      any_variable_defined(grads);
+
+
   if (task_should_compute_output({ mat2_ix })) {
-    auto grad_result = any_grad_defined ? (self.transpose(1, 2).conj().bmm(grad)) : Tensor();
-    copy_range(grad_inputs, mat2_ix, grad_result);
+
+    auto grad_result =
+        any_grad_defined
+        ? (
+            self.transpose(1, 2)
+                .conj()
+                .bmm(grad)
+          )
+        : Tensor();
+
+    copy_range(
+        grad_inputs,
+        mat2_ix,
+        grad_result);
   }
+
+
   if (task_should_compute_output({ self_ix })) {
-    auto grad_result = any_grad_defined ? (grad.bmm(mat2.transpose(1, 2).conj())) : Tensor();
-    copy_range(grad_inputs, self_ix, grad_result);
+
+    auto grad_result =
+        any_grad_defined
+        ? (
+            grad.bmm(
+                mat2.transpose(1, 2)
+                    .conj()
+            )
+          )
+        : Tensor();
+
+    copy_range(
+        grad_inputs,
+        self_ix,
+        grad_result);
   }
+
+
   return grad_inputs;
 }
 void BmmBackward0::compiled_args(CompiledNodeArgs& args) {
@@ -6031,21 +6102,103 @@ variable_list MmBackward0::apply(variable_list&& grads) {
   IndexRangeGenerator gen;
   auto self_ix = gen.range(1);
   auto mat2_ix = gen.range(1);
+
   variable_list grad_inputs(gen.size());
+
   const auto& grad = grads[0];
+
   auto mat2 = mat2_.unpack();
   auto self = self_.unpack();
-  bool any_grad_defined = any_variable_defined(grads);
+
+
+  // ============================================================
+  // JIN: MM saved tensors
+  // ============================================================
+
+  static int64_t jin_dryrun_mm_i = 0;
+
+  if (jin_is_dryrun()) {
+
+    const int64_t idx =
+        jin_dryrun_mm_i++;
+
+    jin_record_exec(
+        "mm",
+        idx,
+        "self",
+        self);
+
+    jin_record_exec(
+        "mm",
+        idx,
+        "mat2",
+        mat2);
+
+  } else {
+
+    // self is the activation from Node A.
+    // This is the important tensor for weight-gradient equality.
+    jin_overwrite_mm_self(self);
+
+    // mat2 is normally the model weight.
+    // If it is absent from payload, helper keeps local weight.
+    jin_overwrite_mm_mat2(mat2);
+  }
+
+  // ============================================================
+
+
+  bool any_grad_defined =
+      any_variable_defined(grads);
+
+
   if (task_should_compute_output({ mat2_ix })) {
-    auto grad_result = any_grad_defined ? (mm_mat2_backward(grad, self, mat2_sym_sizes, mat2_sym_strides, mat2_layout, 1)) : Tensor();
-    copy_range(grad_inputs, mat2_ix, grad_result);
+
+    auto grad_result =
+        any_grad_defined
+        ? (
+            mm_mat2_backward(
+                grad,
+                self,
+                mat2_sym_sizes,
+                mat2_sym_strides,
+                mat2_layout,
+                1)
+          )
+        : Tensor();
+
+    copy_range(
+        grad_inputs,
+        mat2_ix,
+        grad_result);
   }
+
+
   if (task_should_compute_output({ self_ix })) {
-    auto grad_result = any_grad_defined ? (mm_mat1_backward(grad, mat2, self_sym_sizes, self_sym_strides, self_layout, 1)) : Tensor();
-    copy_range(grad_inputs, self_ix, grad_result);
+
+    auto grad_result =
+        any_grad_defined
+        ? (
+            mm_mat1_backward(
+                grad,
+                mat2,
+                self_sym_sizes,
+                self_sym_strides,
+                self_layout,
+                1)
+          )
+        : Tensor();
+
+    copy_range(
+        grad_inputs,
+        self_ix,
+        grad_result);
   }
+
+
   return grad_inputs;
 }
+
 void MmBackward0::compiled_args(CompiledNodeArgs& args) {
     args.collect(mat2_);
     args.collect(mat2_layout);
@@ -6119,6 +6272,46 @@ variable_list MulBackward0::apply(variable_list&& grads) {
   const auto& grad = grads[0];
   auto other = other_.unpack();
   auto self = self_.unpack();
+    // ============================================================
+  // JIN: Mul saved tensors
+  // ============================================================
+
+  static int64_t jin_dryrun_mul_i = 0;
+
+  if (jin_is_dryrun()) {
+
+    const int64_t idx =
+        jin_dryrun_mul_i++;
+
+    if (self.defined() && self.numel() > 1) {
+      jin_record_exec(
+          "mul",
+          idx,
+          "self",
+          self);
+    }
+
+    if (other.defined() && other.numel() > 1) {
+      jin_record_exec(
+          "mul",
+          idx,
+          "other",
+          other);
+    }
+
+  } else {
+
+    if (self.defined() && self.numel() > 1) {
+      jin_overwrite_mul_self(self);
+    }
+
+    if (other.defined() && other.numel() > 1) {
+      jin_overwrite_mul_other(other);
+    }
+
+  }
+
+  // ============================================================
   bool any_grad_defined = any_variable_defined(grads);
   if (task_should_compute_output({ other_ix })) {
     auto grad_result = any_grad_defined ? (mul_tensor_backward(grad, self, other_scalar_type)) : Tensor();
@@ -6615,36 +6808,108 @@ variable_list NativeBatchNormBackwardBackward0::apply_with_saved(const variable_
     return result;
 }
 variable_list NativeLayerNormBackward0::apply(variable_list&& grads) {
+
   std::lock_guard<std::mutex> lock(mutex_);
 
   IndexRangeGenerator gen;
+
   auto input_ix = gen.range(1);
   auto weight_ix = gen.range(1);
   auto bias_ix = gen.range(1);
+
   variable_list grad_inputs(gen.size());
+
   const auto& grad = grads[0];
+
   auto bias = bias_.unpack();
   auto input = input_.unpack();
   auto weight = weight_.unpack();
+
   auto result1 = result1_.unpack(shared_from_this());
   auto result2 = result2_.unpack(shared_from_this());
+
+
+  // ============================================================
+  // JIN: LayerNorm saved tensors
+  // ============================================================
+
+  static int64_t jin_dryrun_layernorm_i = 0;
+
+  if (jin_is_dryrun()) {
+
+    const int64_t idx = jin_dryrun_layernorm_i++;
+
+    jin_record_exec(
+        "layernorm",
+        idx,
+        "input",
+        input);
+
+    jin_record_exec(
+        "layernorm",
+        idx,
+        "result1",
+        result1);
+
+    jin_record_exec(
+        "layernorm",
+        idx,
+        "result2",
+        result2);
+
+  } else {
+
+    jin_overwrite_layernorm_input(input);
+    jin_overwrite_layernorm_result1(result1);
+    jin_overwrite_layernorm_result2(result2);
+  }
+
+  // ============================================================
+
+
   if (task_should_compute_output({ input_ix, weight_ix, bias_ix })) {
-      auto grad_input_mask = std::array<bool, 3>{
+
+    auto grad_input_mask = std::array<bool, 3>{
         task_should_compute_output({ input_ix }),
         task_should_compute_output({ weight_ix }),
         task_should_compute_output({ bias_ix }),
-      };
-    auto grad_result = grad.defined() ? native_layer_norm_backward_symint(grad, input, normalized_shape, result1, result2, weight, bias, grad_input_mask) : std::tuple<Tensor, Tensor, Tensor>();
-      if (task_should_compute_output({ input_ix })) {
-        copy_range(grad_inputs, input_ix, std::get<0>(grad_result));
-      }
-      if (task_should_compute_output({ weight_ix })) {
-        copy_range(grad_inputs, weight_ix, std::get<1>(grad_result));
-      }
-      if (task_should_compute_output({ bias_ix })) {
-        copy_range(grad_inputs, bias_ix, std::get<2>(grad_result));
-      }
+    };
+
+    auto grad_result =
+        grad.defined()
+        ? native_layer_norm_backward_symint(
+              grad,
+              input,
+              normalized_shape,
+              result1,
+              result2,
+              weight,
+              bias,
+              grad_input_mask)
+        : std::tuple<Tensor, Tensor, Tensor>();
+
+    if (task_should_compute_output({ input_ix })) {
+      copy_range(
+          grad_inputs,
+          input_ix,
+          std::get<0>(grad_result));
+    }
+
+    if (task_should_compute_output({ weight_ix })) {
+      copy_range(
+          grad_inputs,
+          weight_ix,
+          std::get<1>(grad_result));
+    }
+
+    if (task_should_compute_output({ bias_ix })) {
+      copy_range(
+          grad_inputs,
+          bias_ix,
+          std::get<2>(grad_result));
+    }
   }
+
   return grad_inputs;
 }
 void NativeLayerNormBackward0::compiled_args(CompiledNodeArgs& args) {
@@ -9762,6 +10027,24 @@ variable_list TanhBackward0::apply(variable_list&& grads) {
   variable_list grad_inputs(gen.size());
   const auto& grad = grads[0];
   auto result = result_.unpack(shared_from_this());
+  static int64_t jin_dryrun_tanh_i = 0;
+
+  if (jin_is_dryrun()) {
+
+    const int64_t idx =
+        jin_dryrun_tanh_i++;
+
+    jin_record_exec(
+        "tanh",
+        idx,
+        "result",
+        result);
+
+  } else {
+
+    jin_overwrite_tanh_result(result);
+
+  }
   bool any_grad_defined = any_variable_defined(grads);
   if (task_should_compute_output({ self_ix })) {
     auto grad_result = any_grad_defined ? (tanh_backward(grad, result)) : Tensor();
@@ -11239,6 +11522,31 @@ variable_list EmbeddingBackward0::apply(variable_list&& grads) {
   variable_list grad_inputs(gen.size());
   const auto& grad = grads[0];
   auto indices = indices_.unpack();
+  // ============================================================
+  // JIN: Embedding saved indices
+  // ============================================================
+
+  static int64_t jin_dryrun_embedding_i = 0;
+
+  if (jin_is_dryrun()) {
+
+    const int64_t idx =
+        jin_dryrun_embedding_i++;
+
+    jin_record_exec(
+        "embedding",
+        idx,
+        "indices",
+        indices);
+
+  } else {
+
+    jin_overwrite_embedding_indices(
+        indices);
+
+  }
+
+  // ============================================================
   bool any_grad_defined = any_variable_defined(grads);
   if (task_should_compute_output({ weight_ix })) {
     auto grad_result = any_grad_defined ? (embedding_backward_symint(grad, indices, weight_sym_argsize_0, padding_idx, scale_grad_by_freq, sparse)) : Tensor();

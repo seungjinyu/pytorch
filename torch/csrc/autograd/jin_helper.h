@@ -34,6 +34,34 @@ void jin_overwrite_addmm_mat1(at::Tensor& t);
 void jin_overwrite_addmm_mat2(at::Tensor& t);
 void jin_advance_addmm();
 
+// mm
+void jin_overwrite_mm_self(at::Tensor& t);
+void jin_overwrite_mm_mat2(at::Tensor& t);
+
+// bmm
+void jin_overwrite_bmm_self(at::Tensor& t);
+void jin_overwrite_bmm_mat2(at::Tensor& t);
+
+// softmax
+void jin_overwrite_softmax_result(at::Tensor& t);
+
+// layernorm
+void jin_overwrite_layernorm_input(at::Tensor& t);
+void jin_overwrite_layernorm_result1(at::Tensor& t);
+void jin_overwrite_layernorm_result2(at::Tensor& t);
+
+// tanh
+void jin_overwrite_tanh_result(at::Tensor& t);
+
+// pow
+void jin_overwrite_pow_self(at::Tensor& t);
+
+// mul
+void jin_overwrite_mul_self(at::Tensor& t);
+void jin_overwrite_mul_other(at::Tensor& t);
+// embedding
+void jin_overwrite_embedding_indices(at::Tensor& t);
+
 // maxpool2d
 void jin_overwrite_maxpool2d_input(at::Tensor& t);
 void jin_overwrite_maxpool2d_indices(at::Tensor& t);

@@ -520,6 +520,11 @@ static bool is_local_parameter_key(const std::string& key) {
       key.compare(key.size() - 5, 5, ":mat2") == 0) {
     return true;
   }
+  if (key.rfind("graph:mm:", 0) == 0 &&
+      key.size() >= 5 &&
+      key.compare(key.size() - 5, 5, ":mat2") == 0) {
+    return true;
+  }
 
   return false;
 }
@@ -966,6 +971,854 @@ void jin_advance_addmm() {
   return;
 }
 
+
+// ============================================================
+// MM
+// ============================================================
+
+void jin_overwrite_mm_self(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+
+  auto& st = S();
+  ensure_loaded_locked(st);
+
+  if (st.role != "B") {
+    return;
+  }
+
+  JINExecItem item;
+
+  if (!jin_next_exec_item_locked(
+          st,
+          "mm",
+          "self",
+          &item)) {
+    return;
+  }
+
+  const int64_t idx = item.idx;
+
+  const std::string key =
+      make_key("graph:mm", idx, "self");
+
+  if (!t.defined()) {
+    if (jin_log_level() >= 4) {
+      fprintf(
+          stderr,
+          "[JIN][MM] SKIP key=%s target undefined\n",
+          key.c_str());
+      fflush(stderr);
+    }
+
+    return;
+  }
+
+  bool ok =
+      overwrite_tensor_locked(
+          st,
+          t,
+          key);
+
+  if (jin_log_level() >= 4) {
+
+    fprintf(
+        stderr,
+        "[JIN][MM_SELF] idx=%lld key=%s shape=%s\n",
+        (long long)idx,
+        key.c_str(),
+        sizes_str(t).c_str());
+
+    if (!ok) {
+      fprintf(
+          stderr,
+          "[JIN][MM] SKIP key=%s "
+          "(payload missing, keep local self)\n",
+          key.c_str());
+    }
+
+    fflush(stderr);
+  }
+}
+
+
+void jin_overwrite_mm_mat2(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+
+  auto& st = S();
+  ensure_loaded_locked(st);
+
+  if (st.role != "B") {
+    return;
+  }
+
+  JINExecItem item;
+
+  if (!jin_next_exec_item_locked(
+          st,
+          "mm",
+          "mat2",
+          &item)) {
+    return;
+  }
+
+  const int64_t idx = item.idx;
+
+  const std::string key =
+      make_key("graph:mm", idx, "mat2");
+
+  if (!t.defined()) {
+    if (jin_log_level() >= 4) {
+      fprintf(
+          stderr,
+          "[JIN][MM] SKIP key=%s target undefined\n",
+          key.c_str());
+      fflush(stderr);
+    }
+
+    return;
+  }
+
+  bool ok =
+      overwrite_tensor_locked(
+          st,
+          t,
+          key);
+
+  if (jin_log_level() >= 4) {
+
+    fprintf(
+        stderr,
+        "[JIN][MM_MAT2] idx=%lld key=%s shape=%s\n",
+        (long long)idx,
+        key.c_str(),
+        sizes_str(t).c_str());
+
+    if (!ok) {
+      fprintf(
+          stderr,
+          "[JIN][MM] SKIP key=%s "
+          "(payload missing, keep local mat2)\n",
+          key.c_str());
+    }
+
+    fflush(stderr);
+  }
+}
+
+// ============================================================
+// BMM
+// ============================================================
+
+void jin_overwrite_bmm_self(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+
+  auto& st = S();
+  ensure_loaded_locked(st);
+
+  if (st.role != "B") {
+    return;
+  }
+
+  JINExecItem item;
+
+  if (!jin_next_exec_item_locked(
+          st,
+          "bmm",
+          "self",
+          &item)) {
+    return;
+  }
+
+  const int64_t idx = item.idx;
+
+  const std::string key =
+      make_key("graph:bmm", idx, "self");
+
+  if (!t.defined()) {
+    if (jin_log_level() >= 4) {
+      fprintf(
+          stderr,
+          "[JIN][BMM] SKIP key=%s target undefined\n",
+          key.c_str());
+      fflush(stderr);
+    }
+
+    return;
+  }
+
+  bool ok =
+      overwrite_tensor_locked(
+          st,
+          t,
+          key);
+
+  if (jin_log_level() >= 4) {
+    fprintf(
+        stderr,
+        "[JIN][BMM_SELF] idx=%lld key=%s shape=%s\n",
+        (long long)idx,
+        key.c_str(),
+        sizes_str(t).c_str());
+
+    if (!ok) {
+      fprintf(
+          stderr,
+          "[JIN][BMM] SKIP key=%s "
+          "(payload missing, keep local self)\n",
+          key.c_str());
+    }
+
+    fflush(stderr);
+  }
+}
+
+
+void jin_overwrite_bmm_mat2(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+
+  auto& st = S();
+  ensure_loaded_locked(st);
+
+  if (st.role != "B") {
+    return;
+  }
+
+  JINExecItem item;
+
+  if (!jin_next_exec_item_locked(
+          st,
+          "bmm",
+          "mat2",
+          &item)) {
+    return;
+  }
+
+  const int64_t idx = item.idx;
+
+  const std::string key =
+      make_key("graph:bmm", idx, "mat2");
+
+  if (!t.defined()) {
+    if (jin_log_level() >= 4) {
+      fprintf(
+          stderr,
+          "[JIN][BMM] SKIP key=%s target undefined\n",
+          key.c_str());
+      fflush(stderr);
+    }
+
+    return;
+  }
+
+  bool ok =
+      overwrite_tensor_locked(
+          st,
+          t,
+          key);
+
+  if (jin_log_level() >= 4) {
+    fprintf(
+        stderr,
+        "[JIN][BMM_MAT2] idx=%lld key=%s shape=%s\n",
+        (long long)idx,
+        key.c_str(),
+        sizes_str(t).c_str());
+
+    if (!ok) {
+      fprintf(
+          stderr,
+          "[JIN][BMM] SKIP key=%s "
+          "(payload missing, keep local mat2)\n",
+          key.c_str());
+    }
+
+    fflush(stderr);
+  }
+}
+// ============================================================
+// SOFTMAX
+// ============================================================
+
+void jin_overwrite_softmax_result(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+
+  auto& st = S();
+  ensure_loaded_locked(st);
+
+  if (st.role != "B") {
+    return;
+  }
+
+  JINExecItem item;
+
+  if (!jin_next_exec_item_locked(
+          st,
+          "softmax",
+          "result",
+          &item)) {
+    return;
+  }
+
+  const int64_t idx = item.idx;
+
+  const std::string key =
+      make_key("graph:softmax", idx, "result");
+
+  if (!t.defined()) {
+    if (jin_log_level() >= 4) {
+      fprintf(
+          stderr,
+          "[JIN][SOFTMAX] SKIP key=%s target undefined\n",
+          key.c_str());
+      fflush(stderr);
+    }
+    return;
+  }
+
+  bool ok =
+      overwrite_tensor_locked(
+          st,
+          t,
+          key);
+
+  if (jin_log_level() >= 4) {
+    fprintf(
+        stderr,
+        "[JIN][SOFTMAX_RESULT] idx=%lld key=%s shape=%s\n",
+        (long long)idx,
+        key.c_str(),
+        sizes_str(t).c_str());
+
+    if (!ok) {
+      fprintf(
+          stderr,
+          "[JIN][SOFTMAX] SKIP key=%s "
+          "(payload missing, keep local result)\n",
+          key.c_str());
+    }
+
+    fflush(stderr);
+  }
+}
+// softmax end 
+// ============================================================
+// LAYERNORM
+// ============================================================
+
+void jin_overwrite_layernorm_input(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+
+  auto& st = S();
+  ensure_loaded_locked(st);
+
+  if (st.role != "B") {
+    return;
+  }
+
+  JINExecItem item;
+
+  if (!jin_next_exec_item_locked(
+          st,
+          "layernorm",
+          "input",
+          &item)) {
+    return;
+  }
+
+  const int64_t idx = item.idx;
+
+  const std::string key =
+      make_key("graph:layernorm", idx, "input");
+
+  if (!t.defined()) {
+    if (jin_log_level() >= 4) {
+      fprintf(
+          stderr,
+          "[JIN][LAYERNORM] SKIP key=%s target undefined\n",
+          key.c_str());
+      fflush(stderr);
+    }
+    return;
+  }
+
+  bool ok =
+      overwrite_tensor_locked(
+          st,
+          t,
+          key);
+
+  if (jin_log_level() >= 4) {
+    fprintf(
+        stderr,
+        "[JIN][LAYERNORM_INPUT] idx=%lld key=%s shape=%s\n",
+        (long long)idx,
+        key.c_str(),
+        sizes_str(t).c_str());
+
+    if (!ok) {
+      fprintf(
+          stderr,
+          "[JIN][LAYERNORM] SKIP key=%s "
+          "(payload missing, keep local input)\n",
+          key.c_str());
+    }
+
+    fflush(stderr);
+  }
+}
+
+
+void jin_overwrite_layernorm_result1(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+
+  auto& st = S();
+  ensure_loaded_locked(st);
+
+  if (st.role != "B") {
+    return;
+  }
+
+  JINExecItem item;
+
+  if (!jin_next_exec_item_locked(
+          st,
+          "layernorm",
+          "result1",
+          &item)) {
+    return;
+  }
+
+  const int64_t idx = item.idx;
+
+  const std::string key =
+      make_key(
+          "graph:layernorm",
+          idx,
+          "result1");
+
+  if (!t.defined()) {
+    if (jin_log_level() >= 4) {
+      fprintf(
+          stderr,
+          "[JIN][LAYERNORM] SKIP key=%s target undefined\n",
+          key.c_str());
+      fflush(stderr);
+    }
+    return;
+  }
+
+  bool ok =
+      overwrite_tensor_locked(
+          st,
+          t,
+          key);
+
+  if (jin_log_level() >= 4) {
+    fprintf(
+        stderr,
+        "[JIN][LAYERNORM_RESULT1] "
+        "idx=%lld key=%s shape=%s\n",
+        (long long)idx,
+        key.c_str(),
+        sizes_str(t).c_str());
+
+    if (!ok) {
+      fprintf(
+          stderr,
+          "[JIN][LAYERNORM] SKIP key=%s "
+          "(payload missing, keep local result1)\n",
+          key.c_str());
+    }
+
+    fflush(stderr);
+  }
+}
+
+
+void jin_overwrite_layernorm_result2(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+
+  auto& st = S();
+  ensure_loaded_locked(st);
+
+  if (st.role != "B") {
+    return;
+  }
+
+  JINExecItem item;
+
+  if (!jin_next_exec_item_locked(
+          st,
+          "layernorm",
+          "result2",
+          &item)) {
+    return;
+  }
+
+  const int64_t idx = item.idx;
+
+  const std::string key =
+      make_key(
+          "graph:layernorm",
+          idx,
+          "result2");
+
+  if (!t.defined()) {
+    if (jin_log_level() >= 4) {
+      fprintf(
+          stderr,
+          "[JIN][LAYERNORM] SKIP key=%s target undefined\n",
+          key.c_str());
+      fflush(stderr);
+    }
+    return;
+  }
+
+  bool ok =
+      overwrite_tensor_locked(
+          st,
+          t,
+          key);
+
+  if (jin_log_level() >= 4) {
+    fprintf(
+        stderr,
+        "[JIN][LAYERNORM_RESULT2] "
+        "idx=%lld key=%s shape=%s\n",
+        (long long)idx,
+        key.c_str(),
+        sizes_str(t).c_str());
+
+    if (!ok) {
+      fprintf(
+          stderr,
+          "[JIN][LAYERNORM] SKIP key=%s "
+          "(payload missing, keep local result2)\n",
+          key.c_str());
+    }
+
+    fflush(stderr);
+  }
+}
+
+// ============================================================
+// TANH
+// ============================================================
+
+void jin_overwrite_tanh_result(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+
+  auto& st = S();
+  ensure_loaded_locked(st);
+
+  if (st.role != "B") {
+    return;
+  }
+
+  JINExecItem item;
+
+  if (!jin_next_exec_item_locked(
+          st,
+          "tanh",
+          "result",
+          &item)) {
+    return;
+  }
+
+  const int64_t idx = item.idx;
+
+  const std::string key =
+      make_key("graph:tanh", idx, "result");
+
+  if (!t.defined()) {
+    if (jin_log_level() >= 4) {
+      fprintf(
+          stderr,
+          "[JIN][TANH] SKIP key=%s target undefined\n",
+          key.c_str());
+      fflush(stderr);
+    }
+
+    return;
+  }
+
+  bool ok =
+      overwrite_tensor_locked(
+          st,
+          t,
+          key);
+
+  if (jin_log_level() >= 4) {
+
+    fprintf(
+        stderr,
+        "[JIN][TANH_RESULT] "
+        "idx=%lld key=%s shape=%s\n",
+        (long long)idx,
+        key.c_str(),
+        sizes_str(t).c_str());
+
+    if (!ok) {
+      fprintf(
+          stderr,
+          "[JIN][TANH] SKIP key=%s "
+          "(payload missing, keep local result)\n",
+          key.c_str());
+    }
+
+    fflush(stderr);
+  }
+}
+// ============================================================
+// POW
+// ============================================================
+
+void jin_overwrite_pow_self(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+
+  auto& st = S();
+  ensure_loaded_locked(st);
+
+  if (st.role != "B") {
+    return;
+  }
+
+  JINExecItem item;
+
+  if (!jin_next_exec_item_locked(
+          st,
+          "pow",
+          "self",
+          &item)) {
+    return;
+  }
+
+  const int64_t idx = item.idx;
+
+  const std::string key =
+      make_key("graph:pow", idx, "self");
+
+  if (!t.defined()) {
+    if (jin_log_level() >= 4) {
+      fprintf(
+          stderr,
+          "[JIN][POW] SKIP key=%s target undefined\n",
+          key.c_str());
+      fflush(stderr);
+    }
+    return;
+  }
+
+  bool ok =
+      overwrite_tensor_locked(
+          st,
+          t,
+          key);
+
+  if (jin_log_level() >= 4) {
+    fprintf(
+        stderr,
+        "[JIN][POW_SELF] idx=%lld key=%s shape=%s\n",
+        (long long)idx,
+        key.c_str(),
+        sizes_str(t).c_str());
+
+    if (!ok) {
+      fprintf(
+          stderr,
+          "[JIN][POW] SKIP key=%s "
+          "(payload missing, keep local self)\n",
+          key.c_str());
+    }
+
+    fflush(stderr);
+  }
+}
+
+// ============================================================
+// MUL
+// ============================================================
+
+void jin_overwrite_mul_self(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+
+  auto& st = S();
+  ensure_loaded_locked(st);
+
+  if (st.role != "B") {
+    return;
+  }
+
+  JINExecItem item;
+
+  if (!jin_next_exec_item_locked(
+          st,
+          "mul",
+          "self",
+          &item)) {
+    return;
+  }
+
+  const int64_t idx = item.idx;
+
+  const std::string key =
+      make_key("graph:mul", idx, "self");
+
+  if (!t.defined()) {
+    return;
+  }
+
+  bool ok =
+      overwrite_tensor_locked(
+          st,
+          t,
+          key);
+
+  if (jin_log_level() >= 4) {
+    fprintf(
+        stderr,
+        "[JIN][MUL_SELF] idx=%lld key=%s shape=%s\n",
+        (long long)idx,
+        key.c_str(),
+        sizes_str(t).c_str());
+
+    if (!ok) {
+      fprintf(
+          stderr,
+          "[JIN][MUL] SKIP key=%s "
+          "(payload missing, keep local self)\n",
+          key.c_str());
+    }
+
+    fflush(stderr);
+  }
+}
+
+
+void jin_overwrite_mul_other(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+
+  auto& st = S();
+  ensure_loaded_locked(st);
+
+  if (st.role != "B") {
+    return;
+  }
+
+  JINExecItem item;
+
+  if (!jin_next_exec_item_locked(
+          st,
+          "mul",
+          "other",
+          &item)) {
+    return;
+  }
+
+  const int64_t idx = item.idx;
+
+  const std::string key =
+      make_key("graph:mul", idx, "other");
+
+  if (!t.defined()) {
+    return;
+  }
+
+  bool ok =
+      overwrite_tensor_locked(
+          st,
+          t,
+          key);
+
+  if (jin_log_level() >= 4) {
+    fprintf(
+        stderr,
+        "[JIN][MUL_OTHER] idx=%lld key=%s shape=%s\n",
+        (long long)idx,
+        key.c_str(),
+        sizes_str(t).c_str());
+
+    if (!ok) {
+      fprintf(
+          stderr,
+          "[JIN][MUL] SKIP key=%s "
+          "(payload missing, keep local other)\n",
+          key.c_str());
+    }
+
+    fflush(stderr);
+  }
+}
+// ============================================================
+// EMBEDDING
+// ============================================================
+
+void jin_overwrite_embedding_indices(at::Tensor& t) {
+  std::lock_guard<std::mutex> lk(g_mu);
+
+  auto& st = S();
+  ensure_loaded_locked(st);
+
+  if (st.role != "B") {
+    return;
+  }
+
+  JINExecItem item;
+
+  if (!jin_next_exec_item_locked(
+          st,
+          "embedding",
+          "indices",
+          &item)) {
+    return;
+  }
+
+  const int64_t idx = item.idx;
+
+  const std::string key =
+      make_key(
+          "graph:embedding",
+          idx,
+          "indices");
+
+  if (!t.defined()) {
+    if (jin_log_level() >= 4) {
+      fprintf(
+          stderr,
+          "[JIN][EMBEDDING] SKIP key=%s target undefined\n",
+          key.c_str());
+      fflush(stderr);
+    }
+    return;
+  }
+
+  bool ok =
+      overwrite_tensor_locked(
+          st,
+          t,
+          key);
+
+  if (jin_log_level() >= 4) {
+
+    fprintf(
+        stderr,
+        "[JIN][EMBEDDING_INDICES] "
+        "idx=%lld key=%s shape=%s\n",
+        (long long)idx,
+        key.c_str(),
+        sizes_str(t).c_str());
+
+    if (!ok) {
+      fprintf(
+          stderr,
+          "[JIN][EMBEDDING] SKIP key=%s "
+          "(payload missing, keep local indices)\n",
+          key.c_str());
+    }
+
+    fflush(stderr);
+  }
+}
 void jin_overwrite_maxpool2d_input(at::Tensor& t) {
   std::lock_guard<std::mutex> lk(g_mu);
   auto& st = S();
