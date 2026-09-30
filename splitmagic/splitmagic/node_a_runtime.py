@@ -11,9 +11,10 @@ from splitmagic.cost_policy import (
     load_recompute_cost_table, 
 )
 from splitmagic.utils.timing import CSVLogger
-import nvtx
 from contextlib import nullcontext, contextmanager
 import torch
+
+from splitmagic.runtime import is_causal_lm_model
 
 @contextmanager
 def nvtx_range_cpu(name: str):
@@ -251,6 +252,15 @@ def run_node_a(
     # move model to cpu
     model = model.to(device)
 
+    causal_lm = is_causal_lm_model(model)
+
+    print(
+        f"[Node A][MODEL] "
+        f"causal_lm={causal_lm} "
+        f"model_type={getattr(getattr(model, 'config', None), 'model_type', None)}",
+        flush=True,
+    )
+
     # if policy is not "full", print a warning
     if policy != "full":
         print(f"[Node A][WARN] policy argument is currently unused: {policy}")
@@ -323,7 +333,15 @@ def run_node_a(
     )
     # initialize global_step and model train mode settings
     global_step = 0
+
     model.train()
+
+    if causal_lm:
+        print(
+            "[Node A][CAUSAL_LM_MODE] "
+            "train mode with synchronized dropout RNG",
+            flush=True,
+        )
 
     if selection_policy not in {"ratio","cost","none"}:
         raise ValueError(
@@ -408,10 +426,30 @@ def run_node_a(
 
                 with nvtx_range_cpu("A_capture_forward"):
 
-                    if global_step == 0:
+                    # TinyStories는 아직 FX profiling/recompute 경로를
+                    # 연결하지 않았으므로 Phase 1에서는 skip.
+                    if (
+                        global_step == 0
+                        and not causal_lm
+                    ):
+                        
                         runtime_a.profile_forward_layers(
                             x,
                             csv_path="./forward_layer_profile_cpu.csv",
+                        )
+                    dropout_seed = None
+                    if causal_lm:
+                        dropout_seed = 1234 + global_step
+
+                        torch.manual_seed(
+                            dropout_seed
+                        )
+
+                        print(
+                            f"[Node A][DROPOUT_SEED] "
+                            f"step={global_step} "
+                            f"seed={dropout_seed}",
+                            flush=True,
                         )
 
                     # 중요: A는 forward only. backward 호출 없음.
@@ -419,6 +457,7 @@ def run_node_a(
                         x=x,
                         plan=plan,
                     )
+
                 with nvtx_range_cpu("A_payload_profile_print"):
 
                     payload.print_add_tensor_profile(
@@ -430,20 +469,51 @@ def run_node_a(
 
                 t0 = time.perf_counter()
                 with nvtx_range_cpu("A_alias_duplicate"):
-                    if enable_alias:
-                        payload = alias_duplicate_tensors(payload)
+                    if (
+                        enable_alias
+                        and not is_causal_lm_model(model)
+                    ):
+                        payload = alias_duplicate_tensors(
+                            payload
+                        )
 
                 t1 = time.perf_counter()
                 alias_ms = (t1 - t0) * 1000
                 
                 t0 = time.perf_counter()
 
-                with nvtx_range_cpu(f"A_selection_{selection_policy}"):
+                with nvtx_range_cpu(
+                    f"A_selection_{selection_policy}"
+                ):
 
-                    if recompute_policy_name is not None:
+                    # --------------------------------------------------------
+                    # TinyStories Phase 1:
+                    # FULL payload only.
+                    # No drop / no recompute selection.
+                    # --------------------------------------------------------
+                    if causal_lm:
+
+                        payload.meta["selection_policy"] = "none"
+                        payload.meta["auto_dropped_keys"] = []
+                        payload.meta["drop_ratio"] = 0.0
+                        payload.meta["dropped_count"] = 0
+                        payload.meta["saved_mb"] = 0.0
+
+                        print(
+                            "[Node A][SELECTION_STAGE] "
+                            "causal_lm=True -> FULL PAYLOAD",
+                            flush=True,
+                        )
+
+                    # --------------------------------------------------------
+                    # Existing CNN path
+                    # --------------------------------------------------------
+                    elif recompute_policy_name is not None:
+
                         policy_conf = RECOMPUTE_POLICIES[
                             recompute_policy_name
                         ]
+
                         candidate_keys = policy_conf["drop"]
 
                         print(
@@ -453,16 +523,23 @@ def run_node_a(
                         )
 
                         if selection_policy == "ratio":
+
                             payload = auto_drop_by_ratio(
                                 payload,
                                 candidate_keys=candidate_keys,
                                 drop_ratio=auto_drop_ratio,
                             )
 
-                            payload.meta["selection_policy"] = "ratio"
+                            payload.meta[
+                                "selection_policy"
+                            ] = "ratio"
 
                         elif selection_policy == "cost":
-                            print("[Node A][ENTER_COST]", flush=True)
+
+                            print(
+                                "[Node A][ENTER_COST]",
+                                flush=True,
+                            )
 
                             cost0 = time.perf_counter()
 
@@ -484,13 +561,17 @@ def run_node_a(
                             )
 
                         elif selection_policy == "none":
+
                             payload.meta["selection_policy"] = "none"
                             payload.meta["auto_dropped_keys"] = []
                             payload.meta["drop_ratio"] = 0.0
                             payload.meta["dropped_count"] = 0
                             payload.meta["saved_mb"] = 0.0
 
-                        print("[Node A][SELECTION_END]", flush=True)
+                        print(
+                            "[Node A][SELECTION_END]",
+                            flush=True,
+                        )
 
                 t1 = time.perf_counter()
                 auto_drop_ms = (t1 - t0) * 1000
@@ -499,42 +580,96 @@ def run_node_a(
 
                 extra = {
                     "tensor_policy": policy_meta,
+
                     "dryrun_backward_plan": payload.meta.get(
-                        "dryrun_backward_plan", []
+                        "dryrun_backward_plan",
+                        [],
                     ),
-                    "aliases": payload.meta.get("aliases", {}),
+
+                    "aliases": payload.meta.get(
+                        "aliases",
+                        {},
+                    ),
 
                     # Cost-policy metadata
                     "selection_meta": {
                         "selection_policy": payload.meta.get(
-                            "selection_policy", "none"
+                            "selection_policy",
+                            "none",
                         ),
+
                         "drop_ratio": payload.meta.get(
-                            "drop_ratio", 0.0
+                            "drop_ratio",
+                            0.0,
                         ),
+
                         "saved_mb": payload.meta.get(
-                            "saved_mb", 0.0
+                            "saved_mb",
+                            0.0,
                         ),
+
                         "dropped_count": payload.meta.get(
-                            "dropped_count", 0
+                            "dropped_count",
+                            0,
                         ),
+
                         "predicted_operator_ms": payload.meta.get(
-                            "predicted_operator_ms", 0.0
+                            "predicted_operator_ms",
+                            0.0,
                         ),
+
                         "predicted_recompute_ms": payload.meta.get(
-                            "predicted_recompute_ms", 0.0
+                            "predicted_recompute_ms",
+                            0.0,
                         ),
+
                         "predicted_inject_ms": payload.meta.get(
-                            "predicted_inject_ms", 0.0
+                            "predicted_inject_ms",
+                            0.0,
                         ),
+
                         "predicted_send_saved_ms": payload.meta.get(
-                            "predicted_send_saved_ms", 0.0
+                            "predicted_send_saved_ms",
+                            0.0,
                         ),
+
                         "predicted_benefit_ms": payload.meta.get(
-                            "predicted_benefit_ms", 0.0
+                            "predicted_benefit_ms",
+                            0.0,
                         ),
                     },
                 }
+
+
+                # ------------------------------------------------------------
+                # Model-specific request metadata
+                # ------------------------------------------------------------
+
+                if causal_lm:
+
+                    extra["model_family"] = (
+                        "causal_lm"
+                    )
+
+                    extra["sequence_length"] = int(
+                        x.size(1)
+                    )
+
+                    # A forward에서 실제 사용한 dropout RNG seed
+                    extra["dropout_seed"] = int(
+                        dropout_seed
+                    )
+
+                else:
+
+                    extra["model_family"] = (
+                        "vision"
+                    )
+
+                    extra["input_shape"] = tuple(
+                        int(v)
+                        for v in x.shape[1:]
+                    )
 
                 if global_step == 0:
                     extra["state_dict"] = clone_state_dict(model)

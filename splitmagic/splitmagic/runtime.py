@@ -20,6 +20,8 @@ from .fx_trace import (
 )
 from .recompute import FXRecomputeEngine
 
+from torch.utils._python_dispatch import TorchDispatchMode
+
 ALWAYS_LOCAL_KEYS = set()
 
 @contextmanager
@@ -187,7 +189,8 @@ def is_always_local_key(key):
         return True
     if key.startswith("graph:addmm:") and key.endswith(":mat2"):
         return True
-
+    if key.startswith("graph:mm:") and key.endswith(":mat2"):
+        return True
     return False
 
 # read the dryrun plan and be ready to send it in the payload 
@@ -235,6 +238,8 @@ def keys_from_dryrun_plan(plan):
         if op == "conv" and suffix == "weight":
             continue
         if op == "addmm" and suffix == "mat2":
+            continue
+        if op == "mm" and suffix == "mat2":
             continue
 
         keys.add(f"graph:{op}:{idx}:{suffix}")
@@ -483,6 +488,356 @@ class ForwardFXProfiler(fx.Interpreter):
             writer.writeheader()
             writer.writerows(self.rows)
 
+def is_causal_lm_model(model):
+    config = getattr(model, "config", None)
+
+    if config is None:
+        return False
+
+    return getattr(
+        config,
+        "model_type",
+        None,
+    ) in {
+        "gpt_neo",
+        "gpt2",
+        "gptj",
+        "gpt_neox",
+    }
+
+
+def run_model_forward(model, x):
+
+    if is_causal_lm_model(model):
+
+        outputs = model(
+            input_ids=x,
+            use_cache=False,
+        )
+
+        return outputs.logits
+
+    return model(x)
+class CausalLMSavedTensorCaptureMode(TorchDispatchMode):
+    """
+    Capture the exact forward tensors that the custom JIN
+    Backward0 implementations will need later.
+
+    Important:
+    - runs during Node A forward only
+    - no backward on Node A
+    - keys come from Node B dry-run execution plan
+    """
+
+    def __init__(self, queues, tensors):
+        super().__init__()
+
+        self.queues = queues
+        self.tensors = tensors
+
+
+    def _pop_key(self, op, suffix):
+        q = self.queues.get(
+            (op, suffix),
+            None,
+        )
+
+        if not q:
+            raise RuntimeError(
+                "[A][CAUSAL_LM_PLAN_KEY_EMPTY] "
+                f"op={op} suffix={suffix}"
+            )
+
+        return q.pop(0)
+
+
+    def _save(self, op, suffix, tensor):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"[A][CAUSAL_LM_CAPTURE] "
+                f"{op}:{suffix} is not Tensor: "
+                f"{type(tensor)}"
+            )
+
+        key = self._pop_key(
+            op,
+            suffix,
+        )
+
+        self.tensors[key] = (
+            tensor
+            .detach()
+            .cpu()
+            .contiguous()
+        )
+
+
+    def __torch_dispatch__(
+        self,
+        func,
+        types,
+        args=(),
+        kwargs=None,
+    ):
+        if kwargs is None:
+            kwargs = {}
+
+        # Run the REAL forward operator.
+        out = func(
+            *args,
+            **kwargs,
+        )
+
+        schema_name = func._schema.name
+
+        # ====================================================
+        # MM
+        #
+        # MmBackward0:
+        #   self  -> payload
+        #   mat2  -> local model weight
+        # ====================================================
+
+        if schema_name == "aten::mm":
+
+            self_tensor = args[0]
+
+            if (
+                isinstance(self_tensor, torch.Tensor)
+                and self_tensor.numel() > 0
+            ):
+                self._save(
+                    "mm",
+                    "self",
+                    self_tensor,
+                )
+
+        # ====================================================
+        # ADDMM
+        #
+        # addmm(self, mat1, mat2)
+        #
+        # AddmmBackward0:
+        #   mat1 -> payload
+        #   mat2 -> local model weight
+        # ====================================================
+
+        elif schema_name == "aten::addmm":
+
+            mat1 = args[1]
+
+            self._save(
+                "addmm",
+                "mat1",
+                mat1,
+            )
+
+        # ====================================================
+        # BMM
+        #
+        # Both operands are activation-dependent.
+        # ====================================================
+
+        elif schema_name == "aten::bmm":
+
+            self_tensor = args[0]
+            mat2 = args[1]
+
+            self._save(
+                "bmm",
+                "self",
+                self_tensor,
+            )
+
+            self._save(
+                "bmm",
+                "mat2",
+                mat2,
+            )
+
+        # ====================================================
+        # SOFTMAX
+        #
+        # SoftmaxBackward0 saves forward result.
+        # ====================================================
+
+        elif schema_name in {
+            "aten::_softmax",
+            "aten::_safe_softmax",
+        }:
+
+            if isinstance(out, torch.Tensor):
+                self._save(
+                    "softmax",
+                    "result",
+                    out,
+                )
+
+        # ====================================================
+        # NATIVE LAYER NORM
+        #
+        # aten::native_layer_norm returns:
+        #
+        #   output, mean, rstd
+        #
+        # NativeLayerNormBackward0 needs:
+        #   input
+        #   result1 = mean
+        #   result2 = rstd
+        # ====================================================
+
+        elif schema_name == "aten::native_layer_norm":
+
+            input_tensor = args[0]
+
+            if (
+                not isinstance(out, tuple)
+                or len(out) < 3
+            ):
+                raise RuntimeError(
+                    "[A][LAYERNORM_CAPTURE] "
+                    f"unexpected output type={type(out)}"
+                )
+
+            _, mean, rstd = out
+
+            self._save(
+                "layernorm",
+                "input",
+                input_tensor,
+            )
+
+            self._save(
+                "layernorm",
+                "result1",
+                mean,
+            )
+
+            self._save(
+                "layernorm",
+                "result2",
+                rstd,
+            )
+
+        # ====================================================
+        # TANH
+        #
+        # TanhBackward0 saves result.
+        # ====================================================
+
+        elif schema_name == "aten::tanh":
+
+            if isinstance(out, torch.Tensor):
+                self._save(
+                    "tanh",
+                    "result",
+                    out,
+                )
+
+        # ====================================================
+        # POW
+        #
+        # GELU uses x ** 3.
+        #
+        # PowBackward0 saves self.
+        # ====================================================
+
+        elif schema_name == "aten::pow":
+
+            self_tensor = args[0]
+
+            if (
+                isinstance(self_tensor, torch.Tensor)
+                and self_tensor.numel() > 1
+            ):
+                self._save(
+                    "pow",
+                    "self",
+                    self_tensor,
+                )
+
+        # ====================================================
+        # MUL
+        #
+        # Match our Functions.cpp rule:
+        # only tensor activations with numel > 1.
+        #
+        # Scalar constants are deliberately excluded.
+        # ====================================================
+
+        elif schema_name == "aten::mul":
+
+            if len(args) < 2:
+                return out
+
+            self_tensor = args[0]
+            other = args[1]
+
+            # ========================================================
+            # IMPORTANT:
+            #
+            # GELU contains several multiplications:
+            #
+            #   scalar * tensor
+            #   scalar * tensor
+            #   ...
+            #   tensor * tensor
+            #
+            # Functions.cpp dryrun plan records the activation pair
+            # that MulBackward0 actually needs for our JIN overwrite.
+            #
+            # Therefore consume the JIN queue ONLY when BOTH
+            # operands are real non-scalar tensors.
+            # ========================================================
+
+            both_activation_tensors = (
+                isinstance(self_tensor, torch.Tensor)
+                and isinstance(other, torch.Tensor)
+                and self_tensor.numel() > 1
+                and other.numel() > 1
+            )
+
+            if both_activation_tensors:
+
+                if (
+                    ("mul", "self") in self.queues
+                    and self.queues[("mul", "self")]
+                ):
+                    self._save(
+                        "mul",
+                        "self",
+                        self_tensor,
+                    )
+
+                if (
+                    ("mul", "other") in self.queues
+                    and self.queues[("mul", "other")]
+                ):
+                    self._save(
+                        "mul",
+                        "other",
+                        other,
+                    )
+
+        # ====================================================
+        # EMBEDDING
+        #
+        # embedding(weight, indices, ...)
+        #
+        # EmbeddingBackward0 saves indices.
+        # ====================================================
+
+        elif schema_name == "aten::embedding":
+
+            indices = args[1]
+
+            self._save(
+                "embedding",
+                "indices",
+                indices,
+            )
+
+        return out
 class SplitRuntime:
     def __init__(self, model, role: str):
         self.model = model 
@@ -833,6 +1188,177 @@ class SplitRuntime:
             ),
             "paths": paths,
         }
+    def capture_causal_lm_forward_plan(
+        self,
+        x,
+        plan,
+    ):
+        if self.role != "A":
+            raise RuntimeError(
+                "Only role 'A' can capture tensors"
+            )
+
+        tensors = {}
+
+        # ========================================================
+        # Build queues from Node B backward dry-run plan.
+        #
+        # dryrun plan:
+        #   backward execution order
+        #
+        # Node A capture:
+        #   forward execution order
+        #
+        # Therefore reverse each op/suffix queue.
+        # ========================================================
+
+        queues = {}
+
+        for e in plan:
+            op = e["op"]
+            idx = e["idx"]
+            suffix = e["suffix"]
+
+            # B already owns these parameters.
+            if (
+                op == "conv"
+                and suffix == "weight"
+            ):
+                continue
+
+            if (
+                op == "addmm"
+                and suffix == "mat2"
+            ):
+                continue
+
+            if (
+                op == "mm"
+                and suffix == "mat2"
+            ):
+                continue
+
+            key = (
+                f"graph:{op}:"
+                f"{idx}:{suffix}"
+            )
+
+            queues.setdefault(
+                (op, suffix),
+                [],
+            ).append(key)
+
+        # backward order -> forward order
+        for queue_key in queues:
+            queues[queue_key] = list(
+                reversed(
+                    queues[queue_key]
+                )
+            )
+
+        # ========================================================
+        # REAL Node A forward
+        # ========================================================
+
+        with CausalLMSavedTensorCaptureMode(
+            queues=queues,
+            tensors=tensors,
+        ):
+            out = run_model_forward(
+                self.model,
+                x,
+            )
+
+        # Model output is needed by B for straight-through output.
+        tensors["model.output"] = (
+            out.detach()
+            .cpu()
+            .contiguous()
+        )
+
+        # ========================================================
+        # Verify every required plan key was captured.
+        # ========================================================
+
+        leftovers = {
+            f"{op}:{suffix}": len(queue)
+            for (op, suffix), queue
+            in queues.items()
+            if len(queue) > 0
+        }
+
+        if leftovers:
+            raise RuntimeError(
+                "[A][CAUSAL_LM_PLAN_KEYS_LEFTOVER] "
+                f"{leftovers}"
+            )
+
+        # ========================================================
+        # Build existing SplitMagic Payload.
+        # ========================================================
+
+        items = []
+
+        for key, tensor in tensors.items():
+
+            items.append({
+                "key": key,
+                "jin_key": key,
+                "graph_key": key,
+                "tensor": tensor,
+                "node": key,
+                "attr": key,
+                "shape": tuple(tensor.shape),
+                "dtype": tensor.dtype,
+                "requires_grad": False,
+            })
+
+        payload = payload_from_jin_items(
+            items
+        )
+
+        payload.meta = getattr(
+            payload,
+            "meta",
+            {},
+        )
+
+        payload.meta[
+            "dryrun_backward_plan"
+        ] = plan
+
+        payload.meta[
+            "model_family"
+        ] = "causal_lm"
+
+        payload.meta[
+            "sequence_length"
+        ] = int(x.size(1))
+
+        payload.meta[
+            "tensor_policy"
+        ] = {
+            "policy":
+                "causal_lm_forward_dispatch",
+
+            "included_keys":
+                sorted(tensors.keys()),
+
+            "num_payload_tensors":
+                len(tensors),
+
+            "all_keys":
+                sorted(tensors.keys()),
+        }
+
+        print(
+            "[A][CAUSAL_LM_CAPTURE] "
+            f"seq={x.size(1)} "
+            f"keys={len(tensors)}",
+            flush=True,
+        )
+
+        return payload
     def capture_jin_forward_plan(self, x, plan):
         #
         # Step 1. Build lookup queues from backward execution plan
@@ -844,6 +1370,16 @@ class SplitRuntime:
         #
 
         # Check that the role is 'A' since only Node A can capture tensors during the forward pass
+        if is_causal_lm_model(
+            self.model
+        ):
+            return (
+                self.capture_causal_lm_forward_plan(
+                    x=x,
+                    plan=plan,
+                )
+            )
+        
         if self.role != "A":
             raise RuntimeError("Only role 'A' can capture tensors")
     
@@ -863,6 +1399,8 @@ class SplitRuntime:
             if op == "conv" and suffix == "weight":
                 continue
             if op == "addmm" and suffix == "mat2":
+                continue
+            if op == "mm" and suffix == "mat2":
                 continue
 
             key = f"graph:{op}:{idx}:{suffix}"
@@ -964,7 +1502,10 @@ class SplitRuntime:
 
         # Step 4: Run the forward pass and capture
         try:
-            out = self.model(x)
+            out = run_model_forward(
+                self.model,
+                x,
+            )
         finally:
             for h in handles:
                 h.remove()
@@ -1026,6 +1567,8 @@ class SplitRuntime:
         payload_path=None,
         tensor_policy=None,
         dryrun_backward_plan=None,
+        dropout_seed=None,
+
     ):
         if self.role != "B":
             raise RuntimeError("backward_jin() is only available for Node B")
@@ -1034,8 +1577,19 @@ class SplitRuntime:
         t0 = time.perf_counter()
 
         with nvtx_range("B_zero_grad"):
+
             self.model.train()
-            self.model.zero_grad(set_to_none=True)
+
+            if is_causal_lm_model(self.model):
+                print(
+                    "[B][CAUSAL_LM_MODE] "
+                    "train mode inside backward_jin",
+                    flush=True,
+                )
+
+            self.model.zero_grad(
+                set_to_none=True
+            )
 
         t1 = time.perf_counter()
         zero_grad_ms = (t1 - t0) * 1000
@@ -1044,26 +1598,100 @@ class SplitRuntime:
 
         # dummy forward profiling 
         with nvtx_range("B_dummy_forward"):
-            out_dummy = self.model(x_dummy)
+
+            if is_causal_lm_model(self.model):
+
+                if dropout_seed is None:
+                    raise RuntimeError(
+                        "[B] dropout_seed is required "
+                        "for causal LM train-mode backward"
+                    )
+
+                torch.manual_seed(
+                    int(dropout_seed)
+                )
+
+                print(
+                    f"[B][DROPOUT_SEED] "
+                    f"seed={int(dropout_seed)}",
+                    flush=True,
+                )
+
+            out_dummy = run_model_forward(
+                self.model,
+                x_dummy,
+            )
 
         # out_dummy = self.model(x_dummy)
         t1 = time.perf_counter()
         dummy_forward_ms = (t1 - t0) * 1000
 
-        from .fx_trace import debug_fx_shapes
-        with nvtx_range("B_debug_fx_shapes"):
-            debug_fx_shapes(self.model, x_dummy)
+        if not is_causal_lm_model(
+            self.model
+        ):
+
+            from .fx_trace import (
+                debug_fx_shapes
+            )
+
+            with nvtx_range(
+                "B_debug_fx_shapes"
+            ):
+                debug_fx_shapes(
+                    self.model,
+                    x_dummy,
+                )
 
         t0 = time.perf_counter()
 
         # loss_build
         with nvtx_range("B_loss_build"):
-            if "model.output" not in payload.tensors:
-                raise KeyError("payload does not contain 'model.output'")
 
-            out_real = payload.tensors["model.output"].detach().to(out_dummy.device)
-            out = out_dummy + (out_real - out_dummy).detach()
-            loss = loss_fn(out, y)
+            if "model.output" not in payload.tensors:
+                raise KeyError(
+                    "payload does not contain 'model.output'"
+                )
+
+            out_real = (
+                payload.tensors["model.output"]
+                .detach()
+                .to(out_dummy.device)
+            )
+
+            # --------------------------------------------------------
+            # Forward:
+            #     value == out_real (Node A)
+            #
+            # Backward:
+            #     d(out)/d(out_dummy) == 1
+            #
+            # out_dummy - out_dummy.detach() is exactly zero
+            # while retaining the gradient path through out_dummy.
+            # --------------------------------------------------------
+
+            out = (
+                out_real
+                + (
+                    out_dummy
+                    - out_dummy.detach()
+                )
+            )
+
+            loss = loss_fn(
+                out,
+                y,
+            )
+
+            if is_causal_lm_model(self.model):
+
+                print(
+                    "[B][OUTPUT_CHECK] "
+                    f"exact_A_output="
+                    f"{torch.equal(out.detach(), out_real)} "
+                    f"max_diff="
+                    f"{(out.detach() - out_real).abs().max().item()}",
+                    flush=True,
+                )
 
         t1 = time.perf_counter()
         loss_build_ms= ( t1 - t0 ) * 1000

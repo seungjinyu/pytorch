@@ -4,6 +4,9 @@ from torchvision.datasets import CIFAR10
 from torchvision import  transforms,datasets
 from pathlib import Path
 
+import torch
+from torch.utils.data import TensorDataset, DataLoader
+
 def make_cifar10_loaders(
     root="./data",
     batch_size=32,
@@ -93,3 +96,36 @@ def make_imagenet_loaders(
     )
 
     return train_loader, val_loader
+
+def make_tinystories_test_loader(
+    batch_size=1,
+    sequence_length=9,
+    vocab_size=50257,
+):
+    # 우선 framework 검증용 deterministic token IDs
+    input_ids = torch.arange(
+        100,
+        100 + batch_size * sequence_length,
+        dtype=torch.long,
+    ).reshape(
+        batch_size,
+        sequence_length,
+    )
+
+    input_ids = input_ids % vocab_size
+
+    # causal LM training용 label
+    labels = input_ids.clone()
+
+    dataset = TensorDataset(
+        input_ids,
+        labels,
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+    )
+
+    return loader

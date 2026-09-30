@@ -122,6 +122,18 @@ class TinyResNetNoBN(nn.Module):
         return x
     
 
+
+def make_tinystories_33m():
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(
+        "roneneldan/TinyStories-33M"
+    )
+
+    model.config.use_cache = False
+
+    return model
+
 def make_resnet18_cifar10():
     model = resnet18(weights=None)
 

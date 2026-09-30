@@ -8,10 +8,11 @@ from splitmagic import SplitRuntime, ZMQServer
 from splitmagic.utils.timing import CSVLogger
 from splitmagic.runtime import read_dryrun_plan
 from splitmagic.runtime import jin_set_payload_bytes_from_python
-from contextlib import nullcontext
+
+from splitmagic.runtime import is_causal_lm_model 
+from splitmagic.runtime import run_model_forward
 
 from contextlib import contextmanager
-import nvtx
 
 print(
     f"[Node B][SCRIPT_CHECK] "
@@ -21,21 +22,6 @@ print(
     f"cuda={torch.cuda.is_available()}",
     flush=True,
 )
-
-# @contextmanager
-# def nvtx_range(name: str):
-#     print(f"[NVTX][ENTER] {name}", flush=True)
-
-#     if torch.cuda.is_available():
-#         torch.cuda.nvtx.range_push(name)
-
-#     try:
-#         yield
-#     finally:
-#         if torch.cuda.is_available():
-#             torch.cuda.nvtx.range_pop()
-
-#         print(f"[NVTX][EXIT] {name}", flush=True)
 
 @contextmanager
 def nvtx_range(name: str):
@@ -300,13 +286,54 @@ def clone_grads(model):
 
     return grads, grad_bytes, grad_tensors
 
+def causal_lm_loss(logits, labels):
+    """
+    logits:
+        [B, S, V]
 
+    labels:
+        [B, S]
+
+    causal language modeling:
+        token t로 token t+1 예측
+    """
+
+    if logits.ndim != 3:
+        raise RuntimeError(
+            "[CAUSAL_LM_LOSS] logits must be [B,S,V], "
+            f"got {tuple(logits.shape)}"
+        )
+
+    if labels.ndim != 2:
+        raise RuntimeError(
+            "[CAUSAL_LM_LOSS] labels must be [B,S], "
+            f"got {tuple(labels.shape)}"
+        )
+
+    shift_logits = (
+        logits[:, :-1, :]
+        .contiguous()
+    )
+
+    shift_labels = (
+        labels[:, 1:]
+        .contiguous()
+    )
+
+    return F.cross_entropy(
+        shift_logits.view(
+            -1,
+            shift_logits.size(-1),
+        ),
+        shift_labels.view(-1),
+    )
 def build_template_plan_on_b(
-        model, 
-        batch_size, 
+        model,
+        batch_size,
         device,
         input_shape=(3, 32, 32),
         num_classes=10,
+        sequence_length=9,
     ):
 
     template_plan_path = os.environ.get(
@@ -319,72 +346,175 @@ def build_template_plan_on_b(
 
     os.environ["JIN_ROLE"] = "B"
     os.environ["JIN_DRYRUN"] = "1"
-    os.environ["JIN_DRYRUN_PATH"] = template_plan_path
-
-    model.zero_grad(set_to_none=True)
-
-    input_shape = tuple(
-        int(dim)
-        for dim in input_shape
+    os.environ["JIN_DRYRUN_PATH"] = (
+        template_plan_path
     )
 
-    if len(input_shape) != 3:
-        raise ValueError(
-            "input_shape must be (C, H, W), "
-            f"got {input_shape}"
+    model.zero_grad(
+        set_to_none=True
+    )
+
+    causal_lm = is_causal_lm_model(
+        model
+    )
+
+    # ========================================================
+    # TinyStories / Causal LM
+    # ========================================================
+
+    if causal_lm:
+
+        x_dummy = torch.randint(
+            low=0,
+            high=model.config.vocab_size,
+            size=(
+                batch_size,
+                sequence_length,
+            ),
+            dtype=torch.long,
+            device=device,
         )
-    
-    x_dummy = torch.randn(
-        batch_size,
-        *input_shape,
-        device=device,
-    )
 
-    y_dummy = torch.zeros(
-        batch_size,
-        dtype=torch.long,
-        device=device,
-    )
+        # Framework 검증에서는
+        # input_ids 자체를 causal-LM labels로 사용
+        y_dummy = x_dummy.clone()
 
-    with nvtx_range("B_template_dryrun"):
-        out = model(x_dummy)
-        if out.ndim != 2:
-            raise RuntimeError(
-                "[Node B] unexpected model output shape: "
-                f"{tuple(out.shape)}"
+    # ========================================================
+    # Existing CNN path
+    # ========================================================
+
+    else:
+
+        input_shape = tuple(
+            int(dim)
+            for dim in input_shape
+        )
+
+        if len(input_shape) != 3:
+            raise ValueError(
+                "input_shape must be (C, H, W), "
+                f"got {input_shape}"
             )
 
-        if out.size(1) != num_classes:
-            raise RuntimeError(
-                "[Node B] output class mismatch: "
-                f"model_output={out.size(1)}, "
-                f"num_classes={num_classes}"
+        x_dummy = torch.randn(
+            batch_size,
+            *input_shape,
+            device=device,
+        )
+
+        y_dummy = torch.zeros(
+            batch_size,
+            dtype=torch.long,
+            device=device,
+        )
+
+    # ========================================================
+    # Dry-run backward
+    # ========================================================
+
+    with nvtx_range(
+        "B_template_dryrun"
+    ):
+
+        out = run_model_forward(
+            model,
+            x_dummy,
+        )
+
+        # ----------------------------------------------------
+        # TinyStories
+        # ----------------------------------------------------
+
+        if causal_lm:
+
+            if out.ndim != 3:
+                raise RuntimeError(
+                    "[Node B] causal LM output "
+                    "must be [B,S,V], "
+                    f"got {tuple(out.shape)}"
+                )
+
+            if out.size(0) != batch_size:
+                raise RuntimeError(
+                    "[Node B] causal LM batch mismatch"
+                )
+
+            if out.size(1) != sequence_length:
+                raise RuntimeError(
+                    "[Node B] causal LM sequence mismatch: "
+                    f"output={out.size(1)} "
+                    f"expected={sequence_length}"
+                )
+
+            loss = causal_lm_loss(
+                out,
+                y_dummy,
             )
-        loss = F.cross_entropy(out, y_dummy)
+
+        # ----------------------------------------------------
+        # Existing CNN
+        # ----------------------------------------------------
+
+        else:
+
+            if out.ndim != 2:
+                raise RuntimeError(
+                    "[Node B] unexpected "
+                    "model output shape: "
+                    f"{tuple(out.shape)}"
+                )
+
+            if out.size(1) != num_classes:
+                raise RuntimeError(
+                    "[Node B] output class mismatch: "
+                    f"model_output={out.size(1)}, "
+                    f"num_classes={num_classes}"
+                )
+
+            loss = F.cross_entropy(
+                out,
+                y_dummy,
+            )
+
+        # 실제 backward dry-run
         loss.backward()
 
-    model.zero_grad(set_to_none=True)
+    model.zero_grad(
+        set_to_none=True
+    )
 
-    os.environ.pop("JIN_DRYRUN", None)
-    os.environ.pop("JIN_DRYRUN_PATH", None)
+    os.environ.pop(
+        "JIN_DRYRUN",
+        None,
+    )
 
-    plan = read_dryrun_plan(template_plan_path)
+    os.environ.pop(
+        "JIN_DRYRUN_PATH",
+        None,
+    )
+
+    plan = read_dryrun_plan(
+        template_plan_path
+    )
 
     if not plan:
-        raise RuntimeError(f"[Node B] template plan empty: {template_plan_path}")
+        raise RuntimeError(
+            "[Node B] template plan empty: "
+            f"{template_plan_path}"
+        )
 
     print(
         "[Node B][TEMPLATE_PLAN] "
         f"path={template_plan_path} "
         f"len={len(plan)} "
         f"batch_size={batch_size} "
-        f"input_shape={input_shape} "
-        f"num_classes={num_classes}",
+        f"causal_lm={causal_lm} "
+        f"sequence_length="
+        f"{sequence_length if causal_lm else 'N/A'}",
         flush=True,
     )
 
     return plan
-
 
 def write_execution_plan(plan, path=None):
     if path is None:
@@ -491,29 +621,77 @@ def run_node_b(
         )
 
     model = model.to(device)
+
+    causal_lm = is_causal_lm_model(
+        model
+    )
+
+    model.train()
+
+    if causal_lm:
+        print(
+            "[Node B][CAUSAL_LM_MODE] "
+            "train mode with synchronized dropout RNG",
+            flush=True,
+        )
+
     os.environ["JIN_ROLE"] = "B"
     os.environ["JIN_LOG_LEVEL"] = log_level
-    template_input_shape = tuple(
-        int(dim)
-        for dim in template_input_shape
-    )
+
     os.environ["JIN_BATCH_SIZE"] = str(
         template_batch_size
     )
 
-    if len(template_input_shape) != 3:
-        raise ValueError(
-            "template_input_shape must be (C, H, W), "
-            f"got {template_input_shape}"
+    # ============================================================
+    # TinyStories
+    # ============================================================
+
+    if causal_lm:
+
+        template_sequence_length = int(
+            os.environ.get(
+                "JIN_SEQUENCE_LENGTH",
+                "9",
+            )
         )
 
-    # Build template plan 
+        print(
+            "[Node B][MODEL] "
+            f"causal_lm=True "
+            f"sequence_length="
+            f"{template_sequence_length}",
+            flush=True,
+        )
+
+    # ============================================================
+    # Existing CNN
+    # ============================================================
+
+    else:
+
+        template_input_shape = tuple(
+            int(dim)
+            for dim in template_input_shape
+        )
+
+        if len(template_input_shape) != 3:
+            raise ValueError(
+                "template_input_shape "
+                "must be (C, H, W), "
+                f"got {template_input_shape}"
+            )
+
+        template_sequence_length = 0
+
+
+    # Build template plan
     template_plan = build_template_plan_on_b(
         model=model,
         batch_size=template_batch_size,
         device=device,
         input_shape=template_input_shape,
         num_classes=num_classes,
+        sequence_length=template_sequence_length,
     )
 
     write_execution_plan(template_plan)
@@ -546,14 +724,26 @@ def run_node_b(
 
     server = ZMQServer(endpoint)
 
-    print(
-        "[Node B] listening "
-        f"device={device} "
-        f"batch_size={template_batch_size} "
-        f"input_shape={template_input_shape} "
-        f"num_classes={num_classes}",
-        flush=True,
-    )
+    if causal_lm:
+        print(
+            "[Node B] listening "
+            f"device={device} "
+            f"model_family=causal_lm "
+            f"batch_size={template_batch_size} "
+            f"sequence_length={template_sequence_length} "
+            f"vocab_size={model.config.vocab_size}",
+            flush=True,
+        )
+    else:
+        print(
+            "[Node B] listening "
+            f"device={device} "
+            f"model_family=vision "
+            f"batch_size={template_batch_size} "
+            f"input_shape={template_input_shape} "
+            f"num_classes={num_classes}",
+            flush=True,
+        )
 
     step = 0
 
@@ -650,63 +840,167 @@ def run_node_b(
             os.environ["JIN_STEP"] = str(step)
 
             with nvtx_range("B_prepare_inputs"):
+
                 y = req["y"].to(device)
 
                 request_batch_size = int(
                     req["batch_size"]
                 )
 
-                request_input_shape = tuple(
-                    int(dim)
-                    for dim in req.get(
-                        "input_shape",
-                        template_input_shape,
-                    )
-                )
+                # ========================================================
+                # TinyStories / Causal LM
+                # ========================================================
 
-                if len(request_input_shape) != 3:
-                    raise RuntimeError(
-                        "[Node B] invalid request input shape: "
-                        f"{request_input_shape}"
-                    )
+                if causal_lm:
 
-                if request_input_shape != template_input_shape:
-                    raise RuntimeError(
-                        "[Node B] request/template input shape mismatch: "
-                        f"request={request_input_shape}, "
-                        f"template={template_input_shape}"
-                    )
-
-                x_dummy = torch.randn(
-                    request_batch_size,
-                    *request_input_shape,
-                    device=device,
-                )
-
-                if y.ndim != 1:
-                    raise RuntimeError(
-                        "[Node B] invalid label shape: "
-                        f"{tuple(y.shape)}"
-                    )
-
-                if y.size(0) != request_batch_size:
-                    raise RuntimeError(
-                        "[Node B] batch-size mismatch: "
-                        f"x={request_batch_size}, "
-                        f"y={y.size(0)}"
-                    )
-
-                if y.numel() > 0:
-                    min_label = int(y.min().item())
-                    max_label = int(y.max().item())
-
-                    if min_label < 0 or max_label >= num_classes:
+                    if y.ndim != 2:
                         raise RuntimeError(
-                            "[Node B] label out of range: "
-                            f"min={min_label}, "
-                            f"max={max_label}, "
-                            f"num_classes={num_classes}"
+                            "[Node B] causal LM labels "
+                            "must be [B,S], "
+                            f"got {tuple(y.shape)}"
                         )
+
+                    if y.size(0) != request_batch_size:
+                        raise RuntimeError(
+                            "[Node B] batch-size mismatch: "
+                            f"request={request_batch_size}, "
+                            f"labels={y.size(0)}"
+                        )
+
+                    request_sequence_length = int(
+                        req.get(
+                            "sequence_length",
+                            y.size(1),
+                        )
+                    )
+
+                    if y.size(1) != request_sequence_length:
+                        raise RuntimeError(
+                            "[Node B] label/request sequence mismatch: "
+                            f"labels={y.size(1)}, "
+                            f"request={request_sequence_length}"
+                        )
+
+                    if (
+                        request_sequence_length
+                        != template_sequence_length
+                    ):
+                        raise RuntimeError(
+                            "[Node B] sequence-length mismatch: "
+                            f"request={request_sequence_length}, "
+                            f"template={template_sequence_length}"
+                        )
+
+                    # IMPORTANT:
+                    # Node A와 일부러 다른 input으로 forward.
+                    # saved tensors는 JIN이 A 값으로 overwrite.
+                    x_dummy = torch.randint(
+                        low=0,
+                        high=model.config.vocab_size,
+                        size=(
+                            request_batch_size,
+                            request_sequence_length,
+                        ),
+                        dtype=torch.long,
+                        device=device,
+                    )
+
+                    if y.numel() > 0:
+
+                        min_label = int(
+                            y.min().item()
+                        )
+
+                        max_label = int(
+                            y.max().item()
+                        )
+
+                        if (
+                            min_label < 0
+                            or max_label
+                            >= model.config.vocab_size
+                        ):
+                            raise RuntimeError(
+                                "[Node B] LM token out of range: "
+                                f"min={min_label}, "
+                                f"max={max_label}, "
+                                f"vocab="
+                                f"{model.config.vocab_size}"
+                            )
+
+                # ========================================================
+                # Existing CNN
+                # ========================================================
+
+                else:
+
+                    request_input_shape = tuple(
+                        int(dim)
+                        for dim in req.get(
+                            "input_shape",
+                            template_input_shape,
+                        )
+                    )
+
+                    if len(request_input_shape) != 3:
+                        raise RuntimeError(
+                            "[Node B] invalid request input shape: "
+                            f"{request_input_shape}"
+                        )
+
+                    if (
+                        request_input_shape
+                        != template_input_shape
+                    ):
+                        raise RuntimeError(
+                            "[Node B] request/template "
+                            "input shape mismatch: "
+                            f"request={request_input_shape}, "
+                            f"template={template_input_shape}"
+                        )
+
+                    x_dummy = torch.randn(
+                        request_batch_size,
+                        *request_input_shape,
+                        device=device,
+                    )
+
+                    if y.ndim != 1:
+                        raise RuntimeError(
+                            "[Node B] invalid label shape: "
+                            f"{tuple(y.shape)}"
+                        )
+
+                    if (
+                        y.size(0)
+                        != request_batch_size
+                    ):
+                        raise RuntimeError(
+                            "[Node B] batch-size mismatch: "
+                            f"x={request_batch_size}, "
+                            f"y={y.size(0)}"
+                        )
+
+                    if y.numel() > 0:
+
+                        min_label = int(
+                            y.min().item()
+                        )
+
+                        max_label = int(
+                            y.max().item()
+                        )
+
+                        if (
+                            min_label < 0
+                            or max_label >= num_classes
+                        ):
+                            raise RuntimeError(
+                                "[Node B] label out of range: "
+                                f"min={min_label}, "
+                                f"max={max_label}, "
+                                f"num_classes={num_classes}"
+                            )
 
             # Setting up to zero   
             optimizer.zero_grad(set_to_none=True)
@@ -732,26 +1026,49 @@ def run_node_b(
                     step=step,
                 )
 
+            if causal_lm:
+                current_loss_fn = (
+                    causal_lm_loss
+                )
+            else:
+                current_loss_fn = (
+                    F.cross_entropy
+                )
+
+
             with nvtx_range("B_backward_jin_total"):
+                dropout_seed = req.get(
+                    "dropout_seed",
+                    None,
+                )
+
+                if causal_lm and dropout_seed is None:
+                    raise RuntimeError(
+                        "[Node B] causal LM request "
+                        "does not contain dropout_seed"
+                    )
+
                 loss = runtime_b.backward_jin(
                     x_dummy,
                     y=y,
                     payload=req["payload"],
-                    loss_fn=F.cross_entropy,
+                    loss_fn=current_loss_fn,
                     payload_path=req["payload_path"],
                     tensor_policy=req.get(
                         "tensor_policy",
                         None,
                     ),
                     dryrun_backward_plan=plan,
+                    dropout_seed=dropout_seed,
                 )
-            append_recompute_experiment_csv(
-                runtime=runtime_b,
-                csv_path=os.environ.get(
-                    "JIN_RECOMPUTE_EXPERIMENT_CSV",
-                    "./recompute_cost_experiments.csv",
-                ),
-            )
+            if not causal_lm:
+                append_recompute_experiment_csv(
+                    runtime=runtime_b,
+                    csv_path=os.environ.get(
+                        "JIN_RECOMPUTE_EXPERIMENT_CSV",
+                        "./recompute_cost_experiments.csv",
+                    ),
+                )
 
             experiment_metrics = getattr(
                 runtime_b,
